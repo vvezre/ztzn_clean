@@ -1,0 +1,42 @@
+添加镜像
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free  # 最低优先级
+conda config --add channels https://mirrors.aliyun.com/anaconda/pkgs/main             # 最高优先级
+
+
+conda env list   # 或 conda info --envs ‌:ml-citation{ref="1,5" data="citationList"}
+
+conda search python
+
+conda create -n python-3.11 python=3.11  # 指定Python版本 ‌:ml-citation{ref="3,5" data="citationList"}
+
+conda activate python-3.11   # 进入环境 ‌:ml-citation{ref="1,5" data="citationList"}
+conda deactivate       # 退出环境 ‌:ml-citation{ref="3" data="citationList"}
+
+
+pip install opencv-python
+pip install redis
+pip install pyserial
+pip install flask
+
+
+# 安装nginx
+sudo apt update                                      # 更新软件包列表:ml-citation{ref="2,5" data="citationList"}  
+sudo apt install nginx -y                            # 安装Nginx:ml-citation{ref="2,5" data="citationList"}  
+sudo systemctl start nginx                           # 启动服务:ml-citation{ref="2,5" data="citationList"}  
+sudo systemctl enable nginx                          # 设置开机自启:ml-citation{ref="2,5" data="citationList"}
+/usr/share/nginx/html	或者 /var/www/html
+
+sudo apt purge nginx nginx-common   # 删除软件包及配置文件‌:ml-citation{ref="1,4" data="citationList"}
+sudo apt autoremove                 # 清理依赖包‌:ml-citation{ref="1,2" data="citationList"}
+
+
+# 安装redis
+# Ubuntu/Debian
+sudo apt update
+sudo apt install redis-server
+sudo systemctl status redis
+redis-cli info server | grep version
+# 修改配置文件
+redis.conf
+
+
