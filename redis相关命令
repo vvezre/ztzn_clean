@@ -1,0 +1,25 @@
+tail -f /var/log/redis/redis-server.log
+
+sudo redis-check-aof --fix /var/lib/redis/appendonly.aof
+
+/usr/bin/redis-server /etc/redis/redis.conf
+
+ls -lh /var/lib/redis/appendonly.aof
+
+redis-check-aof --fix /var/lib/redis/appendonly.aof
+
+redis-cli CONFIG GET dir
+
+redis-cli info server | grep version
+
+sudo systemctl stop redis-server    # 停止服务 ‌:ml-citation{ref="1,2" data="citationList"}
+sudo systemctl disable redis-server # 禁用开机自启 ‌:ml-citation{ref="2,4" data="citationList"}
+
+sudo apt purge redis-server redis-tools  # 卸载核心包及配置 ‌:ml-citation{ref="1,3" data="citationList"}
+sudo apt autoremove --purge         # 清理残留依赖 ‌:ml-citation{ref="2,3" data="citationList"}
+
+sudo rm -rf /etc/redis/           # 删除配置文件目录 ‌:ml-citation{ref="1,2" data="citationList"}
+sudo rm -rf /var/lib/redis/       # 删除数据存储目录 ‌:ml-citation{ref="1,2" data="citationList"}
+sudo rm -f /var/log/redis*.log    # 清理日志文件 ‌:ml-citation{ref="3,5" data="citationList"}
+
+cat /var/log/redis/redis-server.log

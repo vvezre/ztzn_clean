@@ -18,6 +18,10 @@ pip install redis
 pip install pyserial
 pip install flask
 
+pip install geographiclib
+pip install matplotlib
+
+
 
 # 安装nginx
 sudo apt update                                      # 更新软件包列表:ml-citation{ref="2,5" data="citationList"}  

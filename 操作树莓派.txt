@@ -1,0 +1,45 @@
+cat /etc/os-release  # 显示发行版名称、版本号及系统类型
+内核版本与架构
+uname -a  # 简略信息
+hostnamectl  # 详细系统状态（含架构、内核版本）
+
+lscpu  # 查看处理器架构、核心数及频率
+
+top  # 动态查看CPU/内存占用（按Q退出）
+htop # 增强版（需安装：sudo apt install htop）
+
+vcgencmd measure_temp       # 芯片温度
+vcgencmd measure_volts core # 核心电压
+
+df -h  # 显示磁盘分区及剩余空间
+
+free -h  # 人性化显示内存总量/已用/空闲（含Swap）
+
+查看串口设备
+ls /dev/tty*
+
+ls /dev/video*  # 确认设备节点
+
+sudo chown pi html
+
+netstat -tuln
+
+netstat -tulp | grep :80	# 查看具体端口占用进程
+
+nginx -t			# 配置文件优先级验证方法
+nginx -T
+
+
+groups
+
+sudo usermod -a -G dialout $USER
+
+/var/lib/redis
+
+sudo systemctl daemon-reload
+
+添加任务
+编辑
+crontab -e
+查看
+crontab -l
