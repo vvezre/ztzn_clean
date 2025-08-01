@@ -1,0 +1,8 @@
+# 查看所有分支
+git branch -a
+
+# 切换到远程分支
+git checkout -c rtk origin/rtk
+
+# 创建新分支
+git checkout -b rtk
