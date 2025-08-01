@@ -4,6 +4,7 @@ import copy
 import json
 import time
 from collections import defaultdict
+from geographiclib.geodesic import Geodesic
 
 from AppLogger import logger
 
@@ -99,5 +100,96 @@ def listenerVoltage(ser):
 def deep_copy_list(lst):
     return [copy.deepcopy(item) for item in lst]
 
+#分析gngga数据
+def parse_gngga(line):
+    # line = "$GNGGA,070622.00,3202.20138810,N,11855.48034587,E,4,30,0.6,40.6076,M,2.7092,M,1.0,569*60"
+    if not line.startswith("$GNGGA"):
+        return None
+    parts = line.strip().split(',')
+    if len(parts) < 7:
+        return None
+
+    # 检查 E,4 条件：E方向且Fix类型为4
+    if parts[5] != 'E' or parts[6] != '4':
+        return None
+
+    try:
+        lat_raw = float(parts[2])
+        lon_raw = float(parts[4])
+        lat = int(lat_raw / 100) + (lat_raw % 100) / 60
+        lon = int(lon_raw / 100) + (lon_raw % 100) / 60
+        return (round(lat, 8), round(lon, 8))
+    except:
+        return None
+
+#分析uniheadinga数据
+def parse_uniheadinga(line):
+    if not line.startswith("#UNIHEADINGA"):
+        return None
+    parts = line.strip().split(',')
+    if len(parts) < 13:
+        return None
+    try:
+        heading = float(parts[12])  # 第13个字段是角度
+        return heading
+    except:
+        return None
+
+#分析GPTHS数据
+def parse_GPTHS(line):
+    if not line.startswith("$GNTHS"):
+        return None
+    parts = line.strip().split(',')
+    if len(parts) < 3:
+        return None
+    try:
+        heading = float(parts[1])  # 第1个字段是角度
+        return heading
+    except:
+        return None
+
+
+# 监听RTK,获取实时位置
+# lon经度 lat纬度
+def listenerRTK(ser,redis_cli):
+    if ser.is_open:
+        line = ser.readline().decode(errors='ignore').strip()
+        logger.warn(line)
+        if not line:
+            return None
+        if line.startswith("$GNGGA"):
+            gps = parse_gngga(line)
+            if gps:
+                logger.warn("[GNGGA] Lat: {}°, Lon: {}°".format(gps[0],gps[1]))
+                redis_cli.hset('currentLocation', 'lat', gps[0])
+                redis_cli.hset('currentLocation', 'lon', gps[1])
+
+        elif line.startswith("#UNIHEADINGA"):
+            heading = parse_uniheadinga(line)
+            if heading is not None:
+                logger.warn("[UNIHEADINGA] Heading: {}°".format(heading))
+
+        elif line.startswith("$GNTHS"):
+            heading = parse_GPTHS(line)
+            if heading is not None:
+                # logger.warn("[GPTHS] Heading: {}°".format(heading))
+                redis_cli.hset('currentLocation', 'heading', heading)
+
+    else:
+        logger.error("RTK串口打开失败！")
+
+def get_distance_angle(lat1, lon1, lat2, lon2):
+    geod = Geodesic.WGS84
+    result = geod.Inverse(lat1, lon1, lat2, lon2)
+
+    distance = result['s12'] * 100  # 将米转为厘米
+    angle = result['azi1'] % 360    # 确保角度永远是正数
+    return distance, angle
+
 if __name__ == '__main__':
-    createTask()
+    lat1 = 32.03659527
+    lon1 = 118.92462594
+    lat2 = 32.03659694
+    lon2 = 118.92459249
+    result = get_distance_angle(lat1, lon1,lat2, lon2)
+    print(result)
