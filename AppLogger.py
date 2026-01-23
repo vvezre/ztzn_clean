@@ -16,5 +16,3 @@ fileHandler.setFormatter(formatter)
 
 logger.addHandler(streamHandler)
 logger.addHandler(fileHandler)
-# 阻止父Logger传递日志到子Logger
-logger.propagate = False

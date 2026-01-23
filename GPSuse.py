@@ -1,5 +1,3 @@
-# coding=utf-8
-
 from geographiclib.geodesic import Geodesic
 import serial
 import math
@@ -10,7 +8,7 @@ import time
 # pip install geographiclib
 
 
-port = 'COM8'
+port = 'COM9'
 baudrate = 115200
 
 # 已知起点，角度，距离，计算终点GPS
@@ -70,7 +68,7 @@ def parse_uniheadinga(line):
 
 #分析GPTHS数据
 def parse_GPTHS(line):
-    if not line.startswith("$GNTHS"):
+    if not line.startswith("$GPTHS"):
         return None
     parts = line.strip().split(',')
     if len(parts) < 3:
@@ -105,11 +103,10 @@ def try_connect(port, baudrate):
     try:
         return serial.Serial(port, baudrate, timeout=1)
     except SerialException as e:
-        print("[连接失败] 无法打开串口 原因：{}".format(e))
+        print(f"[连接失败] 无法打开串口 {port}，原因：{e}")
         return None
 
 def main():
-
     ser = None
 
     while True:
@@ -122,36 +119,38 @@ def main():
             print("[连接成功] 串口已打开")
         try:
             line = ser.readline().decode(errors='ignore').strip()
-            print(line)
             if not line:
                 continue
+
             if line.startswith("$GNGGA"):
                 gps = parse_gngga(line)
                 if gps:
-                    print("[GNGGA] Lat: {}°, Lon: {}°".format(gps[0],gps[1]))
+                    print(f"[GNGGA] Lat: {gps[0]}°, Lon: {gps[1]}°")
 
             elif line.startswith("#UNIHEADINGA"):
                 heading = parse_uniheadinga(line)
                 if heading is not None:
-                    print("[UNIHEADINGA] Heading: {}°".format(heading))
+                    print(f"[UNIHEADINGA] Heading: {heading}°")
 
-            elif line.startswith("$GNTHS"):
+            elif line.startswith("$GPTHS"):
                 heading = parse_GPTHS(line)
                 if heading is not None:
-                    print("[GPTHS] Heading: {}°".format(heading))
+                    print(f"[GPTHS] Heading: {heading}°")
         except KeyboardInterrupt:
             print("Stopped by user.")
             break
 
         except SerialException as e:
-            print("[串口异常] {}".format(e))
+            print(f"[串口异常] {e}")
             if ser:
                 ser.close()
             ser = None
             time.sleep(1)  # 等待后重新连接
 
         except Exception as e:
-            print("Error: {}".format(e))
+            print(f"Error: {e}")
+
+
 
 if __name__ == "__main__":
     main()

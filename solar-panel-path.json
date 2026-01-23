@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "type": "solar-panel-path",
+    "version": "1.0",
+    "exportedAt": "2025-10-24T07:42:58.403Z",
+    "panel": {
+      "cols": 6,
+      "rows": 10
+    },
+    "totalLines": 3
+  },
+  "coordinates": [
+    [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        1
+      ]
+    ],
+    [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        1
+      ]
+    ],
+    [
+      [
+        1,
+        1
+      ],
+      [
+        1,
+        2
+      ]
+    ]
+  ]
+}
