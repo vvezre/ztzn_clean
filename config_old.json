@@ -1,0 +1,54 @@
+[
+  {
+    "startLat":32.0364768,
+    "startLon":118.92449219,
+    "endLat":32.03648577,
+    "endLon":118.92448929,
+    "angle": 0, 
+    "areaNumber": "1", 
+    "back_len": 5, 
+    "turn_back_len": 10, 
+    "length": 0, 
+    "mode": 1, 
+    "id": 1
+  }, 
+  {
+    "startLat":32.03648577,
+    "startLon":118.92448929,
+    "endLat":32.03648382,
+    "endLon":118.92458395,
+    "angle": 90, 
+    "areaNumber": "1", 
+    "back_len": 10, 
+    "turn_back_len": 10, 
+    "length": 0, 
+    "mode": 1, 
+    "id": 2
+  }, 
+  {
+    "startLat":32.03648382,
+    "startLon":118.92458395,
+    "endLat":32.03647581,
+    "endLon":118.92458723,
+    "angle": 180, 
+    "areaNumber": "1", 
+    "back_len": 0, 
+    "turn_back_len": 10, 
+    "length": 90,
+    "mode": 2, 
+    "id": 3
+  }, 
+  {
+    "startLat":32.03647581,
+    "startLon":118.92458723,
+    "endLat":32.0364768,
+    "endLon":118.92449219,
+    "angle": 270, 
+    "areaNumber": "1", 
+    "back_len": 10, 
+    "turn_back_len": 10, 
+    "length": 0, 
+    "mode": 1, 
+    "id": 4
+  }
+]

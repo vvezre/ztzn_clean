@@ -137,7 +137,8 @@ class RTKDataManager:
             rtk_data = RTKData()
             # 估算中心
             # result = estimator.estimate_center_from_rear_antenna(lat, lon, heading_deg)
-            c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.11, 0.17)
+            # c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.17, 0.11)
+            c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.16, 0.13)
             # rtk_data.lat = round(result['center_lat'], 8)
             # rtk_data.lon = round(result['center_lon'], 8)
             rtk_data.lat = c_lat

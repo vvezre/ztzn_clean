@@ -1,0 +1,66 @@
+[
+  {
+    "id": 1,
+    "angle":270,
+    "mode": 1,
+    "length": 0,
+    "back_len": 15,
+    "return_charging_mode": 1
+  },
+  {
+    "id": 2,
+    "angle":180,
+    "mode": 1,
+    "length": 0,
+    "back_len": 15,
+    "return_charging_mode": 1
+  },
+  {
+    "id": 1,
+    "angle":270,
+    "mode": 1,
+    "length": 0,
+    "back_len": 15,
+    "return_charging_mode": 2
+  },
+  {
+    "id": 2,
+    "angle":180,
+    "mode": 1,
+    "length": 0,
+    "back_len": 15,
+    "return_charging_mode": 2
+  },
+  {
+    "id": 3,
+    "angle":90,
+    "mode": 2,
+    "length": 530,
+    "back_len": 15,
+    "return_charging_mode": 2
+  },
+  {
+    "id": 1,
+    "angle":270,
+    "mode": 1,
+    "length": 0,
+    "back_len": 15,
+    "return_charging_mode": 3
+  },
+  {
+    "id": 2,
+    "angle":180,
+    "mode": 1,
+    "length": 0,
+    "back_len": 15,
+    "return_charging_mode": 3
+  },
+  {
+    "id": 3,
+    "angle":270,
+    "mode": 2,
+    "length": 530,
+    "back_len": 15,
+    "return_charging_mode": 3
+  }
+]

@@ -1,0 +1,64 @@
+{
+  "mqtt": {
+    "broker": "218.2.130.246",
+    "port": 1883,
+    "username": "admin",
+    "password": "njzt888",
+    "company_code": "ZTZN-PVC",
+    "product_model": "-T01",
+    "product_id": "250001",
+    "keepalive": 60,
+    "qos": 1,
+    "status_interval": 5,
+    "auto_reconnect": true,
+    "reconnect_delay": 5
+  },
+  "topics": {
+    "subscribe": "RAILCAR/S/-T01250001",
+    "publish": "RAILCAR/R/-T01250001"
+  },
+  "commands": {
+    "enabled": [
+      "drive",
+      "back",
+      "turn_left",
+      "turn_right",
+      "stop",
+      "parking",
+      "joystick_move",
+      "auto_drive",
+      "go_on",
+      "return_to_point",
+      "enter_garage",
+      "exit_garage",
+      "adjust_speed",
+      "adjust_brush_speed",
+      "toggle_tracking",
+      "toggle_path_planning",
+      "create_task",
+      "select_task",
+      "save_task",
+      "save_params",
+      "get_status"
+    ],
+    "disabled": []
+  },
+  "status_report": {
+    "enabled": true,
+    "interval": 5,
+    "fields": [
+      "speed",
+      "brush_speed",
+      "voltage",
+      "battery_percent",
+      "angle",
+      "tracking",
+      "path_planning",
+      "left_edge",
+      "right_edge",
+      "move_judge",
+      "detect_qrcode",
+      "enter_garage"
+    ]
+  }
+}

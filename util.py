@@ -505,80 +505,146 @@ def readOpencv(cap):
 def readNtrip2Uart():
     print(1)
 
-def readRTK(ser_rtk_params, sync_threshold = 0.5,timeout = 5):
-    buffer = {}  # 缓存最近的 GGA 和 THS 数据
+def readRTK(ser_rtk_params, sync_threshold = 0.5,timeout = 1):
     global ser_rtk
-    last_data_time = time.time()  # 记录最后一次收到任何数据的时间
-    if ser_rtk is None:
-        ser_rtk = serial.Serial(ser_rtk_params['port'], ser_rtk_params['baudRate'], rtscts=True,timeout=0.01)
-    raw_buffer = b''
+    buffer = {}  # 缓存最近的 GGA 和 THS 数据
+
     while True:
         try:
-            current_time = time.time()
-            # 超时判断
-            # if current_time - last_data_time > timeout:
-            #     raise RTKTimeoutError("RTK设备超时：{}秒内未收到任何数据".format(timeout))
-            #     logger.warn("RTK设备超时：{}秒内未收到任何数据".format(timeout))
-            #     logger.warn("重新连接RTK")
-            # 确保串口连接有效
-            if ser_rtk is None or not ser_rtk.is_open:
-                ser_rtk = serial.Serial(ser_rtk_params['port'], ser_rtk_params['baudRate'], rtscts=True, timeout=0.01)
+            rtk_port = util.findPort('$GN')
+            if rtk_port:
+                # 使用 with 语句，离开代码块时会自动 close，即使发生异常
+                with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=1) as ser_rtk:
+                    print("串口已打开")
+                    while ser_rtk.is_open:
+                        try:
+                            if ser_rtk.in_waiting:
+                                line = ser_rtk.readline()
+                                # # 处理数据...
+                                if line:
+                                    timestamp = time.time()  # 记录当前时间戳
+                                    # logger.info(line)
+                                    if line.startswith(b"$GNGGA"):
+                                        gps = parse_gngga(line.decode('utf-8', errors='ignore').strip())
+                                        if gps:
+                                            buffer['gga'] = {
+                                                'timestamp': timestamp,
+                                                'lat': gps[0],
+                                                'lon': gps[1]
+                                            }
+                                            # yield gps[0], gps[1]
+                                    elif line.startswith(b"$GNTHS"):
+                                        heading = parse_GPTHS(line.decode('utf-8', errors='ignore').strip())
+                                        buffer['ths'] = {
+                                            'timestamp': timestamp,
+                                            'heading': heading
+                                        }
 
-            raw_buffer += ser_rtk.read(ser_rtk.in_waiting)
-            # 按帧分割处理
-            while b'\n' in raw_buffer:
-                line, raw_buffer = raw_buffer.split(b'\n', 1)
-                if line:
-                    timestamp = time.time()  # 记录当前时间戳
-                    # logger.info(line)
-                    if line.startswith(b"$GNGGA"):
-                        gps = parse_gngga(line.decode('utf-8', errors='ignore').strip())
-                        # logger.warning(gps)
-                        if gps:
-                            buffer['gga'] = {
-                                'timestamp': timestamp,
-                                'lat': gps[0],
-                                'lon': gps[1]
-                            }
-                            # yield gps[0], gps[1]
-                    elif line.startswith(b"$GNTHS"):
-                        heading = parse_GPTHS(line.decode('utf-8', errors='ignore').strip())
-                        buffer['ths'] = {
-                            'timestamp': timestamp,
-                            'heading': heading
-                        }
+                                    # 同步 GGA 和 VTG 数据
+                                    if 'gga' in buffer and 'ths' in buffer:
+                                        gga_ts = buffer['gga']['timestamp']
+                                        ths_ts = buffer['ths']['timestamp']
 
-                    # 同步 GGA 和 VTG 数据
-                    if 'gga' in buffer and 'ths' in buffer:
-                        gga_ts = buffer['gga']['timestamp']
-                        ths_ts = buffer['ths']['timestamp']
+                                        if abs(gga_ts - ths_ts) < sync_threshold:  # 时间差阈值为 0.5 秒
+                                            lat = buffer['gga']['lat']
+                                            lon = buffer['gga']['lon']
+                                            heading_deg = buffer['ths']['heading']
 
-                        if abs(gga_ts - ths_ts) < sync_threshold:  # 时间差阈值为 0.5 秒
-                            lat = buffer['gga']['lat']
-                            lon = buffer['gga']['lon']
-                            heading_deg = buffer['ths']['heading']
+                                            # 清空缓冲区，准备接收下一次数据
+                                            del buffer['gga']
+                                            del buffer['ths']
 
-                            # 清空缓冲区，准备接收下一次数据
-                            del buffer['gga']
-                            del buffer['ths']
-
-                            last_data_time = current_time
-
-                            yield lat, lon, heading_deg
+                                            yield lat, lon, heading_deg
+                        except Exception as e:
+                            logger.error("读取数据异常: {}".format(e))
+                            break  # 跳出内层循环，重新打开串口
+                # 离开 with 块，串口自动关闭
         except serial.SerialException as e:
-            logger.error("RTK串口异常：{}".format(e))
-            if ser_rtk:
-                ser_rtk.close()
-            ser_rtk = None
-            time.sleep(1)  # 等待后尝试重连
-            raise e
+            logger.error("打开串口失败: {}".format(e))
         except Exception as e:
-            logger.error("RTK处理过程未知错误：{}".format(e))
-            if ser_rtk:
-                ser_rtk.close()
-            ser_rtk = None
-            time.sleep(1)  # 等待后尝试重连
-            raise e
+            logger.error("其他错误: {}".format(e))
+
+        time.sleep(1)  # 确保休眠在所有情况（包括失败）下都执行，防止死循环
+# def readRTK(ser_rtk_params, sync_threshold = 0.5,timeout = 5):
+#     buffer = {}  # 缓存最近的 GGA 和 THS 数据
+#     global ser_rtk
+#     last_data_time = time.time()  # 记录最后一次收到任何数据的时间
+#     if ser_rtk is None:
+#         ser_rtk = serial.Serial(ser_rtk_params['port'], ser_rtk_params['baudRate'], rtscts=True,timeout=0.01)
+#     raw_buffer = b''
+#     while True:
+#         try:
+#             current_time = time.time()
+#             # 超时判断
+#             # if current_time - last_data_time > timeout:
+#             #     raise RTKTimeoutError("RTK设备超时：{}秒内未收到任何数据".format(timeout))
+#             #     logger.warn("RTK设备超时：{}秒内未收到任何数据".format(timeout))
+#             #     logger.warn("重新连接RTK")
+#             # 确保串口连接有效
+#             if ser_rtk is None or not ser_rtk.is_open:
+#                 rtk_port = util.findPort('"$GN"')
+#                 if rtk_port is None:
+#                     rtk_port = ser_rtk_params['port']
+#                 ser_rtk = serial.Serial(rtk_port, ser_rtk_params['baudRate'], rtscts=True, timeout=0.01)
+#                 # ser_rtk = serial.Serial(ser_rtk_params['port'], ser_rtk_params['baudRate'], rtscts=True, timeout=0.01)
+#
+#             raw_buffer += ser_rtk.read(ser_rtk.in_waiting)
+#             # 按帧分割处理
+#             while b'\n' in raw_buffer:
+#                 line, raw_buffer = raw_buffer.split(b'\n', 1)
+#                 if line:
+#                     timestamp = time.time()  # 记录当前时间戳
+#                     # logger.info(line)
+#                     if line.startswith(b"$GNGGA"):
+#                         gps = parse_gngga(line.decode('utf-8', errors='ignore').strip())
+#                         # logger.warning(gps)
+#                         if gps:
+#                             buffer['gga'] = {
+#                                 'timestamp': timestamp,
+#                                 'lat': gps[0],
+#                                 'lon': gps[1]
+#                             }
+#                             # yield gps[0], gps[1]
+#                     elif line.startswith(b"$GNTHS"):
+#                         heading = parse_GPTHS(line.decode('utf-8', errors='ignore').strip())
+#                         buffer['ths'] = {
+#                             'timestamp': timestamp,
+#                             'heading': heading
+#                         }
+#
+#                     # 同步 GGA 和 VTG 数据
+#                     if 'gga' in buffer and 'ths' in buffer:
+#                         gga_ts = buffer['gga']['timestamp']
+#                         ths_ts = buffer['ths']['timestamp']
+#
+#                         if abs(gga_ts - ths_ts) < sync_threshold:  # 时间差阈值为 0.5 秒
+#                             lat = buffer['gga']['lat']
+#                             lon = buffer['gga']['lon']
+#                             heading_deg = buffer['ths']['heading']
+#
+#                             # 清空缓冲区，准备接收下一次数据
+#                             del buffer['gga']
+#                             del buffer['ths']
+#
+#                             last_data_time = current_time
+#
+#                             yield lat, lon, heading_deg
+#         except serial.SerialException as e:
+#             logger.error("RTK串口异常：{}".format(e))
+#             if ser_rtk:
+#                 ser_rtk.close()
+#             ser_rtk = None
+#             logger.info('waiting for RTK')
+#             time.sleep(6)  # 等待后尝试重连
+#             # raise e
+#         except Exception as e:
+#             logger.error("RTK处理过程未知错误：{}".format(e))
+#             if ser_rtk:
+#                 ser_rtk.close()
+#             ser_rtk = None
+#             logger.info('waiting for RTK')
+#             time.sleep(6)  # 等待后尝试重连
+#             # raise e
 def closeSerRtk():
     global ser_rtk
     if ser_rtk is not None and ser_rtk.is_open:
@@ -852,61 +918,6 @@ def findPort(target_magic,timeout=3):
         except Exception as e:
             logger.error("端口 %s 异常: %s", port, e)
     return None
-    # ports = [p.device for p in serial.tools.list_ports.comports()]
-    # logger.warning("发现串口：%s", ports)
-    #
-    # for port in ports:
-    #     try:
-    #         logger.warning("正在测试 %s 串口", port)
-    #         with serial.Serial(port, baudrate=115200, timeout=1) as ser:
-    #             logger.warning("正在测试 %s 串口", port)
-    #             # 给设备一点时间启动（尤其嵌入式设备上电后需要初始化）
-    #             time.sleep(1.0)
-    #             # 清空缓冲区：多次 flush + 读空
-    #             ser.flushInput()
-    #             time.sleep(0.1)
-    #             while ser.in_waiting > 0:
-    #                 ser.read(ser.in_waiting)  # 丢弃所有残余数据
-    #                 time.sleep(0.01)
-    #             # 现在开始监听
-    #             start = time.time()
-    #             buffer = b''
-    #             while time.time() - start < 3:
-    #                 if ser.in_waiting:
-    #                     chunk = ser.read(ser.in_waiting)
-    #                     buffer += chunk
-    #                     try:
-    #                         text = buffer.decode('utf-8', errors='ignore')
-    #                         if target_magic in text:
-    #                             logger.warning("找到目标串口：%s", port)
-    #                             return port+''
-    #                     except:
-    #                         pass
-    #                 time.sleep(0.1)
-    #     except Exception as e:
-    #         logger.error("串口 %s 打开或通信失败：%s", port, e)
-    #         continue
-    # return None
-    # 列出当前所有串口
-    # ports = [p.device for p in serial.tools.list_ports.comports()]
-    # logger.warn("发现串口：{}".format(ports))
-    # # 逐个尝试
-    # for port in ports:
-    #     try:
-    #         # 打开串口
-    #         with serial.Serial(port, baudrate=115200, timeout=3) as ser:
-    #             logger.warn("正在测试{}串口".format(port))
-    #             # 清空旧数据
-    #             ser.flushInput()
-    #             # 读一行
-    #             line = ser.readline().decode().strip()
-    #             # 判断是否为暗号
-    #             if line.startswith(target_magic):
-    #                 logger.warn("找到目标串口：{}".format(port))
-    #                 return port+""
-    #     except Exception as e:
-    #         logger.error("{}串口打开失败：{}".format(port,e))
-    #         continue
 
 # 根据主天线位置计算小车中心点位置，小车的主天线在中心位置的左前方
 # lat_m,lon_m,heading_deg:小车当前经纬度和航向角
@@ -917,22 +928,71 @@ def compute_center_from_master(lat_m, lon_m, heading_deg,offset_x_front, offset_
     c_lat,c_lon = util.get_B_GPS(lat,lon,offset_x_front,(heading_deg+90)%360)
     return c_lat,c_lon
 
-if __name__ == '__main__':
-    lat1,lon1,heading1 = 32.03659588,118.92461104,2.07
-    lat2,lon2,heading2 = 32.03659839,118.92461165,93.95
-    lat3,lon3,heading3 = 32.03659779,118.92461472,184.94
-    lat4,lon4,heading4 = 32.03659538,118.92461397,271.75
-    # c1 = util.compute_center_from_master(lat1,lon1,heading1,0.12,0.08)
-    # c2 = util.compute_center_from_master(lat2,lon2,heading2,0.12,0.08)
-    # print(c1)
-    # print(c2)
-    # dis,h = util.get_distance_angle(c1[0],c1[1],c2[0],c2[1])
-    # print(dis)
 
-    c1 = util.compute_center_from_master(lat1,lon1,heading1,0.17,0.11)
-    c2 = util.compute_center_from_master(lat2,lon2,heading2,0.17,0.11)
-    c3 = util.compute_center_from_master(lat3,lon3,heading3,0.17,0.11)
-    c4 = util.compute_center_from_master(lat4,lon4,heading4,0.17,0.11)
+def compute_center_from_antenna(lat_ant, lon_ant, heading_deg, dx_back, dy_right):
+    """
+    已知主天线位置和航向，计算小车中心点位置（中心在主天线后方 dx_back、右侧 dy_right）
+
+    参数:
+        lat_ant, lon_ant: 主天线经纬度（度）
+        heading_deg: 航向角（度），0=正北，顺时针增加
+        dx_back: 中心点在主天线后方的距离（米），>0
+        dy_right: 中心点在主天线右侧的距离（米），>0
+
+    返回:
+        (lat_center, lon_center) 单位：度
+    """
+    # 航向转弧度
+    theta = math.radians(heading_deg)
+
+    # 计算 ENU 偏移（从主天线到中心点）
+    delta_e = -dx_back * math.sin(theta) - dy_right * math.cos(theta)
+    delta_n = -dx_back * math.cos(theta) + dy_right * math.sin(theta)
+
+    # 使用 geodesic 正解：从 (lat_ant, lon_ant) 出发，沿 (delta_e, delta_n) 移动
+    geod = Geodesic.WGS84
+
+    # 先计算方位角和距离
+    distance = math.hypot(delta_e, delta_n)
+    if distance < 1e-6:
+        return lat_ant, lon_ant
+
+    azimuth = math.degrees(math.atan2(delta_e, delta_n))  # 注意：atan2(E, N)
+
+    # 正解计算新位置
+    result = geod.Direct(lat_ant, lon_ant, azimuth, distance)
+    lat_center = result['lat2']
+    lon_center = result['lon2']
+
+    return round(lat_center,8), round(lon_center,8)
+
+def test01():
+    # 主天线位置
+    lat_ant = 31.01234567
+    lon_ant = 121.09876543
+
+    # 航向：车头朝东北（45°）
+    heading = 45.0  # 度
+
+    # 中心点在主天线后方 0.3m，右侧 0.2m
+    dx = 0.3  # 后
+    dy = 0.2  # 右
+
+    lat_c, lon_c = compute_center_from_antenna(lat_ant, lon_ant, heading, dx, dy)
+
+    print("主天线: {:.8f}, {:.8f}".format(lat_ant, lon_ant))
+    print("中心点: {:.8f}, {:.8f}").format(lat_c, lon_c)
+    print("偏移: 后 {}m, 右 {}m, 航向 {}°".format(dx,dy,heading))
+def test02():
+    lat1,lon1,heading1 = 32.03659781,118.92461508,186.76
+    lat2,lon2,heading2 = 32.03659481,118.92461393,276.83
+    lat3,lon3,heading3 = 32.03659587,118.92461011,6.34
+    lat4,lon4,heading4 = 32.03659864,118.92461165,96.24
+
+    c1 = util.compute_center_from_master(lat1,lon1,heading1,0.2,0.13)
+    c2 = util.compute_center_from_master(lat2,lon2,heading2,0.2,0.13)
+    c3 = util.compute_center_from_master(lat3,lon3,heading3,0.2,0.13)
+    c4 = util.compute_center_from_master(lat4,lon4,heading4,0.2,0.13)
     print(c1)
     print(c2)
     print(c3)
@@ -945,6 +1005,18 @@ if __name__ == '__main__':
 
     dis, h = util.get_distance_angle(c1[0], c1[1], c4[0], c4[1])
     print(dis)
+    # ------------------------------------
+    dis, h = util.get_distance_angle(c2[0], c2[1], c3[0], c3[1])
+    print(dis)
+
+    dis, h = util.get_distance_angle(c2[0], c2[1], c4[0], c4[1])
+    print(dis)
+    # ------------------------------------
+    dis, h = util.get_distance_angle(c3[0], c3[1], c4[0], c4[1])
+    print(dis)
+if __name__ == '__main__':
+    # test01()
+    test02()
 
 
     # command = bytearray(17)

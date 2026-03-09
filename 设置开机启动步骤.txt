@@ -13,6 +13,7 @@ WorkingDirectory=/workspace/cleaner
 ExecStart=/usr/bin/python /workspace/cleaner/main.py
 Restart=always
 RestartSec=10
+ExecStartPre=/bin/sleep 2
 
 [Install]
 WantedBy=multi-user.target     # 多用户模式下启用
