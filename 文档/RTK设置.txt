@@ -1,0 +1,3 @@
+gngga 0.05
+gpths 0.05
+saveconfig

@@ -1,0 +1,19 @@
+conda create -n env_name python=3.8  # 指定Python版本:ml-citation{ref="5,6" data="citationList"}
+conda create -n env_name --clone base  # 克隆基础环境:ml-citation{ref="4" data="citationList"}
+
+conda activate env_name  # 激活环境:ml-citation{ref="6,7" data="citationList"}
+conda deactivate         # 退出当前环境:ml-citation{ref="6" data="citationList"}
+
+conda env list       # 查看所有环境:ml-citation{ref="2,6" data="citationList"}
+conda info --envs    # 等效命令:ml-citation{ref="6" data="citationList"}
+
+conda install pandas        # 安装单个包:ml-citation{ref="3" data="citationList"}
+conda install numpy scipy   # 安装多个包:ml-citation{ref="3" data="citationList"}
+
+conda remove pandas  # 卸载包:ml-citation{ref="8" data="citationList"}
+
+conda list          # 查看当前环境已安装包:ml-citation{ref="3,8" data="citationList"}
+conda list -n env_name  # 查看指定环境的包:ml-citation{ref="8" data="citationList"}
+
+conda clean --all  # 清理所有缓存文件:ml-citation{ref="4" data="citationList"}
+

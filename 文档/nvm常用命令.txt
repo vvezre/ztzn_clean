@@ -1,0 +1,23 @@
+nvm -v # 验证版本
+nvm install 18.18.0   # 安装Node v18.18.0  
+nvm install --lts     # 安装最新稳定版（LTS）:ml-citation{ref="10,12" data="citationList"}  
+
+nvm use 20.19.0       # 临时切换至v20.19.0  
+nvm alias default 20  # 设置默认版本为v20系列:ml-citation{ref="7,15" data="citationList"} 
+
+nvm ls                # 查看已安装版本（箭头→指示当前使用版本）  
+nvm ls-remote         # 查看所有远程可用版本:ml-citation{ref="6,10" data="citationList"}  
+
+nvm uninstall 14.20.0  # 删除指定版本:ml-citation{ref="7" data="citationList"}  
+
+# 编辑NVM配置文件（Windows: settings.txt；macOS/Linux: ~/.nvm/nvm.sh），添加：
+node_mirror: https://npmmirror.com/mirrors/node/  
+npm_mirror: https://npmmirror.com/mirrors/npm/  
+
+
+nvm list available        # 查看可安装的 Node 版本
+nvm install 18.18.0       # 安装指定版本（推荐 LTS）
+nvm use 18.18.0           # 切换到该版本
+nvm list                  # 查看已安装的版本
+node -v                   # 验证当前 Node 版本
+npm -v                    # 验证 npm

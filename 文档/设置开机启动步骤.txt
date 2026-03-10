@@ -1,0 +1,23 @@
+# 创建服务文件（需 root 权限）
+sudo nano /etc/systemd/system/cleaner.service
+
+[Unit]
+Description=My Python Service Cleaner
+After=redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=nano
+WorkingDirectory=/workspace/cleaner
+ExecStart=/usr/bin/python /workspace/cleaner/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target     # 多用户模式下启用
+
+sudo systemctl daemon-reload      # 重载配置
+sudo systemctl enable cleaner    # 设置开机自启
+sudo systemctl start cleaner     # 立即启动服务
+

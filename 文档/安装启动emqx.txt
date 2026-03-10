@@ -1,0 +1,26 @@
+1.安装emqx，v5.3.2及以下版本才有windows版本
+下载地址：https://www.emqx.com/zh/downloads/broker
+官方文档：https://docs.emqx.com/zh/emqx/v5.0/deploy/install-windows.html
+需要用管理员身份运行，使用powerShell,第一次安装时，先运行.\emqx.cmd install，安装EMQX服务
+此命令只需要运行一次，以后再开机就不用执行它了，它对应的命令是uninstall
+提示ChangeServiceConfig 成功，则说明服务安装成功
+
+2.启动
+进入解压路径目录D:\2025\emqx-5.3.2-windows-amd64\bin
+通过以下命令启动 EMQX：emqx start
+
+3.常用命令
+.\emqx.cmd install 将发行版安装为 Windows 服务
+.\emqx.cmd start 启动服务和 Erlang 节点
+.\emqx.cmd stop 停止服务和 Erlang 节点
+.\emqx.cmd restart 运行停止命令和启动命令
+.\emqx.cmd uninstall 卸载服务并终止正在运行的节点
+.\emqx.cmd ping 检查节点是否正在运行
+.\emqx.cmd ctl 运行管理命令
+.\emqx.cmd console 在Windows shell 中启动 Erlang 版本
+.\emqx.cmd attach 连接到正在运行的节点并打开交互式控制台
+.\emqx.cmd remote_console - 与附加相同
+.\emqx.cmd list 显示已安装的 Erlang 服务的列表
+.\emqx.cmd usage 显示可用命令
+
+4.后端管理地址：http://127.0.0.1:18083/

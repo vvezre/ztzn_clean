@@ -1,0 +1,68 @@
+添加镜像
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free  # 最低优先级
+conda config --add channels https://mirrors.aliyun.com/anaconda/pkgs/main             # 最高优先级
+
+
+conda env list   # 或 conda info --envs ‌:ml-citation{ref="1,5" data="citationList"}
+
+conda search python
+
+conda create -n python-3.11 python=3.11  # 指定Python版本 ‌:ml-citation{ref="3,5" data="citationList"}
+
+conda activate python-3.11   # 进入环境 ‌:ml-citation{ref="1,5" data="citationList"}
+conda deactivate       # 退出环境 ‌:ml-citation{ref="3" data="citationList"}
+
+sudo apt-get install python-pip
+
+sudo apt update
+sudo apt install python-opencv
+
+sudo apt update
+sudo apt install python-pip
+
+pip3 install opencv-python
+pip install redis
+pip install pyserial
+pip install flask
+pip install Flask-CORS==3.0.10
+
+pip install geographiclib
+pip install matplotlib
+pip install pyproj
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ pyproj==1.9.6
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ paho-mqtt
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ apscheduler==3.6.3
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ pynmea2
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ pyrtcm 
+pip install requests
+
+set TMP=C:\temp
+set TEMP=C:\temp
+mkdir C:\temp
+pip install your-package
+
+sudo apt-get update
+sudo apt-get install nano
+
+
+# 安装nginx
+sudo apt update                                      # 更新软件包列表:ml-citation{ref="2,5" data="citationList"}  
+sudo apt install nginx -y                            # 安装Nginx:ml-citation{ref="2,5" data="citationList"}  
+sudo systemctl start nginx                           # 启动服务:ml-citation{ref="2,5" data="citationList"}  
+sudo systemctl enable nginx                          # 设置开机自启:ml-citation{ref="2,5" data="citationList"}
+/usr/share/nginx/html	或者 /var/www/html
+
+sudo apt purge nginx nginx-common   # 删除软件包及配置文件‌:ml-citation{ref="1,4" data="citationList"}
+sudo apt autoremove                 # 清理依赖包‌:ml-citation{ref="1,2" data="citationList"}
+
+
+# 安装redis
+# Ubuntu/Debian
+sudo apt update
+sudo apt install redis-server
+sudo systemctl status redis
+redis-cli info server | grep version
+# 修改配置文件
+redis.conf
+
+

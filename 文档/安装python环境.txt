@@ -1,0 +1,94 @@
+# 设置阿里云镜像源（覆盖90%场景）
+pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+
+# 验证配置
+pip3 config list  # 应显示 index-url='https://mirrors.aliyun.com/pypi/simple/'
+
+
+# 安装虚拟环境工具
+sudo apt install virtualenv
+
+# 创建 Python 2 环境
+virtualenv -p python2 venv_py2
+source venv_py2/bin/activate  # 激活环境
+python --version  # 显示 Python 2.x
+deactivate        # 退出环境
+
+# 创建 Python 3 环境
+virtualenv -p python3 venv_py3
+source venv_py3/bin/activate  # 激活环境
+python --version  # 显示 Python 3.x
+
+#永久配置镜像源
+mkdir -p ~/.pip
+nano ~/.pip/pip.conf
+
+[global]
+index-url = https://mirrors.aliyun.com/pypi/simple/
+[install]
+trusted-host = mirrors.aliyun.com
+
+# 验证配置生效
+pip config list
+
+# 查看虚拟环境下有哪些环境
+# 查找所有包含 bin/activate 的目录（标志虚拟环境）
+find ~ -path "*/bin/activate" 2>/dev/null
+
+# 卸载原来的python,重新安装python
+sudo apt remove --purge python*	# 卸载所有Python包
+sudo apt autoremove  # 清理残留依赖
+sudo apt clean  # 清除缓存
+
+# 删除用户数据与系统残留
+sudo rm -rf /usr/local/lib/python*  # 手动安装的Python库
+sudo rm -rf ~/.cache/pip  # 用户级pip缓存
+sudo rm -rf ~/.local/lib/python*  # 用户级Python库
+
+# 避免删除/usr/bin/python3（系统默认Python），否则需重装桌面环境
+sudo apt install ubuntu-desktop --reinstall  # 恢复桌面环境
+# 可选：重装显示管理器
+sudo apt install lightdm gdm3  # 根据原桌面环境选择
+sudo systemctl restart lightdm  # 重启图形服务
+
+sudo apt update && sudo apt install -y \
+   build-essential zlib1g-dev libncurses5-dev \
+   libgdbm-dev libnss3-dev libssl-dev libreadline-dev \
+   libffi-dev libsqlite3-dev libbz2-dev  # 基础编译工具链
+   
+# 下载并编译指定版本‌（以Python 3.9为例）
+wget https://www.python.org/ftp/python/3.9.12/Python-3.9.12.tar.xz
+tar -xf Python-3.9.12.tar.xz
+cd Python-3.9.12
+./configure --enable-optimizations  # 启用优化
+make -j $(nproc)  # 多核编译加速
+sudo make altinstall  # 安装到/usr/local/bin（不覆盖系统Python）
+
+python3.9 --version
+
+python3.9 -m venv myenv  # 创建隔离环境
+source myenv/bin/activate  # 激活环境
+
+sudo update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.9 1
+sudo update-alternatives --config python3  # 选择默认版本
+
+curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+python3.9 get-pip.py  # 为新Python安装pip
+pip3.9 install virtualenv virtualenvwrapper  # 安装虚拟环境工具
+
+# 删除原有pip3链接
+sudo rm -f /usr/bin/pip3
+
+# 创建新链接指向pip3.9
+sudo ln -s /usr/local/bin/pip3.9 /usr/bin/pip3
+
+# 验证版本
+pip3 --version  # 应显示pip3.9版本信息
+
+
+python -m venv torch_env
+torch_env\Scripts\activate
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+
+

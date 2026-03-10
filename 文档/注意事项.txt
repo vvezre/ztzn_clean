@@ -1,0 +1,2 @@
+redis中设置电池
+set voltage 20
