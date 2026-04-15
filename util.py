@@ -928,7 +928,6 @@ def compute_center_from_master(lat_m, lon_m, heading_deg,offset_x_front, offset_
     c_lat,c_lon = util.get_B_GPS(lat,lon,offset_x_front,(heading_deg+90)%360)
     return c_lat,c_lon
 
-
 def compute_center_from_antenna(lat_ant, lon_ant, heading_deg, dx_back, dy_right):
     """
     已知主天线位置和航向，计算小车中心点位置（中心在主天线后方 dx_back、右侧 dy_right）
@@ -965,6 +964,83 @@ def compute_center_from_antenna(lat_ant, lon_ant, heading_deg, dx_back, dy_right
     lon_center = result['lon2']
 
     return round(lat_center,8), round(lon_center,8)
+
+
+def calculate_center_offset(lat_main, lon_main, heading_deg, dist_right, dist_back):
+    """
+    计算小车中心点经纬度
+    :param lat_main: 主天线纬度 (度)
+    :param lon_main: 主天线经度 (度)
+    :param heading_deg: 车辆航向角 (度), 北0, 东90, 南180, 西270
+    :param dist_right: 中心点在主天线右侧的距离 (米) (横向偏移)
+    :param dist_back: 中心点在主天线后方的距离 (米) (纵向偏移，即您说的"下")
+                      如果中心点在主天线前方，此值设为负数
+    :return: (center_lat, center_lon)
+    """
+    R = 6371000.0  # 地球半径 (米)
+
+    # 1. 角度转弧度
+    lat_rad = math.radians(lat_main)
+    heading_rad = math.radians(heading_deg)
+
+    # 2. 计算局部东北坐标系下的增量 (ENU)
+    # 公式推导：
+    # 向右向量 (Heading + 90): (cos(h), -sin(h)) * dist_right
+    # 向后向量 (Heading + 180): (-sin(h), -cos(h)) * dist_back
+
+    delta_east = (dist_right * math.cos(heading_rad)) - (dist_back * math.sin(heading_rad))
+    delta_north = (-dist_right * math.sin(heading_rad)) - (dist_back * math.cos(heading_rad))
+
+    # 3. 将米转换为经纬度增量
+    delta_lat_rad = delta_north / R
+    # 经度方向需要除以纬度的余弦值，因为经线在两极收敛
+    delta_lon_rad = delta_east / (R * math.cos(lat_rad))
+
+    # 4. 计算最终坐标
+    center_lat_rad = lat_rad + delta_lat_rad
+    center_lon_rad = math.radians(lon_main) + delta_lon_rad
+
+    # 5. 转回度数
+    lat_center = math.degrees(center_lat_rad)
+    lon_center = math.degrees(center_lon_rad)
+
+    return round(lat_center,8), round(lon_center,8)
+
+def calculate_center_gps(lat_main, lon_main, heading, offset_x, offset_y):
+    """
+    计算小车中心点的经纬度
+
+    参数:
+    lat_main (float): 主天线纬度 (十进制度数)
+    lon_main (float): 主天线经度 (十进制度数)
+    heading (float): 航向角 (度, 0度为正北, 顺时针增加)
+    offset_x (float): 中心点相对于主天线的横向偏移 (米, 向右为正)
+    offset_y (float): 中心点相对于主天线的纵向偏移 (米, 向前为正)
+
+    返回:
+    tuple: (中心点纬度, 中心点经度)
+    """
+
+    # 将航向角转换为弧度
+    heading_rad = math.radians(heading)
+
+    # 将偏移量转换为东向和北向的偏移量
+    delta_east = offset_x * math.cos(heading_rad) + offset_y * math.sin(heading_rad)
+    delta_north = -offset_x * math.sin(heading_rad) + offset_y * math.cos(heading_rad)
+
+    # 将北向偏移量转换为纬度修正值
+    delta_lat = delta_north / 111139.0
+
+    # 将东向偏移量转换为经度修正值
+    # 注意：经度每度的米数随纬度变化，需要乘以cos(纬度)
+    delta_lon = delta_east / (111139.0 * math.cos(math.radians(lat_main)))
+
+    # 计算中心点的经纬度
+    lat_center = lat_main + delta_lat
+    lon_center = lon_main + delta_lon
+
+    return lat_center, lon_center
+
 
 def test01():
     # 主天线位置

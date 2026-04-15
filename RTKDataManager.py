@@ -134,15 +134,20 @@ class RTKDataManager:
         ser_rtk_params = {'port': self.port, 'baudRate': self.baudrate, 'timeout': 1}
         rtk_generator = util.readRTK(ser_rtk_params)
         for lat, lon, heading_deg in rtk_generator:
+            # logger.info('lat={},lon={},heading={}'.format(lat, lon, heading_deg))
             rtk_data = RTKData()
             # 估算中心
             # result = estimator.estimate_center_from_rear_antenna(lat, lon, heading_deg)
             # c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.17, 0.11)
-            c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.16, 0.13)
+            c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.11, 0.17)
+            # c_lat,c_lon = util.calculate_center_offset(lat,lon,heading_deg,0.1,0.2)
+            # c_lat, c_lon = util.calculate_center_gps(lat,lon,heading_deg,0.1,0.2)
             # rtk_data.lat = round(result['center_lat'], 8)
             # rtk_data.lon = round(result['center_lon'], 8)
             rtk_data.lat = c_lat
             rtk_data.lon = c_lon
+            # rtk_data.lat = lat
+            # rtk_data.lon = lon
             rtk_data.heading = heading_deg
             self._notify_observers(rtk_data)
 

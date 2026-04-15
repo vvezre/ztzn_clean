@@ -105,26 +105,24 @@ class VehicleCenterEstimator:
 
 if __name__ == "__main__":
     # 创建估计器：基线 0.2m，中心在后天线前 0.1m
-    # estimator = VehicleCenterEstimator(baseline_length=0.23)
     estimator = VehicleCenterEstimator(baseline_length=0.23)
 
     # 模拟 RTK 数据
-    lat1 = 32.03656709
-    lon1 = 118.92460540
-    heading1 = 275.07
+    rear_lat = 32.03656615
+    rear_lon = 118.92466217
+    heading = 93.07
 
     # 估算中心
-    result = estimator.estimate_center_from_rear_antenna(lat1, lon1, heading1)
+    result = estimator.estimate_center_from_rear_antenna(rear_lat, rear_lon, heading)
 
     print("✅ 车辆中心位置:")
     print("   纬度: {:.8f}°".format(result['center_lat']))
     print("   经度: {:.8f}°".format(result['center_lon']))
     print("   UTM: E={:.3f}, N={:.3f} (Zone {}N)".format(result['center_utm'][0],result['center_utm'][1],result['utm_zone']))
 
-
-    lat2 = 32.03656860
-    lon2 = 118.92460220
-    heading2 = 2.56
+    lat2 = 32.03656713
+    lon2 = 118.92466388
+    heading2 = 185.61
 
     # 估算中心
     result2 = estimator.estimate_center_from_rear_antenna(lat2, lon2, heading2)
@@ -132,9 +130,9 @@ if __name__ == "__main__":
                                      result2['center_lon'])
     print(r)
 
-    lat3 = 32.03657101
-    lon3 = 118.92460375
-    heading3 = 95.72
+    lat3 = 32.03656586
+    lon3 = 118.92466485
+    heading3 = 276.72
 
     # 估算中心
     result3 = estimator.estimate_center_from_rear_antenna(lat3, lon3, heading3)
@@ -142,9 +140,9 @@ if __name__ == "__main__":
                                 result3['center_lon'])
     print(r)
 
-    lat4 = 32.03657001
-    lon4 = 118.92460675
-    heading4 = 185.70
+    lat4 = 32.03656513
+    lon4 = 118.92466335
+    heading4 = 3.70
 
     # 估算中心
     result3 = estimator.estimate_center_from_rear_antenna(lat4, lon4, heading4)

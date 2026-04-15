@@ -34,10 +34,10 @@ class FixedPositiveChecker:
         # 使用 all() 函数检查所有元素是否 > 0
         result = all(num > 0 for num in self.buffer)
 
-        if result:
-            logger.warn("缓冲区中的 {} 个数都是正数: {}".format(self.window_size,list(self.buffer)))
-        else:
-            logger.warn("缓冲区中的 {} 个数不全是正数: {}".format(self.window_size,list(self.buffer)))
+        # if result:
+        #     logger.warn("缓冲区中的 {} 个数都是正数: {}".format(self.window_size,list(self.buffer)))
+        # else:
+        #     logger.warn("缓冲区中的 {} 个数不全是正数: {}".format(self.window_size,list(self.buffer)))
 
         return result
 
