@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # coding=utf-8
 """
 MQTT客户端模块
@@ -10,6 +10,14 @@ import time
 import threading
 import paho.mqtt.client as mqtt
 from AppLogger import logger
+
+try:
+    text_type = unicode
+    binary_type = str
+except NameError:
+    text_type = str
+    binary_type = bytes
+
 
 
 class MQTTClient:
@@ -36,10 +44,14 @@ class MQTTClient:
         self.connected = False
         self.message_callback = None
 
-        # 构建主题
-        topic_suffix = "{}{}".format(config['mqtt']['product_model'],config['mqtt']['product_id'])
-        self.subscribe_topic = "RAILCAR/S/{}".format(topic_suffix)  # 后端订阅主题（接收控制指令）
-        self.publish_topic = "RAILCAR/R/{}".format(topic_suffix)  # 后端发布主题（上报状态）
+        # 构建主题，优先使用显式配置，回退到 product_model + product_id
+        topics = config.get('topics', {})
+        topic_suffix = "{}{}".format(
+            config['mqtt'].get('product_model', ''),
+            config['mqtt'].get('product_id', '')
+        )
+        self.subscribe_topic = topics.get('subscribe') or "RAILCAR/S/{}".format(topic_suffix)  # 后端订阅主题（接收控制指令）
+        self.publish_topic = topics.get('publish') or "RAILCAR/R/{}".format(topic_suffix)  # 后端发布主题（上报状态）
 
         logger.info("MQTT主题配置 - 订阅: {}, 发布: {}".format(self.subscribe_topic,self.publish_topic))
 
@@ -147,7 +159,26 @@ class MQTTClient:
             'timestamp': int(time.time()),
             'data': data
         }
-        return json.dumps(message, ensure_ascii=False).encode('utf-8')
+        normalized = self._normalize_json_value(message)
+        return json.dumps(normalized, ensure_ascii=False).encode('utf-8')
+
+    def _normalize_json_value(self, value):
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                result[self._normalize_json_value(key)] = self._normalize_json_value(item)
+            return result
+        if isinstance(value, list):
+            return [self._normalize_json_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._normalize_json_value(item) for item in value]
+        if isinstance(value, binary_type) and not isinstance(value, text_type):
+            try:
+                return value.decode('utf-8')
+            except Exception:
+                return value.decode('utf-8', 'replace')
+        return value
+
 
     def _parse_message(self, payload):
         """

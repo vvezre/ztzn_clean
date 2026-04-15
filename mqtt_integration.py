@@ -43,7 +43,7 @@ class MQTTIntegration:
         self.running = False
 
         # 状态上报间隔（秒）
-        self.status_interval = config.get('status_interval', 5)
+        self.status_interval = config.get('mqtt', {}).get('status_interval', 5)
 
         logger.info("MQTT集成模块初始化完成")
 
@@ -56,7 +56,7 @@ class MQTTIntegration:
         """
         try:
             # 使用命令处理器处理消息
-            result = self.command_handler.handle_message(message_data)
+            result = self.command_handler.handle(message_data)
 
             # 发布命令执行结果
             self._publish_command_result(message_data.get('command'), result)

@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 import base64
 import socket
 import threading
@@ -31,7 +31,7 @@ class RTKData:
     def __init__(self):
         self.lat = 0.0  # float
         self.lon = 0.0  # float
-        self.heading = 0.0  # float
+        self.heading = None  # float
         self.timestamp = datetime.datetime.now()  # datetime.datetime
 
     def __str__(self):
@@ -40,7 +40,7 @@ class RTKData:
                 "heading: {heading:.2f}, Time: {time}").format(
             lat=self.lat,
             lon=self.lon,
-            heading=self.heading,
+            heading=self.heading if self.heading is not None else 0.0,
             time=self.timestamp.strftime('%H:%M:%S.%f')[:-3]
         )
 
@@ -49,7 +49,7 @@ class RTKData:
                 "time={time})").format(
             lat=self.lat,
             lon=self.lon,
-            heading=self.heading,
+            heading=self.heading if self.heading is not None else 0.0,
             time=repr(self.timestamp)
         )
 # ==================== 观察者模式核心类 ====================
@@ -132,14 +132,17 @@ class RTKDataManager:
         # 创建估计器：基线 0.2m，中心在后天线前 0.1m
         estimator = VehicleCenterEstimator(baseline_length=0.23)
         ser_rtk_params = {'port': self.port, 'baudRate': self.baudrate, 'timeout': 1}
-        rtk_generator = util.readRTK(ser_rtk_params)
+        rtk_generator = util.readRTK_v2(ser_rtk_params)
         for lat, lon, heading_deg in rtk_generator:
             # logger.info('lat={},lon={},heading={}'.format(lat, lon, heading_deg))
             rtk_data = RTKData()
             # 估算中心
             # result = estimator.estimate_center_from_rear_antenna(lat, lon, heading_deg)
             # c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.17, 0.11)
-            c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.11, 0.17)
+            if heading_deg is None:
+                c_lat, c_lon = lat, lon
+            else:
+                c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.11, 0.17)
             # c_lat,c_lon = util.calculate_center_offset(lat,lon,heading_deg,0.1,0.2)
             # c_lat, c_lon = util.calculate_center_gps(lat,lon,heading_deg,0.1,0.2)
             # rtk_data.lat = round(result['center_lat'], 8)

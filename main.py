@@ -50,11 +50,12 @@ from FixedPositiveChecker import FixedPositiveChecker
 from flask_cors import CORS
 
 from MqttClient import MqttClient
+from ntrip_runtime import get_shared_runtime
 from RTKDataManager import RTKDataManager
 # from pid import PID
 
-# from mqtt_integration import MQTTIntegration
-# from mqtt_vehicle_adapter import VehicleControllerAdapter
+from mqtt_integration import MQTTIntegration
+from mqtt_vehicle_adapter import VehicleControllerAdapter
 
 app = Flask(__name__)
 CORS(app)
@@ -2069,6 +2070,10 @@ def observer_rtk_data(data):
     """观察者用于获取rtk数据，将航向角发送给下位机，将经纬度发送给服务端"""
     lat = data.lat
     lon = data.lon
+    if data.heading is None:
+        if redis_cli.get('openLog') == '1':
+            logger.warning("RTK宸叉洿鏂扮粡绾害锛屼絾褰撳墠鏃犳湁鏁堣埅鍚戣锛岃烦杩囪埅鍚戝悓姝? lat={}, lon={}".format(lat, lon))
+        return
     heading = int(data.heading)
     # preBuildCommand()
     setHeadingToVehicle(heading)
@@ -2091,9 +2096,13 @@ def observer_go_correct(data):
     global global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading,global_go
     global_cur_rtk_lat = data.lat
     global_cur_rtk_lon = data.lon
-    global_cur_rtk_heading = data.heading
+    if data.heading is not None:
+        global_cur_rtk_heading = data.heading
     # global_go=1表示直行启动
     if global_go == 1:
+        if data.heading is None:
+            logger.warning("RTK缁忕含搴﹀凡鏇存柊锛屼絾褰撳墠鏃犳湁鏁堣埅鍚戣锛屾殏涓嶆墽琛岀洿琛岀籂鍋?...")
+            return
         start_lat = global_cur_taskPoint['startLat']
         start_lon = global_cur_taskPoint['startLon']
         target_lat = global_cur_taskPoint['endLat']
@@ -4748,6 +4757,13 @@ def listenerVoltage():
 
 def listenerRTK():
     if rtk_port != None:
+        # 在RTK读线程启动前先建立NTRIP差分链路,失败不阻塞后续读取
+        try:
+            if get_shared_runtime(logger).prepare():
+                logger.info("NTRIP差分链路已预连接")
+        except Exception as exc:
+            logger.error("NTRIP预连接异常: {}".format(exc))
+
         rtk_manager = RTKDataManager(rtk_port, baudrate=115200)
         # 注册多个观察者
         rtk_manager.register_observer(observer_rtk_data)
@@ -4777,11 +4793,13 @@ def init_mqtt(redis_client=None):
     # 构建config
     config = util.readConfig('mqtt_config.json')
     # 创建小车控制器
-    # vehicle_controller = VehicleControllerAdapter()
-    #
-    # if global_mqtt_integration is None:
-    #     global_mqtt_integration = MQTTIntegration(config, vehicle_controller, redis_client)
-    #     global_mqtt_integration.start()
+    vehicle_controller = VehicleControllerAdapter()
+
+    if global_mqtt_integration is None:
+        global_mqtt_integration = MQTTIntegration(config, vehicle_controller, redis_client)
+        global_mqtt_integration.start()
+
+    return global_mqtt_integration
 
 # def my_message_handler(topic, payload):
 #     logger.warn("[自定义处理] 主题: {}, 消息: {}".format(topic,payload))
@@ -4904,7 +4922,7 @@ def main():
     # ws_thread.start()
 
     # 启动mqtt
-    # init_mqtt(redis_cli)
+    init_mqtt(redis_cli)
 
     # 启动flask后台服务
     app.run(host='0.0.0.0', port=7899)

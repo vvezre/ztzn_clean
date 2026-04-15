@@ -12,6 +12,25 @@ class MQTTCommandHandler:
         """
         self.vehicle_controller = vehicle_controller
         self.command_map = self._init_command_map()
+        self.command_map.update({
+            'turnLeft': self._handle_turn_left,
+            'turnRight': self._handle_turn_right,
+            'joystickMove': self._handle_joystick_move,
+            'autoDrive': self._handle_auto_drive,
+            'goOn': self._handle_go_on,
+            'returnToPoint': self._handle_return_to_point,
+            'enterGarage': self._handle_enter_garage,
+            'exitGarage': self._handle_exit_garage,
+            'adjustSpeed': self._handle_adjust_speed,
+            'adjustBrushSpeed': self._handle_adjust_brush_speed,
+            'toggleTracking': self._handle_toggle_tracking,
+            'togglePathPlanning': self._handle_toggle_path_planning,
+            'createTask': self._handle_create_task,
+            'selectTask': self._handle_select_task,
+            'saveTask': self._handle_save_task,
+            'saveParams': self._handle_save_params,
+            'getStatus': self._handle_get_status,
+        })
         logger.info("MQTT命令处理器初始化完成")
 
     def _init_command_map(self):
@@ -71,7 +90,9 @@ class MQTTCommandHandler:
         try:
             # 提取命令和参数
             command = message_data.get('command')
-            params = message_data.get('params', {})
+            params = message_data.get('params')
+            if params is None:
+                params = message_data.get('parameters', {})
 
             if not command:
                 logger.warning("消息缺少command字段: {}".format(message_data))

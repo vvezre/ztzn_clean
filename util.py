@@ -13,6 +13,7 @@ from geographiclib.geodesic import Geodesic
 
 import util
 from AppLogger import logger
+from ntrip_runtime import extract_gga_quality, get_shared_runtime
 
 ser_rtk = None
 
@@ -362,16 +363,13 @@ def deep_copy_list(lst):
     return [copy.deepcopy(item) for item in lst]
 
 #分析gngga数据
-def parse_gngga(line):
-    # line = "$GNGGA,070622.00,3202.20138810,N,11855.48034587,E,4,30,0.6,40.6076,M,2.7092,M,1.0,569*60"
-    if not line.startswith("$GNGGA"):
+def parse_gga_info(line):
+    if not line.startswith(("$GNGGA", "$GPGGA")):
         return None
     parts = line.strip().split(',')
     if len(parts) < 7:
         return None
-
-    # 检查 E,4 条件：E方向且Fix类型为4
-    if parts[5] != 'E' or parts[6] != '4':
+    if not parts[2] or not parts[3] or not parts[4] or not parts[5]:
         return None
 
     try:
@@ -379,9 +377,27 @@ def parse_gngga(line):
         lon_raw = float(parts[4])
         lat = int(lat_raw / 100) + (lat_raw % 100) / 60
         lon = int(lon_raw / 100) + (lon_raw % 100) / 60
-        return (round(lat, 8), round(lon, 8))
+        if parts[3] == 'S':
+            lat = -lat
+        if parts[5] == 'W':
+            lon = -lon
+        return {
+            'lat': round(lat, 8),
+            'lon': round(lon, 8),
+            'quality': parts[6].strip(),
+            'sentence': line.strip()
+        }
     except:
         return None
+
+
+def parse_gngga(line):
+    info = parse_gga_info(line)
+    if not info:
+        return None
+    if info.get('quality') != '4':
+        return None
+    return (info['lat'], info['lon'])
 
 #分析uniheadinga数据
 def parse_uniheadinga(line):
@@ -398,12 +414,14 @@ def parse_uniheadinga(line):
 
 #分析GPTHS数据
 def parse_GPTHS(line):
-    if not line.startswith("$GNTHS"):
+    if not line.startswith(("$GNTHS", "$GPTHS")):
         return None
     parts = line.strip().split(',')
     if len(parts) < 3:
         return None
     try:
+        if parts[2] and parts[2] != 'A':
+            return None
         heading = float(parts[1])  # 第1个字段是角度
         return heading
     except:
@@ -565,6 +583,103 @@ def readRTK(ser_rtk_params, sync_threshold = 0.5,timeout = 1):
             logger.error("其他错误: {}".format(e))
 
         time.sleep(1)  # 确保休眠在所有情况（包括失败）下都执行，防止死循环
+def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
+    global ser_rtk
+    buffer = {}
+    last_heading = None
+    last_quality = None
+    correction_runtime = get_shared_runtime(logger)
+
+    while True:
+        try:
+            rtk_port = util.findPort('$GN')
+            if not rtk_port:
+                logger.warning("鏈壘鍒癛TK涓插彛锛岀瓑寰呴噸璇?...")
+                time.sleep(1)
+                continue
+
+            with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=0.1) as ser_rtk:
+                logger.warning("RTK涓插彛宸叉墦寮€: {}".format(rtk_port))
+                while ser_rtk.is_open:
+                    try:
+                        correction_runtime.step(ser_rtk)
+                        line = ser_rtk.readline()
+                        if not line:
+                            time.sleep(0.01)
+                            continue
+
+                        timestamp = time.time()
+                        line_str = line.decode('utf-8', errors='ignore').strip()
+                        if not line_str:
+                            continue
+
+                        if line_str.startswith(("$GNGGA", "$GPGGA")):
+                            correction_runtime.observe_gga(line_str)
+                            quality = extract_gga_quality(line_str)
+                            if quality != last_quality:
+                                logger.warning("RTK GGA瀹氫綅鐘舵€佹洿鏂? fix={}".format(quality))
+                                last_quality = quality
+
+                            gps = parse_gngga(line_str)
+                            if gps:
+                                buffer['gga'] = {
+                                    'timestamp': timestamp,
+                                    'lat': gps[0],
+                                    'lon': gps[1]
+                                }
+                                if 'ths' in buffer:
+                                    gga_ts = buffer['gga']['timestamp']
+                                    ths_ts = buffer['ths']['timestamp']
+                                    if abs(gga_ts - ths_ts) < sync_threshold:
+                                        lat = buffer['gga']['lat']
+                                        lon = buffer['gga']['lon']
+                                        heading_deg = buffer['ths']['heading']
+                                        del buffer['gga']
+                                        del buffer['ths']
+                                        last_heading = heading_deg
+                                        yield lat, lon, heading_deg
+                                    else:
+                                        heading_deg = last_heading if last_heading is not None else buffer['ths']['heading']
+                                        lat = buffer['gga']['lat']
+                                        lon = buffer['gga']['lon']
+                                        del buffer['gga']
+                                        yield lat, lon, heading_deg
+                                else:
+                                    lat = buffer['gga']['lat']
+                                    lon = buffer['gga']['lon']
+                                    del buffer['gga']
+                                    yield lat, lon, last_heading
+
+                        elif line_str.startswith(("$GNTHS", "$GPTHS")):
+                            heading = parse_GPTHS(line_str)
+                            if heading is not None:
+                                last_heading = heading
+                                buffer['ths'] = {
+                                    'timestamp': timestamp,
+                                    'heading': heading
+                                }
+
+                        elif line_str.startswith("$GNHPR"):
+                            heading_info = parse_GNHPR(line_str)
+                            if heading_info is not None:
+                                last_heading = heading_info[0]
+                                buffer['ths'] = {
+                                    'timestamp': timestamp,
+                                    'heading': heading_info[0]
+                                }
+                    except Exception as e:
+                        logger.error("璇诲彇RTK鏁版嵁寮傚父: {}".format(e))
+                        break
+        except serial.SerialException as e:
+            logger.error("鎵撳紑RTK涓插彛澶辫触: {}".format(e))
+        except Exception as e:
+            logger.error("RTK涓插彛鍏朵粬閿欒: {}".format(e))
+        finally:
+            correction_runtime.close()
+
+        time.sleep(1)
+
+
 # def readRTK(ser_rtk_params, sync_threshold = 0.5,timeout = 5):
 #     buffer = {}  # 缓存最近的 GGA 和 THS 数据
 #     global ser_rtk

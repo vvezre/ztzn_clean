@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "host": "103.45.160.41",
+  "port": 8002,
+  "mountpoint": "RTCM33_GRCE",
+  "username": "replace-with-your-username",
+  "password": "replace-with-your-password",
+  "gga_interval_seconds": 5,
+  "connect_timeout_seconds": 5,
+  "reconnect_interval_seconds": 5
+}
