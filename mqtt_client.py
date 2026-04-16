@@ -43,6 +43,29 @@ class MQTTClient:
         self.client = None
         self.connected = False
         self.message_callback = None
+        self.loop_started = False
+        self.stop_event = threading.Event()
+        self.connect_lock = threading.Lock()
+        self.reconnect_lock = threading.Lock()
+        self.reconnect_thread = None
+        self._intentional_disconnect = False
+
+        mqtt_config = config.get('mqtt', {})
+        self.keepalive = mqtt_config.get('keepalive', 60)
+        self.auto_reconnect = mqtt_config.get('auto_reconnect', True)
+        self.reconnect_delay = max(1, int(mqtt_config.get('reconnect_delay', 5)))
+        self.max_reconnect_delay = max(
+            self.reconnect_delay,
+            int(mqtt_config.get('max_reconnect_delay', 60))
+        )
+        self.connect_wait_timeout = max(1.0, float(mqtt_config.get('connect_wait_timeout', 5)))
+
+        now = time.time()
+        self.last_activity_at = now
+        self.last_publish_at = 0
+        self.last_receive_at = 0
+        self.last_connect_at = 0
+        self.last_connect_attempt_at = 0
 
         # 构建主题，优先使用显式配置，回退到 product_model + product_id
         topics = config.get('topics', {})
@@ -76,21 +99,121 @@ class MQTTClient:
         self.client.on_message = self._on_message
 
         # 设置遗嘱消息（连接异常断开时发送）
-        will_payload = self._build_message({
-            'status': 'offline',
-            'timestamp': int(time.time())
-        })
+        will_payload = self._build_message(self._build_presence_data('offline'))
         self.client.will_set(
             self.publish_topic,
             will_payload,
-            qos=self.config.get('qos', 1),
+            qos=self.config.get('mqtt', {}).get('qos', 1),
             retain=True
         )
+
+    def _build_presence_data(self, state):
+        """构建在线状态消息体。"""
+        timestamp = int(time.time())
+        return {
+            'type': state,
+            'status': state,
+            'timestamp': timestamp
+        }
+
+    def _mark_activity(self, publish=False, receive=False, connected=False):
+        now = time.time()
+        self.last_activity_at = now
+        if publish:
+            self.last_publish_at = now
+        if receive:
+            self.last_receive_at = now
+        if connected:
+            self.last_connect_at = now
+
+    def _start_network_loop(self):
+        if not self.loop_started:
+            self.client.loop_start()
+            self.loop_started = True
+
+    def _wait_for_connection(self, timeout=None):
+        deadline = time.time() + (timeout if timeout is not None else self.connect_wait_timeout)
+        while not self.connected and time.time() < deadline and not self.stop_event.is_set():
+            time.sleep(0.2)
+        return self.connected
+
+    def _connect_once(self):
+        if self.connected:
+            return True
+
+        with self.connect_lock:
+            if self.connected:
+                return True
+
+            self.last_connect_attempt_at = time.time()
+            try:
+                logger.info(
+                    "正在连接MQTT服务器: {}:{}".format(
+                        self.config['mqtt']['broker'],
+                        self.config['mqtt']['port']
+                    )
+                )
+                self._intentional_disconnect = False
+                if self.loop_started and self.last_connect_at > 0:
+                    self.client.reconnect()
+                else:
+                    self.client.connect(
+                        self.config['mqtt']['broker'],
+                        self.config['mqtt']['port'],
+                        keepalive=self.keepalive
+                    )
+                self._start_network_loop()
+            except Exception as e:
+                logger.error("MQTT连接异常: {}".format(str(e)), exc_info=True)
+                return False
+
+        if self._wait_for_connection():
+            logger.info("MQTT客户端已启动")
+            return True
+
+        logger.error("MQTT连接超时")
+        return False
+
+    def _schedule_reconnect(self, immediate=False):
+        if not self.auto_reconnect or self.stop_event.is_set() or self._intentional_disconnect:
+            return False
+
+        with self.reconnect_lock:
+            if self.reconnect_thread and self.reconnect_thread.is_alive():
+                return False
+
+            self.reconnect_thread = threading.Thread(
+                target=self._reconnect_loop,
+                args=(immediate,)
+            )
+            self.reconnect_thread.daemon = True
+            self.reconnect_thread.start()
+            return True
+
+    def _reconnect_loop(self, immediate=False):
+        delay = 0 if immediate else self.reconnect_delay
+
+        while not self.stop_event.is_set():
+            if self.connected:
+                return
+
+            if delay > 0:
+                logger.info("MQTT将在 {} 秒后重连".format(delay))
+                if self.stop_event.wait(delay):
+                    return
+
+            if self._connect_once():
+                logger.info("MQTT自动重连成功")
+                return
+
+            delay = self.reconnect_delay if delay <= 0 else min(delay * 2, self.max_reconnect_delay)
+            logger.warning("MQTT重连失败，继续重试")
 
     def _on_connect(self, client, userdata, flags, rc):
         """连接回调"""
         if rc == 0:
             self.connected = True
+            self._mark_activity(connected=True)
             logger.info("MQTT连接成功 - Broker: {}:{}".format(self.config['mqtt']['broker'],self.config['mqtt']['port']))
 
             # 订阅控制主题
@@ -101,10 +224,7 @@ class MQTTClient:
                 logger.error("订阅主题失败: {}, 错误码: {}".format(self.subscribe_topic,result))
 
             # 发布上线消息
-            self.publish_status({
-                'status': 'online',
-                'timestamp': int(time.time())
-            })
+            self.publish_status(self._build_presence_data('online'))
         else:
             self.connected = False
             error_msg = {
@@ -121,6 +241,7 @@ class MQTTClient:
         self.connected = False
         if rc != 0:
             logger.warning("MQTT意外断开 - 错误码: {}, 将尝试重连...".format(rc))
+            self._schedule_reconnect(immediate=True)
         else:
             logger.info("MQTT正常断开连接")
 
@@ -128,6 +249,7 @@ class MQTTClient:
         """消息接收回调"""
         try:
             payload = msg.payload.decode('utf-8')
+            self._mark_activity(receive=True)
             logger.info("收到MQTT消息 - Topic: {}, Payload: {}".format(msg.topic,payload))
 
             # 解析消息
@@ -193,52 +315,40 @@ class MQTTClient:
         try:
             message = json.loads(payload)
             return message.get('data', message)
-        except json.JSONDecodeError:
+        except (ValueError, TypeError):
             logger.warning("消息不是有效的JSON格式，原样返回: {}".format(payload))
             return {'raw': payload}
 
     def connect(self):
         """连接到MQTT服务器"""
-        try:
-            logger.info("正在连接MQTT服务器: {}:{}".format(self.config['mqtt']['broker'],self.config['mqtt']['port']))
-            self.client.connect(
-                self.config['mqtt']['broker'],
-                self.config['mqtt']['port'],
-                keepalive=self.config.get('mqtt').get('keepalive', 60)
-            )
+        self.stop_event.clear()
+        success = self._connect_once()
+        if not success:
+            self._schedule_reconnect(immediate=False)
+        return success
 
-            # 在后台线程中运行网络循环
-            self.client.loop_start()
-
-            # 等待连接建立
-            retry_count = 0
-            while not self.connected and retry_count < 10:
-                time.sleep(0.5)
-                retry_count += 1
-
-            if self.connected:
-                logger.info("MQTT客户端已启动")
-                return True
-            else:
-                logger.error("MQTT连接超时")
-                return False
-
-        except Exception as e:
-            logger.error("MQTT连接异常: {}".format(str(e)), exc_info=True)
-            return False
+    def ensure_connected(self):
+        """确保连接存在；若已断开则进入后台重连。"""
+        if self.connected:
+            return True
+        self._schedule_reconnect(immediate=True)
+        return False
 
     def disconnect(self):
         """断开MQTT连接"""
         try:
-            # 发布下线消息
-            self.publish_status({
-                'status': 'offline',
-                'timestamp': int(time.time())
-            })
+            self._intentional_disconnect = True
+            self.stop_event.set()
 
-            time.sleep(0.5)  # 等待消息发送完成
+            if self.connected:
+                # 发布下线消息
+                self.publish_status(self._build_presence_data('offline'))
+                time.sleep(0.5)  # 等待消息发送完成
 
-            self.client.loop_stop()
+            if self.loop_started:
+                self.client.loop_stop()
+                self.loop_started = False
+
             self.client.disconnect()
             logger.info("MQTT客户端已断开")
         except Exception as e:
@@ -259,23 +369,30 @@ class MQTTClient:
         """
         if not self.connected:
             logger.warning("MQTT未连接，无法发布消息")
+            self.ensure_connected()
             return False
 
         try:
             payload = self._build_message(data)
-            qos = qos if qos is not None else self.config.get('qos', 1)
+            qos = qos if qos is not None else self.config.get('mqtt', {}).get('qos', 1)
 
             result = self.client.publish(topic, payload, qos=qos, retain=retain)
 
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                self._mark_activity(publish=True)
                 logger.debug("消息发布成功 - Topic: {}".format(topic))
                 return True
             else:
                 logger.error("消息发布失败 - Topic: {}, 错误码: {}".format(topic,result.rc))
+                if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                    self.connected = False
+                    self.ensure_connected()
                 return False
 
         except Exception as e:
             logger.error("发布消息异常: {}".format(str(e)), exc_info=True)
+            self.connected = False
+            self.ensure_connected()
             return False
 
     def publish_status(self, status_data):
@@ -303,6 +420,12 @@ class MQTTClient:
     def is_connected(self):
         """检查是否已连接"""
         return self.connected
+
+    def get_last_publish_at(self):
+        return self.last_publish_at
+
+    def get_last_activity_at(self):
+        return self.last_activity_at
 
 
 # 单例模式

@@ -27,8 +27,14 @@ class MQTTIntegration:
         self.mqtt_client.set_message_callback(self._on_mqtt_message)
 
         self.status_thread = None
+        self.heartbeat_thread = None
         self.running = False
         self.status_interval = config.get('mqtt', {}).get('status_interval', 5)
+        self.heartbeat_interval = max(
+            float(config.get('mqtt', {}).get('heartbeat_interval', max(self.status_interval * 3, 15))),
+            1.0
+        )
+        self.heartbeat_check_interval = min(max(int(self.heartbeat_interval / 3), 1), 5)
 
         logger.info("MQTT集成模块初始化完成")
 
@@ -195,21 +201,52 @@ class MQTTIntegration:
 
         while self.running:
             try:
+                if not self.mqtt_client.ensure_connected():
+                    time.sleep(1)
+                    continue
+
                 self.publish_vehicle_status()
                 time.sleep(self.status_interval)
             except Exception as e:
                 logger.error("状态上报循环异常: {}".format(str(e)), exc_info=True)
                 time.sleep(1)
 
+    def _heartbeat_loop(self):
+        logger.info("MQTT心跳监测线程已启动，间隔 {} 秒".format(self.heartbeat_interval))
+
+        while self.running:
+            try:
+                if not self.mqtt_client.is_connected():
+                    self.mqtt_client.ensure_connected()
+                    time.sleep(1)
+                    continue
+
+                last_publish_at = self.mqtt_client.get_last_publish_at()
+                now = time.time()
+
+                if last_publish_at <= 0 or (now - last_publish_at) >= self.heartbeat_interval:
+                    logger.info("MQTT心跳触发，补发车辆状态")
+                    self.publish_vehicle_status()
+
+                time.sleep(self.heartbeat_check_interval)
+            except Exception as e:
+                logger.error("MQTT心跳循环异常: {}".format(str(e)), exc_info=True)
+                time.sleep(1)
+
     def start(self):
         try:
-            if not self.mqtt_client.connect():
-                logger.error("MQTT连接失败，集成启动失败")
-                return False
-
             self.running = True
+            initial_connected = self.mqtt_client.connect()
+            if not initial_connected:
+                logger.warning("MQTT初始连接失败，已进入后台重连模式")
+
             self.status_thread = threading.Thread(target=self._status_publish_loop)
+            self.status_thread.daemon = True
             self.status_thread.start()
+
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+            self.heartbeat_thread.daemon = True
+            self.heartbeat_thread.start()
 
             logger.info("MQTT集成已启动")
             return True
@@ -222,6 +259,8 @@ class MQTTIntegration:
             self.running = False
             if self.status_thread:
                 self.status_thread.join(timeout=5)
+            if self.heartbeat_thread:
+                self.heartbeat_thread.join(timeout=5)
 
             self.mqtt_client.disconnect()
 
