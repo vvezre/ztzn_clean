@@ -91,6 +91,8 @@ redis_cli.set('moveJudge', 'false')
 redis_cli.set(PATH_PLANNING_KEY, LEFT_PATH_PLANNING)
 redis_cli.set('detectQrcode', 'false')
 redis_cli.set('enterGarage', 'false')
+redis_cli.set('currentAction', 'idle')
+redis_cli.set('curTaskIndex', 0)
 
 # 状态，0刹车，1速度模式，2距离速度模式，3旋转模式
 global_get_status = 0
@@ -169,6 +171,13 @@ vehicleType = 'tracklayer'
 # 自动清扫线程
 drive_thread = None
 global_last_cte = 0.0
+
+
+def set_current_action(action_name):
+    try:
+        redis_cli.set('currentAction', action_name)
+    except Exception as e:
+        logger.warning("设置currentAction失败: {}".format(str(e)))
 
 
 
@@ -919,7 +928,7 @@ def correctByRTKTest():
     global global_cur_rtk_lon
     global global_cur_rtk_heading
 
-    rtk_generator = util.readRTK(ser_rtk_params)
+    rtk_generator = util.readRTK_v2(ser_rtk_params)
     try:
         # —— 1. 主循环
         for lat, lon, heading_deg in rtk_generator:
@@ -1032,6 +1041,8 @@ def returnToPointByRTK():
     return response
 def returnToPointByRTKThread():
     global global_go,global_status
+    set_current_action('return_to_point')
+    redis_cli.set('curTaskIndex', 0)
     charginPileLat = float(redis_cli.hget('taskParams','chargingPileLat'))
     chargingPileLon = float(redis_cli.hget('taskParams','chargingPileLon'))
     # 原点航向角，用于起始点转正
@@ -1275,6 +1286,8 @@ def getTaskNameByLoc():
 
 def autoDriveByRTKThread():
     global global_status
+    set_current_action('auto_drive')
+    redis_cli.set('curTaskIndex', 0)
     taskParams = redis_cli.hgetall("taskParams")
     # 获取当前坐标点，判断当前点位是否在充电桩中
     chargingPileLat = float(taskParams.get('chargingPileLat'))
@@ -1311,6 +1324,7 @@ def autoDriveByRTKThread():
             for line in src:
                 dst.write(line)
         redis_cli.set('currentTaskName', taskName)
+        redis_cli.set('curTaskIndex', 0)
         # 将当前任务文件中的参数信息同步到redis中
         syncCurTaskFileToRedis()
     # 如果小车已经在工作了，就没有办法再启动工作
@@ -1599,7 +1613,7 @@ def correctByRTK():
     global global_cur_rtk_lon
     global global_cur_rtk_heading
 
-    rtk_generator = util.readRTK(ser_rtk_params)
+    rtk_generator = util.readRTK_v2(ser_rtk_params)
     try:
         # —— 1. 主循环
         for lat, lon, heading_deg in rtk_generator:
@@ -1680,6 +1694,7 @@ def correctByRTK():
 @app.route("/vehicle/parking", methods=['GET'])
 def parking():
     global global_pointToPoint_flag,global_go,global_status
+    set_current_action('parking')
     redis_cli.set("ultraSonic", "false")
     redis_cli.set("mission", "complete")
     redis_cli.set('action', 'false')
@@ -1695,6 +1710,7 @@ def parking():
     global_go = 0
     sendBraking()
     global_status = 'active'
+    redis_cli.set('curTaskIndex', 0)
     response = make_response("1")
 
     return response
@@ -1702,6 +1718,7 @@ def parking():
 
 def doParking():
     global global_pointToPoint_flag, global_go
+    set_current_action('parking')
     redis_cli.set('parking', 1)
 
     redis_cli.set("ultraSonic", "false")
@@ -1716,6 +1733,7 @@ def doParking():
     global_pointToPoint_flag = 1
     global_go = 0
     sendBraking()
+    redis_cli.set('curTaskIndex', 0)
 
 # 删除缓存任务
 @app.route('/vehicle/delTaskList', methods=['GET'])
@@ -1907,6 +1925,8 @@ def returnToPoint():
 def returnToPointThread():
     try:
         logger.warn("启动返回固定点")
+        set_current_action('return_to_point')
+        redis_cli.set('curTaskIndex', 0)
         correctThread = threading.Thread(target=correctByRTKTest)
         correctThread.start()
         # 判断当前到那个任务了
@@ -1917,6 +1937,7 @@ def returnToPointThread():
         redis_cli.set("mission", "working")
         redis_cli.set("correct", "true")
         redis_cli.set('action', 'true')
+        set_current_action('return_to_point')
         # 使其每一次接口调用，都重新开始
         redis_cli.set('parking', 0)
         reset_odometer(ser)
@@ -1929,6 +1950,8 @@ def returnToPointThread():
         redis_cli.set("mission", "complete")
         # 开启纠偏
         redis_cli.set("correct", "false")
+        set_current_action('idle')
+        redis_cli.set('curTaskIndex', 0)
         # 初始化
         redis_cli.set("doCleanThreadStop", 0)
         logger.warn("返回固定点结束")
@@ -3851,6 +3874,7 @@ def doClean(tmpTaskList, goon=False):
                 turn_back_len = item['turn_back_len']
 
                 global_cur_task_index = id - 1
+                redis_cli.set('curTaskIndex', global_cur_task_index)
                 try:
                     startLat = item['startLat']
                     startLon = item['startLon']
@@ -3953,6 +3977,7 @@ def doCleanByRTK(tmpTaskList, goon=False):
         redis_cli.set("mission", "working")
         # redis_cli.set("correct", "true")
         # redis_cli.set('action', 'true')
+        set_current_action('auto_drive')
         # 使其每一次接口调用，都重新开始
         redis_cli.set('parking', 0)
         reset_odometer(ser)
@@ -3969,6 +3994,7 @@ def doCleanByRTK(tmpTaskList, goon=False):
                 turn_back_len = item['turn_back_len']
 
                 global_cur_task_index = id - 1
+                redis_cli.set('curTaskIndex', global_cur_task_index)
                 try:
                     startLat = item['startLat']
                     startLon = item['startLon']
@@ -4132,6 +4158,8 @@ def starttt():
     redis_cli.set("mission", "complete")
     redis_cli.set("correct", "false")
     redis_cli.set('action', 'false')
+    set_current_action('idle')
+    redis_cli.set('curTaskIndex', 0)
 
     return "1"
 
