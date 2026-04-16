@@ -180,6 +180,16 @@ def set_current_action(action_name):
         logger.warning("设置currentAction失败: {}".format(str(e)))
 
 
+def sync_current_location(lat, lon, heading=None):
+    try:
+        redis_cli.hset('currentLocation', 'lat', lat)
+        redis_cli.hset('currentLocation', 'lon', lon)
+        if heading is not None:
+            redis_cli.hset('currentLocation', 'heading', heading)
+    except Exception as e:
+        logger.warning("同步currentLocation失败: {}".format(str(e)))
+
+
 
 # =============== 可调整参数 ===============
 MIN_LINE_LENGTH = 100  # 最小线段长度
@@ -2121,6 +2131,7 @@ def observer_go_correct(data):
     global_cur_rtk_lon = data.lon
     if data.heading is not None:
         global_cur_rtk_heading = data.heading
+    sync_current_location(data.lat, data.lon, data.heading)
     # global_go=1表示直行启动
     if global_go == 1:
         if data.heading is None:
