@@ -4590,8 +4590,7 @@ def startOpencv():
             f_y0 = 0
             f_x1 = 0
             f_y1 = 0
-
-            line_b = 10000
+            selected_length = 0.0
             line_angle = 0  # 夹角
             if not (dlines[0] is None):
                 for dline in dlines[0]:
@@ -4600,35 +4599,28 @@ def startOpencv():
                     x1 = int(round(dline[0][2]))
                     y1 = int(round(dline[0][3]))
 
-                    # todo 是否需要abs
-                    if y1 - y0 <= 70:
+                    vertical_span = abs(y1 - y0)
+                    if vertical_span <= 70:
                         continue
-                    else:
-                        xmid = (x1 + x0) / 2
-                        offset = xmid - center_x
-                        if line is None:
-                            line = offset
-                        if abs(offset) < abs(line):
-                            line = offset
-                            f_x0 = x0
-                            f_y0 = y0
-                            f_x1 = x1
-                            f_y1 = y1
-                    # 计算角度
-                    if y1 - y0 > 90:
-                        xmid = (x1 + x0) / 2
-                        ymid = (y1 + y0) / 2
+                    dx = x1 - x0
+                    dy = y1 - y0
+                    length = math.hypot(dx, dy)
+                    if length < 100:
+                        continue
+                    vertical_angle = math.degrees(math.atan2(abs(dx), abs(dy))) if abs(dy) >= 1e-5 else 90
+                    if vertical_angle > 35:
+                        continue
 
-                        # 计算线段与垂直轴的夹角（弧度）
-                        dx = x1 - x0
-                        dy = y1 - y0  # 图像坐标系中y轴向下为正
-                        # 计算线段与垂直轴的夹角（90度减去与水平轴的夹角）
-                        angle_rad = math.atan2(dx, dy)
-                        # 转换为角度（0-180度范围）
-                        angle_deg = math.degrees(angle_rad)
-                        # 规范化角度到0-90度范围（取绝对值）
-                        # vertical_angle = abs(angle_deg)
-                        line_angle = angle_deg
+                    xmid = (x1 + x0) / 2
+                    offset = xmid - center_x
+                    if line is None or abs(offset) < abs(line) or (abs(offset) == abs(line) and length > selected_length):
+                        line = offset
+                        f_x0 = x0
+                        f_y0 = y0
+                        f_x1 = x1
+                        f_y1 = y1
+                        selected_length = length
+                        line_angle = math.degrees(math.atan2(dx, dy))
             if line is None:
                 logger.info("没有找到线")
                 line = 0
