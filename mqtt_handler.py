@@ -1,4 +1,8 @@
 # coding=utf-8
+import json
+import os
+import time
+
 from AppLogger import logger
 
 
@@ -30,6 +34,8 @@ class MQTTCommandHandler:
             'saveTask': self._handle_save_task,
             'saveParams': self._handle_save_params,
             'getStatus': self._handle_get_status,
+            'getTaskPath': self._handle_get_task_path,
+            'get_task_path': self._handle_get_task_path,
         })
         logger.info("MQTT命令处理器初始化完成")
 
@@ -381,3 +387,43 @@ class MQTTCommandHandler:
                 return {'success': False, 'message': '车辆控制器不支持get_status方法'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
+
+    def _handle_get_task_path(self, params):
+        """处理获取任务路径命令：读取 config.json 的 taskList，按小程序期望的 schema 返回"""
+        try:
+            config_path = 'config.json'
+            if not os.path.exists(config_path):
+                return {'success': False, 'message': '未找到任务配置文件'}
+            with open(config_path, 'r', encoding='utf-8') as fp:
+                config = json.load(fp)
+            task_list = config.get('taskList') or []
+            if not isinstance(task_list, list) or len(task_list) == 0:
+                return {'success': False, 'message': '任务列表为空'}
+
+            segments = []
+            for item in task_list:
+                if not isinstance(item, dict):
+                    continue
+                segments.append({
+                    'id': item.get('id'),
+                    'startX': item.get('startX', 0),
+                    'startY': item.get('startY', 0),
+                    'endX': item.get('endX', 0),
+                    'endY': item.get('endY', 0),
+                    'mode': item.get('mode'),
+                    'heading': item.get('heading'),
+                    'areaNumber': item.get('areaNumber'),
+                })
+
+            task_name = config.get('taskName') or ''
+            task_id = params.get('taskId') if isinstance(params, dict) else None
+            data = {
+                'taskId': task_id or task_name or 'current',
+                'taskName': task_name,
+                'updatedAt': int(time.time() * 1000),
+                'segments': segments,
+            }
+            return {'success': True, 'message': '任务路径获取成功', 'data': data}
+        except Exception as e:
+            logger.error("获取任务路径失败: {}".format(str(e)), exc_info=True)
+            return {'success': False, 'message': '获取任务路径失败: {}'.format(e)}

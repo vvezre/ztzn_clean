@@ -25,6 +25,10 @@ def createTask(taskName,areaList):
         panelHeight = int(taskParams.get('panelHeight'))
         leftOrRightBridgeLen = int(taskParams.get('leftOrRightBridgeLen'))
         gap = int(taskParams.get('gap'))
+        gapXValue = taskParams.get('gapX')
+        gapYValue = taskParams.get('gapY')
+        gapX = gap if gapXValue in (None, '', b'') else int(gapXValue)
+        gapY = gap if gapYValue in (None, '', b'') else int(gapYValue)
         panelAngle = int(taskParams.get('panelAngle'))
         panelAngleX = int(taskParams.get('panelAngleX'))
 
@@ -32,6 +36,8 @@ def createTask(taskName,areaList):
 
         # 将度数转换为弧度
         angle_radians = math.radians(panelAngle)
+        angle_radians_y = math.radians(panelAngle)
+        angle_radians_x = math.radians(panelAngleX)
         # 默认表示y轴上有角度
         angle_to = 'y'
         if panelAngle == 0 and panelAngleX != 0:
@@ -45,7 +51,7 @@ def createTask(taskName,areaList):
         originLat = float(taskParams.get('startLat'))
         originLon = float(taskParams.get('startLon'))
         # 原点航向角
-        originHeading = int(taskParams.get('originHeading'))
+        originHeading = float(taskParams.get('originHeading'))
         # 充电桩经纬度
         chargingPileLat = float(taskParams.get('chargingPileLat'))
         chargingPileLon = float(taskParams.get('chargingPileLon'))
@@ -75,7 +81,7 @@ def createTask(taskName,areaList):
             # 判断当前区域是否是最后一个区域
             isLastArea = index == len(areaList)-1
             taskList = util.createTaskByPanelInfo(panelInfoList,areaNumber,startX,startY,direction,isLastArea,lineCount,goBackLen,goLeftOrRightBackLen,turnBackLen,
-                                       panelWidth,panelHeight,leftOrRightBridgeLen,gap,angle_radians,angle_to)
+                                       panelWidth,panelHeight,leftOrRightBridgeLen,gap,angle_radians,angle_to,gapX,gapY,angle_radians_x,angle_radians_y)
             # 获取这个区域中最后一个任务，留给下个区域作为起始点
             task = taskList[-1]
 
@@ -116,6 +122,8 @@ def createTask(taskName,areaList):
             'panelAngleX':panelAngleX,
             'panelAngle':panelAngle,
             'gap':int(taskParams.get('gap')),
+            'gapX':gapX,
+            'gapY':gapY,
             'taskList': totalTaskList
         }
         # 将任务列表写入配置文件

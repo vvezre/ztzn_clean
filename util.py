@@ -142,20 +142,33 @@ def createTask(direction='left', panels=None, areaNumber=1,goBackLen=5, goLeftOr
 # 根据光伏板信息来生成任务列表
 def createTaskByPanelInfo(panelInfoList,areaNumber=1,startX=0,startY=0,direction='left', isLastArea=True,lineCount=0,goBackLen=5, goLeftOrRightBackLen=15,
                       turnBackLen=10,panelWidth=113, panelHeight=226,leftOrRightBridgeLen=150,
-                      gap=3,angle_radians=0.06,angle_to='y'):
+                      gap=3,angle_radians=0.06,angle_to='y',gapX=None,gapY=None,
+                      angle_radians_x=None,angle_radians_y=None):
     # logger.warn(panelInfoList)
     # 计算y轴上特定间隙总长
+    if gapX is None:
+        gapX = gap
+    if gapY is None:
+        gapY = gap
+    gapX = int(gapX)
+    gapY = int(gapY)
+    if angle_radians_x is None:
+        angle_radians_x = angle_radians if angle_to != 'y' else 0
+    if angle_radians_y is None:
+        angle_radians_y = angle_radians if angle_to == 'y' else 0
+    x_projection = math.cos(angle_radians_x)
+    y_projection = math.cos(angle_radians_y)
+    projected_panel_width = int(panelWidth * x_projection)
+    projected_left_or_right_bridge_len = int(leftOrRightBridgeLen * x_projection)
+    projected_gap_y = int(gapY * y_projection)
     totalGapLen = 0
     for rowPanelInfo in panelInfoList:
         # 有间隙则累加
         if rowPanelInfo["isGap"]:
             totalGapLen = totalGapLen + int(rowPanelInfo['gapLen'])
-    height = len(panelInfoList) * panelHeight + (lineCount - 1) * gap + totalGapLen - panelHeight * 0.5
-    H = panelHeight * 0.5
+    height = int((len(panelInfoList) * panelHeight + (lineCount - 1) * gapY + totalGapLen - panelHeight * 0.5) * y_projection)
+    H = int(panelHeight * 0.5 * y_projection)
     # 如果y轴上有角度，height就需要cos,width就不需要处理
-    if angle_to == 'y':
-        height = int(height * math.cos(angle_radians))
-        H = int(H * math.cos(angle_radians))
     # 第一步直行任务
     goTask = [{"angle": 0, "mode": 1, "length": height, "turn_back_len": turnBackLen, "back_len": goBackLen}]
     # 向下任务
@@ -163,10 +176,9 @@ def createTaskByPanelInfo(panelInfoList,areaNumber=1,startX=0,startY=0,direction
 
     # 计算每一行x轴长度
     for index,rowPanelInfo in enumerate(panelInfoList):
-        width = rowPanelInfo['column'] * panelWidth + (rowPanelInfo['column'] - 1) * gap - panelWidth
+        width = rowPanelInfo['column'] * panelWidth + (rowPanelInfo['column'] - 1) * gapX - panelWidth
         # 如果是x轴上有角度，不是y轴上有角度，width就需要cos
-        if angle_to != 'y':
-            width = int(width * math.cos(angle_radians))
+        width = int(width * x_projection)
         list = [
             {"angle": 90, "mode": 1, "length": width, "turn_back_len": turnBackLen, "back_len": goLeftOrRightBackLen},
             {"angle": 180, "mode": 2, "length": H, "turn_back_len": turnBackLen, "back_len": 0},
@@ -187,7 +199,7 @@ def createTaskByPanelInfo(panelInfoList,areaNumber=1,startX=0,startY=0,direction
                 # 去掉最后一个任务，将下面的任务替换为最后一个任务
                 goTask.pop()
                 # 区域中最后一个任务
-                areaEndTask = {"angle": angle, "mode": 2, "length": panelWidth + leftOrRightBridgeLen,
+                areaEndTask = {"angle": angle, "mode": 2, "length": projected_panel_width + projected_left_or_right_bridge_len,
                                 "turn_back_len": turnBackLen,
                                 "back_len": 0}
                 goTask = goTask + [areaEndTask]
@@ -201,8 +213,9 @@ def createTaskByPanelInfo(panelInfoList,areaNumber=1,startX=0,startY=0,direction
 
         else:
             nextRowPanelInfo = panelInfoList[index + 1]
+            downTask = {"angle": 180, "mode": 2, "length": H, "turn_back_len": turnBackLen, "back_len": 0}
             if nextRowPanelInfo["isGap"]:
-                gapLen = int(nextRowPanelInfo["gapLen"])
+                gapLen = int(int(nextRowPanelInfo["gapLen"]) * y_projection)
                 downTask = {"angle": 180, "mode": 2, "length": H + gapLen, "turn_back_len": turnBackLen, "back_len": 0}
             goTask = goTask + [downTask]
     # logger.warn(goTask)
@@ -244,7 +257,7 @@ def createTaskByPanelInfo(panelInfoList,areaNumber=1,startX=0,startY=0,direction
                     item['endY'] = pre_item['endY'] - item['length']
                 else:
                     item['endX'] = item['startX']
-                    item['endY'] = pre_item['endY'] - item['length'] - gap
+                    item['endY'] = pre_item['endY'] - item['length'] - projected_gap_y
             elif item['angle'] == 270:
                 # 获取上一个任务
                 pre_item = resultTaskList[index - 1]
@@ -274,7 +287,7 @@ def createTaskByPanelInfo(panelInfoList,areaNumber=1,startX=0,startY=0,direction
                     item['endY'] = pre_item['endY'] - item['length']
                 else:
                     item['endX'] = item['startX']
-                    item['endY'] = pre_item['endY'] - item['length'] - gap
+                    item['endY'] = pre_item['endY'] - item['length'] - projected_gap_y
             elif item['angle'] == 270:
                 # 获取上一个任务
                 pre_item = resultTaskList[index - 1]
@@ -996,6 +1009,23 @@ def local_rotated_xy_to_latlon_precise(lat0, lon0, x, y, y_axis_bearing):
     result2 = geod.Direct(lat_temp, lon_temp, x_axis_bearing, x)
 
     return round(result2['lat2'],8),round(result2['lon2'],8)
+
+
+def latlon_to_local_rotated_xy_precise(lat0, lon0, lat, lon, y_axis_bearing):
+    """
+    local_rotated_xy_to_latlon_precise 的逆运算
+    给定原点 (lat0, lon0)、目标点 (lat, lon) 与 Y 轴方位角（从正北顺时针）
+    返回自定义旋转坐标系下的 (x, y)，单位：米
+    约定：Y 轴 = y_axis_bearing；X 轴 = Y 轴顺时针 90°
+    """
+    geod = Geodesic.WGS84
+    result = geod.Inverse(lat0, lon0, lat, lon)
+    distance = result['s12']
+    azimuth = result['azi1']
+    delta = math.radians((azimuth - y_axis_bearing) % 360)
+    y = distance * math.cos(delta)
+    x = distance * math.sin(delta)
+    return x, y
 
 def findPort(target_magic,timeout=3):
     ports = [p.device for p in serial.tools.list_ports.comports()]

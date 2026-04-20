@@ -9,6 +9,7 @@ import json
 import threading
 import time
 
+import util
 from AppLogger import logger
 from mqtt_client import MQTTClient, get_mqtt_client
 from mqtt_handler import MQTTCommandHandler
@@ -65,13 +66,18 @@ class MQTTIntegration:
 
         try:
             current_location = self._get_redis_hash('currentLocation')
+            lat = self._coerce_value(current_location.get('lat'), float, None)
+            lon = self._coerce_value(current_location.get('lon'), float, None)
+            local_x, local_y = self._compute_local_xy_cm(lat, lon)
             status = {
                 'speed': self._get_redis_value('forwardSpeed', int, 0),
                 'brush_speed': self._get_redis_value('brushSpeed', int, 0),
                 'voltage': self._get_redis_value('voltage', float, 0.0),
-                'lat': self._coerce_value(current_location.get('lat'), float, None),
-                'lon': self._coerce_value(current_location.get('lon'), float, None),
+                'lat': lat,
+                'lon': lon,
                 'heading': self._coerce_value(current_location.get('heading'), float, None),
+                'local_x': local_x,
+                'local_y': local_y,
                 'status': self._build_status(),
                 'action': self._build_action(),
                 'task_name': self._build_task_name(),
@@ -84,6 +90,24 @@ class MQTTIntegration:
         except Exception as e:
             logger.error("从Redis获取车辆状态失败: {}".format(str(e)), exc_info=True)
             return {}
+
+    def _compute_local_xy_cm(self, lat, lon):
+        if lat is None or lon is None:
+            return None, None
+        try:
+            task_params = self._get_redis_hash('taskParams')
+            origin_lat = self._coerce_value(task_params.get('startLat'), float, None)
+            origin_lon = self._coerce_value(task_params.get('startLon'), float, None)
+            origin_heading = self._coerce_value(task_params.get('originHeading'), float, None)
+            if origin_lat is None or origin_lon is None or origin_heading is None:
+                return None, None
+            x_m, y_m = util.latlon_to_local_rotated_xy_precise(
+                origin_lat, origin_lon, lat, lon, origin_heading
+            )
+            return int(round(x_m * 100)), int(round(y_m * 100))
+        except Exception as e:
+            logger.debug("计算本地坐标失败: {}".format(str(e)))
+            return None, None
 
     def _get_redis_hash(self, key):
         try:

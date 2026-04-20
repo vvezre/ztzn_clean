@@ -962,12 +962,12 @@ def correctByRTKTest():
                 start_lon = global_cur_taskPointTest['startLon']
                 target_lat = global_cur_taskPointTest['endLat']
                 target_lon = global_cur_taskPointTest['endLon']
-                const_target_h = global_cur_taskPointTest['target_heading']
+            const_target_h = float(global_cur_taskPointTest['target_heading'])
             # 走到这一步说明RTK打开成功
             global_open_rtk = 1
             # 计算期望航向角（从当前位置指向目标点）
             distance_to_target, target_heading = util.get_distance_angle(lat, lon, target_lat, target_lon)
-            heading_error = int(const_target_h - heading_deg)
+            heading_error = float(const_target_h) - float(heading_deg)
             # 计算最短偏差
             heading_error = (heading_error + 180) % 360 - 180
             # 只有直行，才发送纠偏指令
@@ -1056,7 +1056,7 @@ def returnToPointByRTKThread():
     charginPileLat = float(redis_cli.hget('taskParams','chargingPileLat'))
     chargingPileLon = float(redis_cli.hget('taskParams','chargingPileLon'))
     # 原点航向角，用于起始点转正
-    originHeading = int(redis_cli.hget('taskParams','originHeading'))
+    originHeading = float(redis_cli.hget('taskParams','originHeading'))
 
     global_go = 0
     taskParams = redis_cli.hgetall("taskParams")
@@ -1296,6 +1296,8 @@ def getTaskNameByLoc():
 
 def autoDriveByRTKThread():
     global global_status
+    global taskList  # 申明使用全局变量
+    global global_pointToPoint_flag,global_doCleanThreadStop,global_go,global_originLat,global_originLon
     set_current_action('auto_drive')
     redis_cli.set('curTaskIndex', 0)
     taskParams = redis_cli.hgetall("taskParams")
@@ -1310,7 +1312,7 @@ def autoDriveByRTKThread():
     # 初始航向角
     # initHeading = taskObj['heading']
     # 起始点航向角,用于位置转正
-    originHeading = int(taskParams.get('originHeading'))
+    originHeading = float(taskParams.get('originHeading'))
     # 如果不等于0，原点和起始点不是同一点
     if backLength != 0:
         if global_status == 'goCharging':
@@ -1344,8 +1346,6 @@ def autoDriveByRTKThread():
     global_status = 'working'
     redis_cli.set("mission", "working")
     redis_cli.set("parking", "0")
-    global taskList  # 申明使用全局变量
-    global global_pointToPoint_flag,global_doCleanThreadStop,global_go,global_originLat,global_originLon
     global_doCleanThreadStop = 0
 
     # 根据缓存中是否存在任务，来构建新的任务
@@ -1658,12 +1658,12 @@ def correctByRTK():
                 target_lat = global_cur_taskPoint['endLat']
                 target_lon = global_cur_taskPoint['endLon']
                 # dis_total, target_heading = util.get_distance_angle(start_lat, start_lon, target_lat, target_lon)
-                target_heading = global_cur_taskPoint['heading']
+            target_heading = float(global_cur_taskPoint['heading'])
             # 走到这一步说明RTK打开成功
             global_open_rtk = 1
             # 计算期望航向角（从当前位置指向目标点）
             distance_to_target, target_heading_cur = util.get_distance_angle(lat, lon, target_lat, target_lon)
-            heading_error = int(target_heading - heading_deg)
+            heading_error = float(target_heading) - float(heading_deg)
             # 计算最短偏差
             heading_error = (heading_error + 180) % 360 - 180
             # 只有直行，才发送纠偏指令
@@ -1792,6 +1792,8 @@ def saveParams():
     redis_cli.hset('taskParams', "panelAngle", data['panelAngle'])
     redis_cli.hset('taskParams', "panelAngleX", data['panelAngleX'])
     redis_cli.hset('taskParams', "gap", data['gap'])
+    redis_cli.hset('taskParams', "gapX", data.get('gapX', data['gap']))
+    redis_cli.hset('taskParams', "gapY", data.get('gapY', data['gap']))
     # 原点航向角，用于起始点转正
     redis_cli.hset('taskParams', "originHeading", data['originHeading'])
     result = {"success": True, "msg": "保存成功"}
@@ -1909,6 +1911,8 @@ def syncCurTaskFileToRedis():
     redis_cli.hset('taskParams', "panelAngle", taskObj['panelAngle'])
     redis_cli.hset('taskParams', "panelAngleX", taskObj['panelAngleX'])
     redis_cli.hset('taskParams', "gap", taskObj['gap'])
+    redis_cli.hset('taskParams', "gapX", taskObj.get('gapX', taskObj['gap']))
+    redis_cli.hset('taskParams', "gapY", taskObj.get('gapY', taskObj['gap']))
     # 原点航向角，用于起始点转正
     redis_cli.hset('taskParams', "originHeading", taskObj['originHeading'])
 
@@ -2107,7 +2111,7 @@ def observer_rtk_data(data):
         if redis_cli.get('openLog') == '1':
             logger.warning("RTK宸叉洿鏂扮粡绾害锛屼絾褰撳墠鏃犳湁鏁堣埅鍚戣锛岃烦杩囪埅鍚戝悓姝? lat={}, lon={}".format(lat, lon))
         return
-    heading = int(data.heading)
+    heading = float(data.heading)
     # preBuildCommand()
     setHeadingToVehicle(heading)
     duplicateWriteCmd(ser, command)
@@ -2141,11 +2145,11 @@ def observer_go_correct(data):
         start_lon = global_cur_taskPoint['startLon']
         target_lat = global_cur_taskPoint['endLat']
         target_lon = global_cur_taskPoint['endLon']
-        target_heading = global_cur_taskPoint['heading']
+        target_heading = float(global_cur_taskPoint['heading'])
 
         # 计算期望航向角（从当前位置指向目标点）
         distance_to_target, target_heading_cur = util.get_distance_angle(data.lat, data.lon, target_lat, target_lon)
-        heading_error = int(target_heading - data.heading)
+        heading_error = float(target_heading) - float(data.heading)
         # 计算最短偏差
         heading_error = (heading_error + 180) % 360 - 180
         if distance_to_target < 2:
@@ -3217,16 +3221,11 @@ def setBrushSpeed(status):
         command[10] = int(hex_string, 16)
 
 def setHeadingToVehicle(heading):
-    if int(heading) <= 255:
-        hex_string = hex(int(heading))[2:]
-        hex_1 = '00'
-        hex_2 = hex_string
-    else:
-        hex_string = hex(int(heading))[2:]
-        hex_1 = "0" + hex_string[0]
-        hex_2 = hex_string[1] + hex_string[2]
-    command[15] = int(hex_1,16)
-    command[16] = int(hex_2,16)
+    normalized_heading = float(heading) % 360.0
+    heading_centidegrees = int(round(normalized_heading * 100.0)) % 36000
+    byteArr = getCmdBytes(heading_centidegrees)
+    command[15] = byteArr[0]
+    command[16] = byteArr[1]
 
 
 def setRotate(status):
@@ -3268,7 +3267,7 @@ def setRotate(status):
 
 
 def setRotateTo(status):
-    status = status & 0xffff
+    status = int(round(float(status))) & 0xffff
     command[13] = status >> 8 & 0xff
     command[14] = status & 0xff
 
@@ -3571,16 +3570,11 @@ def reset_clean_mode(ser):
 
 def sendInitHeading(ser,heading):
     preBuildCommand()
-    if int(heading) <= 255:
-        hex_string = hex(int(heading))[2:]
-        hex_1 = '00'
-        hex_2 = hex_string
-    else:
-        hex_string = hex(int(heading))[2:]
-        hex_1 = "0" + hex_string[0]
-        hex_2 = hex_string[1] + hex_string[2]
-    command[17] = int(hex_1,16)
-    command[18] = int(hex_2,16)
+    normalized_heading = float(heading) % 360.0
+    heading_centidegrees = int(round(normalized_heading * 100.0)) % 36000
+    byteArr = getCmdBytes(heading_centidegrees)
+    command[17] = byteArr[0]
+    command[18] = byteArr[1]
     logger.warn('发送初始航向角给下位机')
     logger.warn(' '.join(format(x, '02x') for x in command))
     duplicateWriteCmd(ser, command)
