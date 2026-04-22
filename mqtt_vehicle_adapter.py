@@ -3,15 +3,16 @@
 ?????????? MQTT ??????? Flask HTTP ???
 ????? requests??????? Python 2 ???????????
 """
+import json
 import os
 
 try:
     from urllib import urlencode
-    from urllib2 import URLError, urlopen
+    from urllib2 import Request, URLError, urlopen
 except ImportError:
     from urllib.error import URLError
     from urllib.parse import urlencode
-    from urllib.request import urlopen
+    from urllib.request import Request, urlopen
 
 from AppLogger import logger
 
@@ -22,21 +23,54 @@ class VehicleControllerAdapter(object):
         self.timeout = timeout
         logger.info('MQTT????????????base_url={}'.format(self.base_url))
 
-    def _call(self, path, params=None):
+    def _decode_body(self, body):
+        if body is None:
+            return None
+        if isinstance(body, bytes):
+            try:
+                body = body.decode('utf-8')
+            except Exception:
+                body = body.decode('utf-8', 'replace')
+        return body
+
+    def _parse_response(self, response):
+        body = self._decode_body(response.read())
+        if body is None:
+            return None
+        try:
+            return json.loads(body)
+        except Exception:
+            return body
+
+    def _call(self, path, params=None, json_data=None):
         url = self.base_url + path
         if params:
             url = url + '?' + urlencode(params)
-        logger.warning('MQTT?????????: {} params={}'.format(url, params))
+        headers = {}
+        payload = None
+        if json_data is not None:
+            payload = json.dumps(json_data).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        logger.warning('MQTT?????????: {} params={} json={}'.format(url, params, json_data))
         try:
-            response = urlopen(url, timeout=self.timeout)
-            return response.read()
+            request = Request(url, data=payload, headers=headers)
+            response = urlopen(request, timeout=self.timeout)
+            return self._parse_response(response)
         except URLError as exc:
             raise RuntimeError('MQTT adapter request failed: {}'.format(exc))
 
     def drive(self, distance=0, speed=None):
+        if speed is not None:
+            self.adjust_speed(speed)
+        if distance:
+            resolved_speed = int(speed) if speed is not None else 100
+            return self._call('/vehicle/moveDistance/{}/{}'.format(int(distance), resolved_speed))
         return self._call('/vehicle/drive')
 
     def back(self, distance=0, speed=None):
+        if distance:
+            resolved_speed = int(speed) if speed is not None else 100
+            return self._call('/vehicle/moveBackDistance/{}/{}'.format(int(distance), resolved_speed))
         return self._call('/vehicle/back')
 
     def turn_left(self, angle=90):
@@ -88,17 +122,20 @@ class VehicleControllerAdapter(object):
     def toggle_path_planning(self, path):
         return self._call('/vehicle/togglePathPlanning/{}'.format(path))
 
-    def create_task(self, *args, **kwargs):
-        raise NotImplementedError('???????? MQTT ??????')
+    def create_task(self, params):
+        return self._call('/vehicle/createTask', json_data=params or {})
 
-    def select_task(self, *args, **kwargs):
-        raise NotImplementedError('???????? MQTT ??????')
+    def select_task(self, task_name):
+        return self._call('/vehicle/selectTaskByName', params={'taskName': task_name})
 
-    def save_task(self, *args, **kwargs):
-        raise NotImplementedError('???????? MQTT ??????')
+    def save_task(self, task_name):
+        return self._call('/vehicle/saveCurrentTaskName', params={'taskName': task_name})
 
-    def save_params(self, *args, **kwargs):
-        raise NotImplementedError('???????? MQTT ??????')
+    def save_params(self, params):
+        return self._call('/vehicle/saveParams', json_data=params or {})
 
     def get_status(self):
         return self._call('/vehicle/getInfo')
+
+    def get_task_path(self):
+        return self._call('/vehicle/getTaskPath')

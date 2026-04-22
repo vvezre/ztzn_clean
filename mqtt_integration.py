@@ -41,19 +41,42 @@ class MQTTIntegration:
 
     def _on_mqtt_message(self, message_data):
         try:
+            self._publish_command_ack(message_data)
             result = self.command_handler.handle(message_data)
-            self._publish_command_result(message_data.get('command'), result)
+            self._publish_command_result(message_data, result)
 
             if result.get('success'):
                 self.publish_vehicle_status()
         except Exception as e:
+            self._publish_command_result(message_data, {
+                'success': False,
+                'message': 'command handler exception: {}'.format(str(e))
+            })
             logger.error("处理MQTT消息异常: {}".format(str(e)), exc_info=True)
 
-    def _publish_command_result(self, command, result):
+    def _publish_command_ack(self, message_data):
+        try:
+            command = message_data.get('command')
+            if not command:
+                return
+            self.mqtt_client.publish_status({
+                'type': 'ack',
+                'command_id': message_data.get('command_id'),
+                'trace_id': message_data.get('trace_id'),
+                'command': command,
+                'status': 'accepted',
+                'timestamp': int(time.time())
+            })
+        except Exception as e:
+            logger.error("鍙戝竷鍛戒护ACK澶辫触: {}".format(str(e)), exc_info=True)
+
+    def _publish_command_result(self, message_data, result):
         try:
             self.mqtt_client.publish_status({
                 'type': 'command_result',
-                'command': command,
+                'command_id': message_data.get('command_id'),
+                'trace_id': message_data.get('trace_id'),
+                'command': message_data.get('command'),
                 'result': result,
                 'timestamp': int(time.time())
             })
@@ -72,7 +95,7 @@ class MQTTIntegration:
             status = {
                 'speed': self._get_redis_value('forwardSpeed', int, 0),
                 'brush_speed': self._get_redis_value('brushSpeed', int, 0),
-                'voltage': self._get_redis_value('voltage', float, 0.0),
+                'voltage': self._get_redis_value('packVoltage', float, None),
                 'lat': lat,
                 'lon': lon,
                 'heading': self._coerce_value(current_location.get('heading'), float, None),
@@ -83,6 +106,29 @@ class MQTTIntegration:
                 'task_name': self._build_task_name(),
                 'cur_task_index': self._get_redis_value('curTaskIndex', int, 0),
                 'task_count': self._build_task_count(),
+                'battery': self._get_redis_value('batteryPercent', float, None),
+                'battery_percent': self._get_redis_value('batteryPercent', float, None),
+                'battery_raw': self._get_redis_value('batteryPercentRaw', float, None),
+                'battery_percent_raw': self._get_redis_value('batteryPercentRaw', float, None),
+                'pack_voltage': self._get_redis_value('packVoltage', float, None),
+                'online_state': 'ONLINE',
+                'mission_state': self._build_mission_state(),
+                'control_state': self._build_control_state(),
+                'health_state': self._build_health_state(),
+                'fault_state': self._build_fault_state(),
+                'tracking': self._get_redis_value('correct', self._bool_value, False),
+                'path_planning': self._get_redis_value('pathPlanning', str, ''),
+                'move_judge': self._get_redis_value('moveJudge', self._bool_value, False),
+                'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
+                'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
+                'supported_actions': [
+                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'
+                ],
+                'supported_params': ['taskName', 'speed', 'tracking', 'path'],
+                'supported_status_fields': [
+                    'control_state', 'health_state', 'fault_state', 'mission_state', 'detail'
+                ],
+                'detail': self._build_detail(),
                 'timestamp': int(time.time())
             }
 
@@ -147,11 +193,60 @@ class MQTTIntegration:
         except Exception:
             return default
 
+    def _get_optional_int(self, key):
+        try:
+            value = self.redis_client.get(key)
+            if value is None:
+                return None
+            return int(self._decode_value(value))
+        except Exception:
+            return None
+
+    def _hardware_report_age_sec(self):
+        report_at = self._get_optional_int('hardwareReportAt')
+        if report_at is None:
+            return None
+        try:
+            return max(0, int(time.time()) - int(report_at))
+        except Exception:
+            return None
+
+    def _bool_value(self, value):
+        value = self._decode_value(value)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        text = str(value).strip().lower()
+        if text in ('1', 'true', 'yes', 'on'):
+            return True
+        if text in ('0', 'false', 'no', 'off', 'none', ''):
+            return False
+        try:
+            return int(text) != 0
+        except Exception:
+            return False
+
+    def _read_runtime_detail(self):
+        raw = self._get_redis_value('runtimeDetail', str, '')
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+
     def _build_status(self):
         mission = self._get_redis_value('mission', str, '')
         parking = self._get_redis_value('parking', str, '0')
         current_action = self._get_redis_value('currentAction', str, '')
+        control_state = self._build_control_state()
+        power_on_state = self._get_optional_int('powerOnState')
 
+        if control_state == 'UNKNOWN':
+            return 'unknown'
+        if control_state in ('BLOCKED', 'DISABLED') or power_on_state == 0:
+            return 'disabled'
         if current_action == 'return_to_point':
             return 'returning'
         if mission == 'working':
@@ -171,6 +266,77 @@ class MQTTIntegration:
         if self._get_redis_value('parking', str, '0') == '1':
             return 'parking'
         return 'idle'
+
+    def _build_mission_state(self):
+        control_state = self._build_control_state()
+        if control_state in ('BLOCKED', 'DISABLED', 'UNKNOWN'):
+            return control_state
+
+        current_action = self._get_redis_value('currentAction', str, '')
+        if current_action == 'return_to_point':
+            return 'RETURNING'
+
+        mission = self._get_redis_value('mission', str, '')
+        if mission == 'working':
+            return 'RUNNING'
+        if self._get_redis_value('parking', str, '0') == '1':
+            return 'STOPPED'
+        if mission == 'complete':
+            return 'COMPLETE'
+        return 'IDLE'
+
+    def _build_control_state(self):
+        power_on_state = self._get_optional_int('powerOnState')
+        if power_on_state == 0:
+            return 'DISABLED'
+        control_state = self._get_redis_value('controlState', str, '')
+        if control_state:
+            return control_state
+        if power_on_state is None:
+            return 'UNKNOWN'
+        if self._get_redis_value('mission', str, '') == 'working':
+            return 'RUNNING'
+        if self._get_redis_value('parking', str, '0') == '1':
+            return 'STOPPED'
+        return 'IDLE'
+
+    def _build_fault_state(self):
+        power_on_state = self._get_optional_int('powerOnState')
+        if power_on_state == 0:
+            return 'LOWER_MACHINE_DISABLED'
+        fault_state = self._get_redis_value('faultState', str, '')
+        if fault_state:
+            return fault_state
+        if power_on_state is None:
+            return 'LOWER_MACHINE_STATUS_UNKNOWN'
+        return ''
+
+    def _build_health_state(self):
+        if self._build_fault_state():
+            return 'WARN'
+        health_state = self._get_redis_value('healthState', str, '')
+        if health_state:
+            return health_state
+        return 'OK'
+
+    def _build_detail(self):
+        detail = self._read_runtime_detail()
+        power_on_state = self._get_optional_int('powerOnState')
+        battery_percent = self._get_redis_value('batteryPercent', float, None)
+        detail['lastCommandMessage'] = self._get_redis_value('lastCommandMessage', str, '')
+        detail['startCheckReady'] = self._get_redis_value('startCheckReady', self._bool_value, False)
+        detail['startCheckReason'] = self._get_redis_value('startCheckReason', str, '')
+        detail['batteryPercent'] = battery_percent
+        detail['batteryPercentRaw'] = self._get_redis_value('batteryPercentRaw', float, None)
+        detail['batteryReportAt'] = self._get_optional_int('batteryReportAt')
+        detail['packVoltage'] = self._get_redis_value('packVoltage', float, None)
+        detail['packVoltageReportAt'] = self._get_optional_int('packVoltageReportAt')
+        detail['powerOnState'] = power_on_state
+        detail['powerOnEnabled'] = power_on_state == 1
+        detail['hardwareState'] = self._get_optional_int('hardwareState')
+        detail['hardwareReportAt'] = self._get_optional_int('hardwareReportAt')
+        detail['hardwareReportAgeSec'] = self._hardware_report_age_sec()
+        return detail
 
     def _build_task_name(self):
         task_name = self._get_redis_value('currentTaskName', str, '')

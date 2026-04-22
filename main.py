@@ -93,6 +93,27 @@ redis_cli.set('detectQrcode', 'false')
 redis_cli.set('enterGarage', 'false')
 redis_cli.set('currentAction', 'idle')
 redis_cli.set('curTaskIndex', 0)
+redis_cli.set('mission', 'complete')
+redis_cli.set('parking', '1')
+redis_cli.set('action', 'false')
+redis_cli.set('correct', 'false')
+redis_cli.set('moveJudge', 'false')
+redis_cli.set('reverse', 'false')
+redis_cli.set('controlState', 'IDLE')
+redis_cli.set('healthState', 'OK')
+redis_cli.set('faultState', '')
+redis_cli.set('startCheckReady', 'false')
+redis_cli.set('startCheckReason', '')
+redis_cli.set('runtimeDetail', '{}')
+redis_cli.delete('battery')
+redis_cli.delete('batteryPercent')
+redis_cli.delete('batteryRaw')
+redis_cli.delete('batteryPercentRaw')
+redis_cli.delete('batteryReportAt')
+redis_cli.delete('voltage')
+redis_cli.delete('packVoltage')
+redis_cli.delete('packVoltageReportAt')
+redis_cli.set('bootSafeStopAt', int(time.time()))
 
 # 状态，0刹车，1速度模式，2距离速度模式，3旋转模式
 global_get_status = 0
@@ -171,6 +192,12 @@ vehicleType = 'tracklayer'
 # 自动清扫线程
 drive_thread = None
 global_last_cte = 0.0
+START_POSITION_TOLERANCE_METERS = 2.0
+global_power_on_guard_sent = False
+BATTERY_SMOOTH_ALPHA = 0.18
+BATTERY_MAX_DROP_PER_SAMPLE = 0.3
+BATTERY_MAX_RISE_PER_SAMPLE = 0.6
+BATTERY_SMOOTH_RESET_AFTER_SEC = 60
 
 
 def set_current_action(action_name):
@@ -188,6 +215,599 @@ def sync_current_location(lat, lon, heading=None):
             redis_cli.hset('currentLocation', 'heading', heading)
     except Exception as e:
         logger.warning("同步currentLocation失败: {}".format(str(e)))
+
+
+def _decode_redis_value(value):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, bytes):
+            return value.decode('utf-8')
+    except Exception:
+        pass
+    return value
+
+
+def _coerce_float(value, default=None):
+    value = _decode_redis_value(value)
+    if value in (None, ''):
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _coerce_int(value, default=None):
+    value = _decode_redis_value(value)
+    if value in (None, ''):
+        return default
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _coerce_bool(value, default=False):
+    value = _decode_redis_value(value)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ('1', 'true', 'yes', 'on'):
+        return True
+    if text in ('0', 'false', 'no', 'off', 'none', ''):
+        return False
+    try:
+        return int(text) != 0
+    except Exception:
+        return default
+
+
+def _set_redis_value(key, value):
+    if value is None:
+        redis_cli.delete(key)
+        return
+    if isinstance(value, (dict, list)):
+        redis_cli.set(key, json.dumps(value))
+        return
+    if isinstance(value, bool):
+        redis_cli.set(key, 'true' if value else 'false')
+        return
+    redis_cli.set(key, value)
+
+
+def _load_runtime_detail():
+    raw = _decode_redis_value(redis_cli.get('runtimeDetail'))
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _get_power_on_state():
+    return _coerce_int(redis_cli.get('powerOnState'), None)
+
+
+def _get_hardware_report_at():
+    return _coerce_int(redis_cli.get('hardwareReportAt'), None)
+
+
+def _get_hardware_report_age_sec():
+    report_at = _get_hardware_report_at()
+    if report_at is None:
+        return None
+    try:
+        return max(0, int(time.time()) - int(report_at))
+    except Exception:
+        return None
+
+
+def _clamp_percent(value):
+    value = _coerce_float(value, None)
+    if value is None:
+        return None
+    return max(0.0, min(100.0, value))
+
+
+def _smooth_battery_percent(raw_percent, report_at=None):
+    raw_percent = _clamp_percent(raw_percent)
+    if raw_percent is None:
+        return None
+
+    previous = _coerce_float(redis_cli.get('batteryPercent'), None)
+    previous_report_at = _coerce_int(redis_cli.get('batteryReportAt'), None)
+    if previous is None:
+        return round(raw_percent, 1)
+    if report_at is None:
+        report_at = int(time.time())
+    if previous_report_at is None or report_at - previous_report_at > BATTERY_SMOOTH_RESET_AFTER_SEC:
+        return round(raw_percent, 1)
+
+    delta = raw_percent - previous
+    if abs(delta) < 0.05:
+        return round(raw_percent, 1)
+    if delta < 0:
+        step = max(delta * BATTERY_SMOOTH_ALPHA, -BATTERY_MAX_DROP_PER_SAMPLE)
+    else:
+        step = min(delta * BATTERY_SMOOTH_ALPHA, BATTERY_MAX_RISE_PER_SAMPLE)
+    return round(_clamp_percent(previous + step), 1)
+
+
+def _cache_battery_percent(raw_percent, report_at=None):
+    raw_percent = _clamp_percent(raw_percent)
+    if raw_percent is None:
+        return None
+    if report_at is None:
+        report_at = int(time.time())
+
+    smoothed_percent = _smooth_battery_percent(raw_percent, report_at)
+    redis_cli.set("batteryRaw", raw_percent)
+    redis_cli.set("batteryPercentRaw", raw_percent)
+    redis_cli.set("battery", smoothed_percent)
+    redis_cli.set("batteryPercent", smoothed_percent)
+    redis_cli.set("batteryReportAt", report_at)
+    # Legacy low-battery logic reads "voltage" as percentage.
+    redis_cli.set("voltage", smoothed_percent)
+    return smoothed_percent
+
+
+def _set_runtime_state(control_state=None, health_state=None, fault_state=None,
+                       start_ready=None, start_reason=None, detail=None):
+    if control_state is not None:
+        _set_redis_value('controlState', control_state)
+    if health_state is not None:
+        _set_redis_value('healthState', health_state)
+    if fault_state is not None:
+        _set_redis_value('faultState', fault_state)
+    if start_ready is not None:
+        _set_redis_value('startCheckReady', start_ready)
+    if start_reason is not None:
+        _set_redis_value('startCheckReason', start_reason)
+    if detail is not None:
+        _set_redis_value('runtimeDetail', detail)
+
+
+def _load_task_params_snapshot():
+    raw = redis_cli.hgetall('taskParams') or {}
+    result = {}
+    for key, value in raw.items():
+        result[_decode_redis_value(key)] = _decode_redis_value(value)
+    return result
+
+
+def _compute_local_xy_cm(lat, lon, task_params):
+    if lat is None or lon is None:
+        return None, None
+
+    origin_lat = _coerce_float(task_params.get('startLat'), None)
+    origin_lon = _coerce_float(task_params.get('startLon'), None)
+    origin_heading = _coerce_float(task_params.get('originHeading'), None)
+    if origin_lat is None or origin_lon is None or origin_heading is None:
+        return None, None
+
+    try:
+        x_m, y_m = util.latlon_to_local_rotated_xy_precise(
+            origin_lat, origin_lon, lat, lon, origin_heading
+        )
+        return int(round(x_m * 100)), int(round(y_m * 100))
+    except Exception:
+        return None, None
+
+
+def _distance_to_task_start(task_params):
+    start_lat = _coerce_float(task_params.get('startLat'), None)
+    start_lon = _coerce_float(task_params.get('startLon'), None)
+    if start_lat is None or start_lon is None:
+        return None
+    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
+        return None
+    try:
+        distance, _ = util.get_distance_angle(global_cur_rtk_lat, global_cur_rtk_lon, start_lat, start_lon)
+        return round(float(distance), 3)
+    except Exception:
+        return None
+
+
+def _build_runtime_detail(extra=None):
+    task_params = _load_task_params_snapshot()
+    detail = _load_runtime_detail()
+    power_on_state = _get_power_on_state()
+    detail.update({
+        'batteryReportAt': _coerce_int(redis_cli.get('batteryReportAt'), None),
+        'batteryPercent': _coerce_float(redis_cli.get('batteryPercent'), None),
+        'batteryPercentRaw': _coerce_float(redis_cli.get('batteryPercentRaw'), None),
+        'packVoltage': _coerce_float(redis_cli.get('packVoltage'), None),
+        'packVoltageReportAt': _coerce_int(redis_cli.get('packVoltageReportAt'), None),
+        'powerOnState': power_on_state,
+        'powerOnEnabled': power_on_state == 1,
+        'hardwareState': _coerce_int(redis_cli.get('hardwareState'), None),
+        'hardwareReportAt': _get_hardware_report_at(),
+        'hardwareReportAgeSec': _get_hardware_report_age_sec(),
+        'distanceToStartM': _distance_to_task_start(task_params),
+        'startToleranceM': START_POSITION_TOLERANCE_METERS,
+        'currentLat': global_cur_rtk_lat,
+        'currentLon': global_cur_rtk_lon,
+        'currentHeading': global_cur_rtk_heading,
+        'taskStartLat': _coerce_float(task_params.get('startLat'), None),
+        'taskStartLon': _coerce_float(task_params.get('startLon'), None),
+        'originHeading': _coerce_float(task_params.get('originHeading'), None),
+    })
+    if extra:
+        detail.update(extra)
+    return detail
+
+
+def _mark_runtime_ready(message, extra=None):
+    _set_runtime_state(
+        control_state='READY',
+        health_state='OK',
+        fault_state='',
+        start_ready=True,
+        start_reason=message,
+        detail=_build_runtime_detail(extra)
+    )
+
+
+def _mark_runtime_running(message, extra=None):
+    _set_runtime_state(
+        control_state='RUNNING',
+        health_state='OK',
+        fault_state='',
+        start_ready=True,
+        start_reason=message,
+        detail=_build_runtime_detail(extra)
+    )
+
+
+def _mark_runtime_idle(message, extra=None):
+    _set_runtime_state(
+        control_state='STOPPED',
+        health_state='OK',
+        fault_state='',
+        start_ready=False,
+        start_reason=message,
+        detail=_build_runtime_detail(extra)
+    )
+
+
+def _mark_runtime_blocked(fault_state, message, extra=None):
+    detail = _build_runtime_detail(extra)
+    detail['blocked'] = True
+    _set_runtime_state(
+        control_state='BLOCKED',
+        health_state='WARN',
+        fault_state=fault_state,
+        start_ready=False,
+        start_reason=message,
+        detail=detail
+    )
+
+
+def _maybe_brake_on_power_enable(previous_power_on_state, current_power_on_state):
+    global global_power_on_guard_sent
+    if current_power_on_state != 1 or previous_power_on_state == 1:
+        return
+    if global_power_on_guard_sent:
+        return
+
+    mission = _decode_redis_value(redis_cli.get('mission'))
+    current_action = _decode_redis_value(redis_cli.get('currentAction'))
+    if mission == 'working' and current_action in ('auto_drive', 'go_on', 'return_to_point'):
+        return
+
+    global_power_on_guard_sent = True
+    redis_cli.set('parking', '1')
+    redis_cli.set('mission', 'complete')
+    set_current_action('parking')
+    _mark_runtime_idle('下位机刚使能，已自动补发安全停车')
+    try:
+        logger.warning("下位机使能从 {} 切换为 1，当前非任务执行态，补发安全停车".format(previous_power_on_state))
+        sendBraking()
+    except Exception as exc:
+        logger.error("下位机使能安全停车失败: {}".format(exc), exc_info=True)
+
+
+def _frame_byte_to_int(byte_value):
+    try:
+        if isinstance(byte_value, int):
+            return byte_value
+        return int(binascii.b2a_hex(byte_value), 16)
+    except Exception:
+        return None
+
+
+def _frame_u16_to_int(data, index):
+    high = _frame_byte_to_int(data[index])
+    low = _frame_byte_to_int(data[index + 1])
+    if high is None or low is None:
+        return None
+    return (high << 8) + low
+
+
+def _cache_hardware_status_frame(data):
+    if not data or len(data) < CMD_LEN:
+        return False
+
+    try:
+        report_at = int(time.time())
+        redis_cli.set("hardwareReportAt", report_at)
+
+        previous_power_on_state = _get_power_on_state()
+        power_on_state = _frame_byte_to_int(data[2])
+        if power_on_state is not None:
+            redis_cli.set("powerOnState", power_on_state)
+            _maybe_brake_on_power_enable(previous_power_on_state, power_on_state)
+
+        hardware_state = _frame_byte_to_int(data[3])
+        if hardware_state is not None:
+            redis_cli.set("hardwareState", hardware_state)
+
+        _cache_battery_percent(_frame_byte_to_int(data[10]), report_at)
+
+        pack_voltage_raw = _frame_u16_to_int(data, 14)
+        if pack_voltage_raw is not None:
+            redis_cli.set("packVoltage", round(pack_voltage_raw * 0.01, 1))
+            redis_cli.set("packVoltageReportAt", report_at)
+
+        return True
+    except Exception as exc:
+        logger.warning("cache hardware status frame failed: {}".format(exc), exc_info=True)
+        return False
+
+
+def _load_task_items_for_preview():
+    cached_items = redis_cli.lrange('taskList', 0, -1)
+    items = []
+    for raw in cached_items or []:
+        try:
+            items.append(json.loads(_decode_redis_value(raw)))
+        except Exception:
+            continue
+    if items:
+        return items
+
+    try:
+        task_obj = util.readConfig("config.json")
+        task_list = task_obj.get('taskList', [])
+        if isinstance(task_list, list):
+            return task_list
+    except Exception as e:
+        logger.warning("读取任务预览失败: {}".format(str(e)))
+    return []
+
+
+def _build_task_path_payload():
+    task_params = _load_task_params_snapshot()
+    task_items = _load_task_items_for_preview()
+    segments = []
+    for item in task_items:
+        if not isinstance(item, dict):
+            continue
+        segments.append({
+            'id': item.get('id'),
+            'startX': _coerce_int(item.get('startX'), 0),
+            'startY': _coerce_int(item.get('startY'), 0),
+            'endX': _coerce_int(item.get('endX'), 0),
+            'endY': _coerce_int(item.get('endY'), 0),
+            'mode': _coerce_int(item.get('mode'), None),
+            'angle': _coerce_float(item.get('angle'), None),
+            'heading': _coerce_float(item.get('heading'), None),
+            'areaNumber': _coerce_int(item.get('areaNumber'), None),
+        })
+
+    return {
+        'taskId': _decode_redis_value(redis_cli.get('currentTaskName')) or 'current',
+        'taskName': _decode_redis_value(redis_cli.get('currentTaskName')) or '',
+        'originLat': _coerce_float(task_params.get('startLat'), None),
+        'originLon': _coerce_float(task_params.get('startLon'), None),
+        'yAxisBearing': _coerce_float(task_params.get('originHeading'), None),
+        'updatedAt': int(time.time() * 1000),
+        'segments': segments,
+    }
+
+
+def _derive_control_state():
+    power_on_state = _get_power_on_state()
+    if power_on_state == 0:
+        return 'DISABLED'
+    control_state = _decode_redis_value(redis_cli.get('controlState'))
+    if control_state:
+        return control_state
+    if power_on_state is None:
+        return 'UNKNOWN'
+    if _decode_redis_value(redis_cli.get('mission')) == 'working':
+        return 'RUNNING'
+    if _coerce_bool(redis_cli.get('parking'), False):
+        return 'STOPPED'
+    return 'IDLE'
+
+
+def _derive_health_state():
+    if _derive_fault_state():
+        return 'WARN'
+    health_state = _decode_redis_value(redis_cli.get('healthState'))
+    if health_state:
+        return health_state
+    return 'OK'
+
+
+def _derive_fault_state():
+    power_on_state = _get_power_on_state()
+    if power_on_state == 0:
+        return 'LOWER_MACHINE_DISABLED'
+    fault_state = _decode_redis_value(redis_cli.get('faultState'))
+    if fault_state:
+        return fault_state
+    if power_on_state is None:
+        return 'LOWER_MACHINE_STATUS_UNKNOWN'
+    return ''
+
+
+def _derive_mission_state(control_state):
+    if control_state in ('BLOCKED', 'DISABLED', 'UNKNOWN'):
+        return control_state
+    current_action = _decode_redis_value(redis_cli.get('currentAction'))
+    if current_action == 'return_to_point':
+        return 'RETURNING'
+    mission = _decode_redis_value(redis_cli.get('mission'))
+    if mission == 'working':
+        return 'RUNNING'
+    if _coerce_bool(redis_cli.get('parking'), False):
+        return 'STOPPED'
+    if mission == 'complete':
+        return 'COMPLETE'
+    return 'IDLE'
+
+
+def _derive_status(control_state, mission_state):
+    if control_state == 'UNKNOWN':
+        return 'unknown'
+    if control_state == 'BLOCKED' or control_state == 'DISABLED':
+        return 'disabled'
+    if mission_state == 'RUNNING':
+        return 'working'
+    if mission_state == 'RETURNING':
+        return 'returning'
+    if _coerce_bool(redis_cli.get('parking'), False):
+        return 'idle'
+    return 'active'
+
+
+def _build_vehicle_status_payload():
+    task_params = _load_task_params_snapshot()
+    lat = global_cur_rtk_lat
+    lon = global_cur_rtk_lon
+    heading = global_cur_rtk_heading if global_cur_rtk_heading is not None else None
+    local_x, local_y = _compute_local_xy_cm(lat, lon, task_params)
+    control_state = _derive_control_state()
+    mission_state = _derive_mission_state(control_state)
+    fault_state = _derive_fault_state()
+    current_action = _decode_redis_value(redis_cli.get('currentAction')) or ('parking' if _coerce_bool(redis_cli.get('parking'), False) else 'idle')
+    battery_percent = _clamp_percent(redis_cli.get('batteryPercent'))
+    battery_percent_raw = _clamp_percent(redis_cli.get('batteryPercentRaw'))
+
+    detail = _build_runtime_detail({
+        'lastCommandMessage': _decode_redis_value(redis_cli.get('lastCommandMessage')) or '',
+        'startCheckReady': _coerce_bool(redis_cli.get('startCheckReady'), False),
+        'startCheckReason': _decode_redis_value(redis_cli.get('startCheckReason')) or '',
+    })
+
+    return {
+        'status': _derive_status(control_state, mission_state),
+        'battery': battery_percent,
+        'battery_percent': battery_percent,
+        'battery_raw': battery_percent_raw,
+        'battery_percent_raw': battery_percent_raw,
+        'action': current_action,
+        'task_name': _decode_redis_value(redis_cli.get('currentTaskName')) or '',
+        'cur_task_index': _coerce_int(redis_cli.get('curTaskIndex'), 0),
+        'task_count': len(_load_task_items_for_preview()),
+        'online_state': 'ONLINE',
+        'mission_state': mission_state,
+        'control_state': control_state,
+        'health_state': _derive_health_state(),
+        'fault_state': fault_state,
+        'speed': _coerce_int(redis_cli.get('forwardSpeed'), 0),
+        'brush_speed': _coerce_int(redis_cli.get('brushSpeed'), 0),
+        'voltage': _coerce_float(redis_cli.get('packVoltage'), None),
+        'lat': lat,
+        'lon': lon,
+        'heading': heading,
+        'local_x': local_x,
+        'local_y': local_y,
+        'tracking': _coerce_bool(redis_cli.get('correct'), False),
+        'path_planning': _decode_redis_value(redis_cli.get(PATH_PLANNING_KEY)) or '',
+        'move_judge': _coerce_bool(redis_cli.get('moveJudge'), False),
+        'detect_qrcode': _coerce_bool(redis_cli.get('detectQrcode'), False),
+        'enter_garage': _coerce_bool(redis_cli.get('enterGarage'), False),
+        'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'],
+        'supported_params': ['taskName', 'speed', 'tracking', 'path'],
+        'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state'],
+        'detail': detail,
+        'timestamp': int(time.time()),
+    }
+
+
+def _validate_auto_drive_request():
+    task_params = _load_task_params_snapshot()
+    start_lat = _coerce_float(task_params.get('startLat'), None)
+    start_lon = _coerce_float(task_params.get('startLon'), None)
+    origin_heading = _coerce_float(task_params.get('originHeading'), None)
+    detail = _build_runtime_detail()
+
+    if _decode_redis_value(redis_cli.get('mission')) == 'working':
+        return {
+            'success': False,
+            'faultState': 'ALREADY_RUNNING',
+            'message': '小车当前正在执行任务，请勿重复启动',
+            'data': detail,
+        }
+
+    power_on_state = _get_power_on_state()
+    if power_on_state is None:
+        detail['lowerMachineStatusWarning'] = '尚未收到下位机使能状态上报，已按用户指令继续启动校验'
+
+    elif power_on_state != 1:
+        return {
+            'success': False,
+            'faultState': 'LOWER_MACHINE_DISABLED',
+            'message': '下位机未使能，拒绝启动自动清扫',
+            'data': detail,
+        }
+
+    if start_lat is None or start_lon is None or origin_heading is None:
+        return {
+            'success': False,
+            'faultState': 'TASK_PARAMS_MISSING',
+            'message': '任务起点或航向参数未配置完整，无法启动',
+            'data': detail,
+        }
+
+    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
+        return {
+            'success': False,
+            'faultState': 'RTK_NOT_READY',
+            'message': 'RTK 定位未就绪，无法校验任务起点',
+            'data': detail,
+        }
+
+    distance_to_start = _distance_to_task_start(task_params)
+    if distance_to_start is None:
+        return {
+            'success': False,
+            'faultState': 'START_POSITION_UNKNOWN',
+            'message': '无法计算当前位置与任务起点距离，拒绝启动',
+            'data': detail,
+        }
+
+    detail['distanceToStartM'] = distance_to_start
+    if distance_to_start > START_POSITION_TOLERANCE_METERS:
+        return {
+            'success': False,
+            'faultState': 'NOT_AT_TASK_START',
+            'message': '当前位置距离任务起点 {:.2f} 米，超过允许范围 {:.2f} 米'.format(
+                distance_to_start, START_POSITION_TOLERANCE_METERS
+            ),
+            'data': detail,
+        }
+
+    if len(_load_task_items_for_preview()) == 0:
+        return {
+            'success': False,
+            'faultState': 'TASK_PATH_EMPTY',
+            'message': '当前没有可执行任务路径，拒绝启动',
+            'data': detail,
+        }
+
+    return {
+        'success': True,
+        'message': '启动条件通过',
+        'data': detail,
+    }
 
 
 
@@ -229,13 +849,19 @@ def globalDataSet(data):
     global global_get_air
     global global_get_moveFinish
 
+    redis_cli.set("hardwareReportAt", int(time.time()))
+
     for ch in data:
         if i == 1:
             global_get_status = int(binascii.b2a_hex(data[i]), 16)
         elif i == 2:
+            previous_power_on_state = _get_power_on_state()
             global_get_powerOn = int(binascii.b2a_hex(data[i]), 16)
+            redis_cli.set("powerOnState", global_get_powerOn)
+            _maybe_brake_on_power_enable(previous_power_on_state, global_get_powerOn)
         elif i == 3:
             global_get_HWstatus = int(binascii.b2a_hex(data[i]), 16)
+            redis_cli.set("hardwareState", global_get_HWstatus)
         elif i == 4:
             global_get_XSpeed = int(binascii.b2a_hex(data[i] + data[i + 1]), 16)
         elif i == 6:
@@ -253,6 +879,7 @@ def globalDataSet(data):
                 global_get_edge = 0
         elif i == 10:
             global_get_voltage = int(binascii.b2a_hex(data[i]), 16)
+            _cache_battery_percent(global_get_voltage, int(time.time()))
         elif i == 11:
             global_get_air = int(binascii.b2a_hex(data[i]), 16)
         elif i == 12:
@@ -278,6 +905,8 @@ def globalDataSet(data):
     str1 = binascii.b2a_hex(data[14])
     str2 = binascii.b2a_hex(data[15])
     voltage = int(str1 + str2, 16)
+    redis_cli.set("packVoltage", round(voltage * 0.01, 1))
+    redis_cli.set("packVoltageReportAt", int(time.time()))
     # if voltage > 0:
     #     logger.info('获取到电压值: %d', voltage)
     #     roundVoltage = round(voltage * 0.01, 1)
@@ -639,87 +1268,75 @@ def login():
     response.headers['Content-Type'] = 'application/json'
     return response
 
+def _build_legacy_web_user_info():
+    dept = {
+        'deptId': 103,
+        'parentId': 101,
+        'deptName': 'dev',
+        'status': '0',
+    }
+    role = {
+        'roleId': 1,
+        'roleName': 'admin',
+        'roleKey': 'admin',
+        'roleSort': 1,
+        'dataScope': '1',
+        'menuCheckStrictly': False,
+        'deptCheckStrictly': False,
+        'status': '0',
+        'flag': False,
+        'admin': True,
+    }
+    return {
+        'createBy': 'admin',
+        'createTime': '2024-06-30 11:27:11',
+        'remark': 'admin',
+        'userId': 1,
+        'deptId': 103,
+        'userName': 'admin',
+        'nickName': 'admin',
+        'email': 'zt@163.com',
+        'phonenumber': '15888888888',
+        'sex': '1',
+        'status': '0',
+        'delFlag': '0',
+        'dept': dept,
+        'roles': role,
+        'admin': True,
+    }
+
+
 @app.route("/vehicle/getInfo", methods=['GET'])
 def getInfo():
-    res = {}
+    # Keep the legacy web login contract while exposing the vehicle status
+    # fields consumed by MQTT/cloud and the miniapp.
+    return jsonify({
+        'success': True,
+        'message': 'status ok',
+        'data': _build_vehicle_status_payload(),
+        'msg': 'operation success',
+        'code': 200,
+        'permissions': '*:*:*',
+        'roles': 'admin',
+        'user': _build_legacy_web_user_info(),
+    })
 
-    res['msg'] = '操作成功'
 
-    res['code'] = 200
+@app.route("/vehicle/getTaskPath", methods=['GET'])
+def getTaskPath():
+    payload = _build_task_path_payload()
+    if not payload.get('segments'):
+        return jsonify({
+            'success': False,
+            'message': '当前没有可用任务路径',
+            'data': payload,
+        })
 
-    res['permissions'] = '*:*:*'
-
-    res['roles'] = 'admin'
-
-    user = {}
-
-    user['createBy'] = 'admin'
-
-    user['createTime'] = '2024-06-30 11:27:11'
-
-    user['remark'] = '管理员'
-
-    user['userId'] = 1
-
-    user['deptId'] = 103
-
-    user['userName'] = 'admin'
-
-    user['nickName'] = '中拓'
-
-    user['email'] = 'zt@163.com'
-
-    user['phonenumber'] = '15888888888'
-
-    user['sex'] = '1'
-
-    user['status'] = '0'
-
-    user['delFlag'] = '0'
-
-    dept = {}
-
-    dept['deptId'] = 103
-
-    dept['parentId'] = 101
-
-    dept['deptName'] = '研发部门'
-
-    dept['status'] = '0'
-
-    user['dept'] = dept
-
-    roles = {}
-
-    roles['roleId'] = 1
-
-    roles['roleName'] = '超级管理员'
-
-    roles['roleKey'] = 'admin'
-
-    roles['roleSort'] = 1
-
-    roles['dataScope'] = '1'
-
-    roles['menuCheckStrictly'] = False
-
-    roles['deptCheckStrictly'] = False
-
-    roles['status'] = '0'
-
-    roles['flag'] = False
-
-    roles['admin'] = True
-
-    user['roles'] = roles
-
-    user['admin'] = True
-
-    res['user'] = user
-
-    response = make_response(json.dumps(res))
-
-    return response
+    return jsonify({
+        'success': True,
+        'message': '任务路径获取成功',
+        'data': payload,
+    })
 
 
 @app.route("/vehicle/enterGarage", methods=['GET'])
@@ -1328,6 +1945,7 @@ def autoDriveByRTKThread():
             logger.warn("搜索到当前任务，任务名称为:{}".format(taskName))
         else:
             logger.warn("未搜索到当前任务")
+            _mark_runtime_blocked('TASK_NAME_NOT_FOUND', '当前位置没有匹配到可执行任务')
             return
         # 然后将taskName.json文件中的内容复制到config.json中
         fileName = taskName + '.json'
@@ -1342,11 +1960,13 @@ def autoDriveByRTKThread():
     # 如果小车已经在工作了，就没有办法再启动工作
     if global_status == 'working':
         logger.warn("小车已经在工作了，无法再开启工作")
+        _mark_runtime_blocked('ALREADY_WORKING', '小车当前已经在执行任务，请勿重复启动')
         return 0
     global_status = 'working'
     redis_cli.set("mission", "working")
     redis_cli.set("parking", "0")
     global_doCleanThreadStop = 0
+    _mark_runtime_running('自动清扫启动成功，任务执行中')
 
     # 根据缓存中是否存在任务，来构建新的任务
     resultTask = buildTask(taskParams)
@@ -1369,6 +1989,8 @@ def autoDriveByRTKThread():
 
     # # 位置校验
     if turnCheckPoint(originHeading) == 0:
+        _mark_runtime_blocked('START_HEADING_CHECK_FAILED', '起始姿态校验失败，自动清扫未启动')
+        doParking()
         return
     time.sleep(0.02)
     # 重置陀螺仪(记录当前航向角)
@@ -1514,19 +2136,26 @@ def setStatus_api():
 def auto_driving():
     redis_cli.set("reverse", "false")
     global global_doCleanThreadStop
-    # thread = threading.Thread(target=starttt)
-    # thread.start()
+    validation = _validate_auto_drive_request()
+    if not validation.get('success'):
+        _mark_runtime_blocked(
+            validation.get('faultState', 'AUTO_DRIVE_BLOCKED'),
+            validation.get('message', '启动条件未通过'),
+            validation.get('data')
+        )
+        return jsonify(validation)
 
     global_doCleanThreadStop = 0
-    # thread = threading.Thread(target=doCleanThread)
-    # logger.warn("启动清扫任务线程")
-    # thread.start()
+    _mark_runtime_ready('启动条件通过，正在创建自动清扫线程', validation.get('data'))
 
     thread = threading.Thread(target=autoDriveByRTKThread)
     thread.start()
 
-    response = make_response("启动清扫任务线程")
-    return response
+    return jsonify({
+        'success': True,
+        'message': '启动自动清扫任务线程',
+        'data': validation.get('data'),
+    })
 
 
 # 根据RTK获取航向角偏差值
@@ -1721,6 +2350,7 @@ def parking():
     sendBraking()
     global_status = 'active'
     redis_cli.set('curTaskIndex', 0)
+    _mark_runtime_idle('已执行停车指令')
     response = make_response("1")
 
     return response
@@ -1744,6 +2374,7 @@ def doParking():
     global_go = 0
     sendBraking()
     redis_cli.set('curTaskIndex', 0)
+    _mark_runtime_idle('任务已停止并进入停车状态')
 
 # 删除缓存任务
 @app.route('/vehicle/delTaskList', methods=['GET'])
@@ -2271,7 +2902,7 @@ def goOn():
     redis_cli.set("reverse", "false")
     # thread = threading.Thread(target=goOnDoClean)
     # thread.start()
-    thread = threading.Thread(target=goOnDoCleanByRTK())
+    thread = threading.Thread(target=goOnDoCleanByRTK)
     thread.start()
     response = make_response("1")
     return response
@@ -4447,15 +5078,19 @@ def listenerSlavePort():
                 if len(data) < CMD_LEN:
                     time.sleep(2)
                     continue
-                i = 0
-                for q in data:
+                start_index = None
+                for idx, q in enumerate(data):
                     if binascii.b2a_hex(q) == '7b':
+                        start_index = idx
                         break
-                    else:
-                        i = i + 1
-                        time.sleep(2)
-                        continue
-                data = data[i:]
+                if start_index is None:
+                    time.sleep(2)
+                    continue
+                data = data[start_index:]
+                if len(data) < CMD_LEN:
+                    time.sleep(2)
+                    continue
+                _cache_hardware_status_frame(data)
                 # 激光传感器值
                 jgValue = int(binascii.b2a_hex(data[11]), 16)
                 # logging.info('获取到激光传感器值: %d', jgValue)

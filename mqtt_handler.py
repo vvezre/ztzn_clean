@@ -1,4 +1,5 @@
 # coding=utf-8
+import io
 import json
 import os
 import time
@@ -6,14 +7,8 @@ import time
 from AppLogger import logger
 
 
-class MQTTCommandHandler:
-    def __init__(self,vehicle_controller):
-        """
-        初始化命令处理器
-
-        Args:
-            vehicle_controller: 车辆控制器对象（需要提供车辆控制方法）
-        """
+class MQTTCommandHandler(object):
+    def __init__(self, vehicle_controller):
         self.vehicle_controller = vehicle_controller
         self.command_map = self._init_command_map()
         self.command_map.update({
@@ -37,393 +32,202 @@ class MQTTCommandHandler:
             'getTaskPath': self._handle_get_task_path,
             'get_task_path': self._handle_get_task_path,
         })
-        logger.info("MQTT命令处理器初始化完成")
+        logger.info("MQTT command handler initialized")
 
     def _init_command_map(self):
-        """
-        初始化命令映射表
-
-        Returns:
-            dict: 命令名称到处理函数的映射
-        """
         return {
-            # 基础运动控制
             'drive': self._handle_drive,
             'back': self._handle_back,
             'turn_left': self._handle_turn_left,
             'turn_right': self._handle_turn_right,
             'stop': self._handle_stop,
             'parking': self._handle_parking,
-
-            # 摇杆控制
             'joystick_move': self._handle_joystick_move,
-
-            # 高级功能
             'auto_drive': self._handle_auto_drive,
             'go_on': self._handle_go_on,
             'return_to_point': self._handle_return_to_point,
             'enter_garage': self._handle_enter_garage,
             'exit_garage': self._handle_exit_garage,
-
-            # 参数调整
             'adjust_speed': self._handle_adjust_speed,
             'adjust_brush_speed': self._handle_adjust_brush_speed,
             'toggle_tracking': self._handle_toggle_tracking,
             'toggle_path_planning': self._handle_toggle_path_planning,
-
-            # 任务管理
             'create_task': self._handle_create_task,
             'select_task': self._handle_select_task,
             'save_task': self._handle_save_task,
-
-            # 参数配置
             'save_params': self._handle_save_params,
             'get_status': self._handle_get_status,
         }
-    def handle(self,message_data):
-        """
-                处理接收到的MQTT消息
-                Args:
-                    message_data: 消息数据字典，格式：
-                        {
-                            'command': '命令名称',
-                            'params': {...}  # 可选参数
-                        }
 
-                Returns:
-                    dict: 处理结果
-                """
+    def handle(self, message_data):
         try:
-            # 提取命令和参数
             command = message_data.get('command')
             params = message_data.get('params')
             if params is None:
                 params = message_data.get('parameters', {})
 
             if not command:
-                logger.warning("消息缺少command字段: {}".format(message_data))
-                return {'success': False, 'message': '消息格式错误：缺少command字段'}
+                return {'success': False, 'message': '消息格式错误：缺少 command 字段'}
 
-            logger.info("处理MQTT命令: {}, 参数: {}".format(command, params))
-
-            # 查找并执行命令处理函数
+            logger.info("Processing MQTT command: {}, params: {}".format(command, params))
             handler = self.command_map.get(command)
-            if handler:
-                result = handler(params)
-                logger.info("命令执行结果: {}".format(result))
-                return result
-            else:
-                logger.warning("未知命令: {}".format(command))
+            if not handler:
+                logger.warning("Unknown MQTT command: {}".format(command))
                 return {'success': False, 'message': '未知命令: {}'.format(command)}
 
-        except Exception as e:
-            logger.error("处理MQTT命令异常: {}".format(e), exc_info=True)
-            return {'success': False, 'message': '命令处理异常: {}'.format(e)}
+            result = handler(params or {})
+            logger.info("MQTT command result: {}".format(result))
+            return result
+        except Exception as exc:
+            logger.error("MQTT command handling failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': '命令处理异常: {}'.format(exc)}
+
+    def _normalize_controller_result(self, result, default_message):
+        if isinstance(result, dict):
+            success = result.get('success')
+            message = result.get('message') or default_message
+            response = {
+                'success': False if success is False else True,
+                'message': message,
+            }
+            if 'data' in result:
+                response['data'] = result.get('data')
+            return response
+
+        response = {
+            'success': True,
+            'message': default_message,
+        }
+        if result not in (None, '', '1'):
+            response['data'] = result
+        return response
+
+    def _call_controller(self, method_name, default_message, *args):
+        if not hasattr(self.vehicle_controller, method_name):
+            return {'success': False, 'message': '车辆控制器不支持 {} 方法'.format(method_name)}
+        result = getattr(self.vehicle_controller, method_name)(*args)
+        return self._normalize_controller_result(result, default_message)
 
     def _handle_drive(self, params):
-        """处理前进命令"""
-        try:
-            distance = params.get('distance', 0)
-            speed = params.get('speed', None)
-
-            if hasattr(self.vehicle_controller, 'drive'):
-                self.vehicle_controller.drive(distance, speed)
-                return {'success': True, 'message': '前进命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持drive方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('drive', '前进命令已执行', params.get('distance', 0), params.get('speed'))
 
     def _handle_back(self, params):
-        """处理后退命令"""
-        try:
-            distance = params.get('distance', 0)
-            speed = params.get('speed', None)
-
-            if hasattr(self.vehicle_controller, 'back'):
-                self.vehicle_controller.back(distance, speed)
-                return {'success': True, 'message': '后退命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持back方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('back', '后退命令已执行', params.get('distance', 0), params.get('speed'))
 
     def _handle_turn_left(self, params):
-        """处理左转命令"""
-        try:
-            angle = params.get('angle', 90)
-
-            if hasattr(self.vehicle_controller, 'turn_left'):
-                self.vehicle_controller.turn_left(angle)
-                return {'success': True, 'message': '左转命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持turn_left方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('turn_left', '左转命令已执行', params.get('angle', 90))
 
     def _handle_turn_right(self, params):
-        """处理右转命令"""
-        try:
-            angle = params.get('angle', 90)
-
-            if hasattr(self.vehicle_controller, 'turn_right'):
-                self.vehicle_controller.turn_right(angle)
-                return {'success': True, 'message': '右转命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持turn_right方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('turn_right', '右转命令已执行', params.get('angle', 90))
 
     def _handle_stop(self, params):
-        """处理停止命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'stop'):
-                self.vehicle_controller.stop()
-                return {'success': True, 'message': '停止命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持stop方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('stop', '停止命令已执行')
 
     def _handle_parking(self, params):
-        """处理急停命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'parking'):
-                self.vehicle_controller.parking()
-                return {'success': True, 'message': '急停命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持parking方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
-
-    # ==================== 摇杆控制命令处理 ====================
+        return self._call_controller('parking', '停车命令已执行')
 
     def _handle_joystick_move(self, params):
-        """处理摇杆移动命令"""
-        try:
-            distance = params.get('distance', 50)
-            dir_x = params.get('dirX', 0)
-            dir_y = params.get('dirY', 0)
-
-            if hasattr(self.vehicle_controller, 'joystick_move'):
-                self.vehicle_controller.joystick_move(distance, dir_x, dir_y)
-                return {'success': True, 'message': '摇杆控制命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持joystick_move方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
-
-    # ==================== 高级功能命令处理 ====================
+        return self._call_controller(
+            'joystick_move',
+            '摇杆控制命令已执行',
+            params.get('distance', 50),
+            params.get('dirX', 0),
+            params.get('dirY', 0)
+        )
 
     def _handle_auto_drive(self, params):
-        """处理自动清扫命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'auto_drive'):
-                self.vehicle_controller.auto_drive()
-                return {'success': True, 'message': '自动清扫已启动'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持auto_drive方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('auto_drive', '自动清扫已启动')
 
     def _handle_go_on(self, params):
-        """处理继续清扫命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'go_on'):
-                self.vehicle_controller.go_on()
-                return {'success': True, 'message': '继续清扫命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持go_on方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('go_on', '继续清扫命令已执行')
 
     def _handle_return_to_point(self, params):
-        """处理返回原点命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'return_to_point'):
-                self.vehicle_controller.return_to_point()
-                return {'success': True, 'message': '返回原点命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持return_to_point方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('return_to_point', '返回原点命令已执行')
 
     def _handle_enter_garage(self, params):
-        """处理入库命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'enter_garage'):
-                self.vehicle_controller.enter_garage()
-                return {'success': True, 'message': '入库命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持enter_garage方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('enter_garage', '入库命令已执行')
 
     def _handle_exit_garage(self, params):
-        """处理出库命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'exit_garage'):
-                self.vehicle_controller.exit_garage()
-                return {'success': True, 'message': '出库命令已执行'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持exit_garage方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
-
-    # ==================== 参数调整命令处理 ====================
+        return self._call_controller('exit_garage', '出库命令已执行')
 
     def _handle_adjust_speed(self, params):
-        """处理调整速度命令"""
-        try:
-            speed = params.get('speed', 50)
-
-            if hasattr(self.vehicle_controller, 'adjust_speed'):
-                self.vehicle_controller.adjust_speed(speed)
-                return {'success': True, 'message': '速度已调整为: {}'.format(speed)}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持adjust_speed方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('adjust_speed', '移动速度已调整', params.get('speed', 50))
 
     def _handle_adjust_brush_speed(self, params):
-        """处理调整滚刷速度命令"""
-        try:
-            speed = params.get('speed', 50)
-
-            if hasattr(self.vehicle_controller, 'adjust_brush_speed'):
-                self.vehicle_controller.adjust_brush_speed(speed)
-                return {'success': True, 'message': '滚刷速度已调整为: {}'.format(speed)}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持adjust_brush_speed方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('adjust_brush_speed', '滚刷速度已调整', params.get('speed', 50))
 
     def _handle_toggle_tracking(self, params):
-        """处理切换纠偏功能命令"""
-        try:
-            tracking = params.get('tracking', True)
-
-            if hasattr(self.vehicle_controller, 'toggle_tracking'):
-                self.vehicle_controller.toggle_tracking(tracking)
-                status = "开启" if tracking else "关闭"
-                return {'success': True, 'message': '纠偏功能已{}'.format(status)}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持toggle_tracking方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('toggle_tracking', '循迹状态已切换', params.get('tracking', True))
 
     def _handle_toggle_path_planning(self, params):
-        """处理切换路径规划模式命令"""
-        try:
-            path_mode = params.get('path', 'left')
-
-            if hasattr(self.vehicle_controller, 'toggle_path_planning'):
-                self.vehicle_controller.toggle_path_planning(path_mode)
-                return {'success': True, 'message': '路径规划模式已切换为: {}'.format(path_mode)}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持toggle_path_planning方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
-
-    # ==================== 任务管理命令处理 ====================
+        return self._call_controller('toggle_path_planning', '路径规划模式已切换', params.get('path', 'left'))
 
     def _handle_create_task(self, params):
-        """处理创建任务命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'create_task'):
-                result = self.vehicle_controller.create_task(params)
-                return {'success': True, 'message': '任务创建成功', 'data': result}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持create_task方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('create_task', '任务创建成功', params)
 
     def _handle_select_task(self, params):
-        """处理选择任务命令"""
-        try:
-            task_name = params.get('taskName', '')
-
-            if hasattr(self.vehicle_controller, 'select_task'):
-                result = self.vehicle_controller.select_task(task_name)
-                return {'success': True, 'message': '任务已选择', 'data': result}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持select_task方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('select_task', '任务已选择', params.get('taskName', ''))
 
     def _handle_save_task(self, params):
-        """处理保存任务命令"""
-        try:
-            task_name = params.get('taskName', '')
-
-            if hasattr(self.vehicle_controller, 'save_task'):
-                self.vehicle_controller.save_task(task_name)
-                return {'success': True, 'message': '任务已保存'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持save_task方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
-
-    # ==================== 参数配置命令处理 ====================
+        return self._call_controller('save_task', '任务已保存', params.get('taskName', ''))
 
     def _handle_save_params(self, params):
-        """处理保存参数命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'save_params'):
-                self.vehicle_controller.save_params(params)
-                return {'success': True, 'message': '参数已保存'}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持save_params方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('save_params', '参数已保存', params)
 
     def _handle_get_status(self, params):
-        """处理获取状态命令"""
-        try:
-            if hasattr(self.vehicle_controller, 'get_status'):
-                status = self.vehicle_controller.get_status()
-                return {'success': True, 'message': '状态获取成功', 'data': status}
-            else:
-                return {'success': False, 'message': '车辆控制器不支持get_status方法'}
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
+        return self._call_controller('get_status', '状态获取成功')
 
-    def _handle_get_task_path(self, params):
-        """处理获取任务路径命令：读取 config.json 的 taskList，按小程序期望的 schema 返回"""
-        try:
-            config_path = 'config.json'
-            if not os.path.exists(config_path):
-                return {'success': False, 'message': '未找到任务配置文件'}
-            with open(config_path, 'r', encoding='utf-8') as fp:
-                config = json.load(fp)
-            task_list = config.get('taskList') or []
-            if not isinstance(task_list, list) or len(task_list) == 0:
-                return {'success': False, 'message': '任务列表为空'}
+    def _fallback_task_path(self, params):
+        config_path = 'config.json'
+        if not os.path.exists(config_path):
+            return {'success': False, 'message': '未找到任务配置文件'}
 
-            segments = []
-            for item in task_list:
-                if not isinstance(item, dict):
-                    continue
-                segments.append({
-                    'id': item.get('id'),
-                    'startX': item.get('startX', 0),
-                    'startY': item.get('startY', 0),
-                    'endX': item.get('endX', 0),
-                    'endY': item.get('endY', 0),
-                    'mode': item.get('mode'),
-                    'heading': item.get('heading'),
-                    'areaNumber': item.get('areaNumber'),
-                })
+        with io.open(config_path, 'r', encoding='utf-8') as fp:
+            config = json.load(fp)
 
-            task_name = config.get('taskName') or ''
-            task_id = params.get('taskId') if isinstance(params, dict) else None
-            data = {
-                'taskId': task_id or task_name or 'current',
+        task_list = config.get('taskList') or []
+        if not isinstance(task_list, list) or len(task_list) == 0:
+            return {'success': False, 'message': '任务列表为空'}
+
+        segments = []
+        for item in task_list:
+            if not isinstance(item, dict):
+                continue
+            segments.append({
+                'id': item.get('id'),
+                'startX': item.get('startX', 0),
+                'startY': item.get('startY', 0),
+                'endX': item.get('endX', 0),
+                'endY': item.get('endY', 0),
+                'mode': item.get('mode'),
+                'angle': item.get('angle'),
+                'heading': item.get('heading'),
+                'areaNumber': item.get('areaNumber'),
+            })
+
+        task_name = config.get('taskName') or ''
+        return {
+            'success': True,
+            'message': '任务路径获取成功',
+            'data': {
+                'taskId': params.get('taskId') if isinstance(params, dict) else task_name or 'current',
                 'taskName': task_name,
+                'originLat': config.get('startLat'),
+                'originLon': config.get('startLon'),
+                'yAxisBearing': config.get('originHeading'),
                 'updatedAt': int(time.time() * 1000),
                 'segments': segments,
             }
-            return {'success': True, 'message': '任务路径获取成功', 'data': data}
-        except Exception as e:
-            logger.error("获取任务路径失败: {}".format(str(e)), exc_info=True)
-            return {'success': False, 'message': '获取任务路径失败: {}'.format(e)}
+        }
+
+    def _handle_get_task_path(self, params):
+        try:
+            if hasattr(self.vehicle_controller, 'get_task_path'):
+                return self._normalize_controller_result(
+                    self.vehicle_controller.get_task_path(),
+                    '任务路径获取成功'
+                )
+            return self._fallback_task_path(params)
+        except Exception as exc:
+            logger.error("Fetch task path failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': '获取任务路径失败: {}'.format(exc)}
