@@ -1670,8 +1670,6 @@ def returnToPointByRTKThread():
     global global_go,global_status
     set_current_action('return_to_point')
     redis_cli.set('curTaskIndex', 0)
-    charginPileLat = float(redis_cli.hget('taskParams','chargingPileLat'))
-    chargingPileLon = float(redis_cli.hget('taskParams','chargingPileLon'))
     # 原点航向角，用于起始点转正
     originHeading = float(redis_cli.hget('taskParams','originHeading'))
 
@@ -1681,6 +1679,8 @@ def returnToPointByRTKThread():
     startHeading = float(taskParams.get('heading'))
     originLat = float(taskParams.get('startLat'))
     originLon = float(taskParams.get('startLon'))
+    garageEntryLat = float(taskParams.get('garageEntryLat') or originLat)
+    garageEntryLon = float(taskParams.get('garageEntryLon') or originLon)
     start_angle_rtk = float(taskParams.get('heading'))
     backLength = int(taskParams.get('startToChargingPilePointLength'))
     # 返回路线任务
@@ -1704,29 +1704,29 @@ def returnToPointByRTKThread():
                 item['heading'] = (item['heading'] + 180)%360
 
                 routes.append(item)
-                route = {'startLat':item['endLat'], 'startLon':item['endLon'], 'endLat':originLat,
-                         'endLon':originLon,'angle':180,'heading':(180+start_angle_rtk)%360}
+                route = {'startLat':item['endLat'], 'startLon':item['endLon'], 'endLat':garageEntryLat,
+                         'endLon':garageEntryLon,'angle':180,'heading':(180+start_angle_rtk)%360}
                 routes.append(route)
 
             elif item['angle'] == 180 and next_item['angle'] == 270:
                 routes.append(item)
                 routes.append(next_item)
-                route = {'startLat': next_item['endLat'], 'startLon': next_item['endLon'], 'endLat': originLat,
-                         'endLon': originLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
+                route = {'startLat': next_item['endLat'], 'startLon': next_item['endLon'], 'endLat': garageEntryLat,
+                         'endLon': garageEntryLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
                 routes.append(route)
                 # 要删除3个任务
                 for _ in range(3):
                     redis_cli.lpop("taskList")
             elif item['angle'] == 180 and next_item['angle'] == 90:
-                route = {'startLat': item['endLat'], 'startLon': item['endLon'], 'endLat': originLat,
-                         'endLon': originLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
+                route = {'startLat': item['endLat'], 'startLon': item['endLon'], 'endLat': garageEntryLat,
+                         'endLon': garageEntryLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
                 routes.append(route)
                 # 要删除1个任务
                 redis_cli.lpop("taskList")
             elif item['angle'] == 270:
                 routes.append(item)
-                route = {'startLat': item['endLat'], 'startLon': item['endLon'], 'endLat': originLat,
-                         'endLon': originLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
+                route = {'startLat': item['endLat'], 'startLon': item['endLon'], 'endLat': garageEntryLat,
+                         'endLon': garageEntryLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
                 routes.append(route)
                 # 要删除2个任务
                 for _ in range(2):
@@ -1750,8 +1750,8 @@ def returnToPointByRTKThread():
                          'endLon': endLon, 'angle': 180, 'heading': (180 + start_angle_rtk) % 360}
                 routes.append(route)
 
-                route2 = {'startLat': endLat, 'startLon': endLon, 'endLat': originLat,
-                         'endLon': originLon, 'angle': 270, 'heading': (270 + start_angle_rtk) % 360}
+                route2 = {'startLat': endLat, 'startLon': endLon, 'endLat': garageEntryLat,
+                         'endLon': garageEntryLon, 'angle': 270, 'heading': (270 + start_angle_rtk) % 360}
                 routes.append(route2)
             elif item['angle'] == 180 and next_item['angle'] == 270:
                 routes.append(item)
@@ -1764,15 +1764,15 @@ def returnToPointByRTKThread():
                          'endLon': endLon, 'angle': 180, 'heading': (180 + start_angle_rtk) % 360}
                 routes.append(route)
 
-                route2 = {'startLat': endLat, 'startLon': endLon, 'endLat': originLat,
-                         'endLon': originLon, 'angle': 270, 'heading': (270 + start_angle_rtk) % 360}
+                route2 = {'startLat': endLat, 'startLon': endLon, 'endLat': garageEntryLat,
+                         'endLon': garageEntryLon, 'angle': 270, 'heading': (270 + start_angle_rtk) % 360}
                 routes.append(route2)
                 # 要删除3个任务
                 for _ in range(3):
                     redis_cli.lpop("taskList")
             elif item['angle'] == 180 and next_item['angle'] == 90:
-                route = {'startLat': item['endLat'], 'startLon': item['endLon'], 'endLat': originLat,
-                         'endLon': originLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
+                route = {'startLat': item['endLat'], 'startLon': item['endLon'], 'endLat': garageEntryLat,
+                         'endLon': garageEntryLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
                 routes.append(route)
                 x,y = item['endX'], item['endY']
                 endLat, endLon = util.local_rotated_xy_to_latlon_precise(originLat, originLon, x / 100.0, 0,
@@ -1791,8 +1791,8 @@ def returnToPointByRTKThread():
                          'endLon': endLon, 'angle': 180,'heading':(180+start_angle_rtk)%360}
                 routes.append(route)
 
-                route2 = {'startLat': endLat, 'startLon': endLon, 'endLat': originLat,
-                          'endLon': originLon, 'angle': 270, 'heading': (270 + start_angle_rtk) % 360}
+                route2 = {'startLat': endLat, 'startLon': endLon, 'endLat': garageEntryLat,
+                          'endLon': garageEntryLon, 'angle': 270, 'heading': (270 + start_angle_rtk) % 360}
                 routes.append(route2)
                 # 要删除2个任务
                 for _ in range(2):
@@ -2035,7 +2035,7 @@ def autoDriveByRTKThread():
                     global_doCleanThreadStop = 1
                     break
             if mode == 1 and index == len(taskList)-1:
-                if lastTaskBackLength != '0':
+                if lastTaskBackLength != 0:
                     moveBack(ser, lastTaskBackLength)
             # 在redis中设置是否是最后一个任务，如果是则设置为1，不是则设置为0
             if index == len(taskList) - 2:
@@ -2216,6 +2216,15 @@ def setCharginPileInfo():
     # redis_cli.hset('taskParams','startToChargingPilePointLength',startToChargingPilePointLength)
     result = {"success":True,"msg":"设置成功","chargingPileLat":lat,"chargingPileLon":lon,'startToChargingPilePointLength':startToChargingPilePointLength}
     return jsonify(result)
+# 设置入舱点，入舱点是小车进入充电桩前的入口位置，不等同于充电桩位置
+@app.route("/vehicle/setGarageEntryInfo", methods=['GET'])
+def setGarageEntryInfo():
+    lat = float(request.args.get('lat'))
+    lon = float(request.args.get('lon'))
+    redis_cli.hset('taskParams','garageEntryLat',lat)
+    redis_cli.hset('taskParams','garageEntryLon',lon)
+    result = {"success":True,"msg":"设置成功","garageEntryLat":lat,"garageEntryLon":lon}
+    return jsonify(result)
 # 设置原点，也就是起始点
 @app.route("/vehicle/setOrigin", methods=['GET'])
 def setOrigin():
@@ -2225,6 +2234,9 @@ def setOrigin():
 
     redis_cli.hset('taskParams','startLat',global_originLat)
     redis_cli.hset('taskParams','startLon',global_originLon)
+    if not redis_cli.hget('taskParams','garageEntryLat') or not redis_cli.hget('taskParams','garageEntryLon'):
+        redis_cli.hset('taskParams','garageEntryLat',global_originLat)
+        redis_cli.hset('taskParams','garageEntryLon',global_originLon)
     result = {"success":True,"msg":"设置成功","global_originLat":global_originLat,"global_originLon":global_originLon}
     return jsonify(result)
 # 设置目标航向角，根据当前位置和原点设置目标航向角
@@ -2399,6 +2411,8 @@ def selectParams():
 @app.route('/vehicle/saveParams', methods=['POST'])
 def saveParams():
     data = request.get_json()
+    garageEntryLat = data.get('garageEntryLat') or data['startLat']
+    garageEntryLon = data.get('garageEntryLon') or data['startLon']
     redis_cli.hset('taskParams', "goBackLen", data['goBackLen'])
     redis_cli.hset('taskParams', "goLeftOrRightBackLen", data['goLeftOrRightBackLen'])
     redis_cli.hset('taskParams', "turnBackLen", data['turnBackLen'])
@@ -2412,10 +2426,13 @@ def saveParams():
     # 起始点经纬度
     redis_cli.hset('taskParams', "startLat", data['startLat'])
     redis_cli.hset('taskParams', "startLon", data['startLon'])
+    # 入舱点经纬度，未设置时默认等于起始点
+    redis_cli.hset('taskParams', "garageEntryLat", garageEntryLat)
+    redis_cli.hset('taskParams', "garageEntryLon", garageEntryLon)
     # 充电桩经纬度
     redis_cli.hset('taskParams', "chargingPileLat", data['chargingPileLat'])
     redis_cli.hset('taskParams', "chargingPileLon", data['chargingPileLon'])
-    # 起始点到充电桩位置
+    # 入舱点到充电桩距离
     redis_cli.hset('taskParams', "startToChargingPilePointLength", data['startToChargingPilePointLength'])
     # 最后一个任务结束后的后退距离
     redis_cli.hset('taskParams', "lastTaskBackLength", data['lastTaskBackLength'])
@@ -2533,11 +2550,15 @@ def syncCurTaskFileToRedis():
     # 起始点经纬度
     redis_cli.hset('taskParams', "startLat", taskObj['startLat'])
     redis_cli.hset('taskParams', "startLon", taskObj['startLon'])
+    # 入舱点经纬度，兼容旧任务文件：没有入舱点则默认使用起始点
+    redis_cli.hset('taskParams', "garageEntryLat", taskObj.get('garageEntryLat', taskObj['startLat']))
+    redis_cli.hset('taskParams', "garageEntryLon", taskObj.get('garageEntryLon', taskObj['startLon']))
     # 充电桩经纬度
     redis_cli.hset('taskParams', "chargingPileLat", taskObj['chargingPileLat'])
     redis_cli.hset('taskParams', "chargingPileLon", taskObj['chargingPileLon'])
-    # 起始点到充电桩位置
+    # 入舱点到充电桩距离
     redis_cli.hset('taskParams', "startToChargingPilePointLength", taskObj['startToChargingPilePointLength'])
+    redis_cli.hset('taskParams', "lastTaskBackLength", taskObj.get('lastTaskBackLength', 0))
 
     redis_cli.hset('taskParams', "panelAngle", taskObj['panelAngle'])
     redis_cli.hset('taskParams', "panelAngleX", taskObj['panelAngleX'])

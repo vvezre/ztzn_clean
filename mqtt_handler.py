@@ -28,6 +28,7 @@ class MQTTCommandHandler(object):
             'selectTask': self._handle_select_task,
             'saveTask': self._handle_save_task,
             'saveParams': self._handle_save_params,
+            'setGarageEntry': self._handle_set_garage_entry,
             'getStatus': self._handle_get_status,
             'getTaskPath': self._handle_get_task_path,
             'get_task_path': self._handle_get_task_path,
@@ -56,6 +57,7 @@ class MQTTCommandHandler(object):
             'select_task': self._handle_select_task,
             'save_task': self._handle_save_task,
             'save_params': self._handle_save_params,
+            'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
         }
 
@@ -173,6 +175,16 @@ class MQTTCommandHandler(object):
 
     def _handle_save_params(self, params):
         return self._call_controller('save_params', '参数已保存', params)
+
+    def _handle_set_garage_entry(self, params):
+        if params.get('lat') is None or params.get('lon') is None:
+            return {'success': False, 'message': 'set_garage_entry命令需要参数：lat, lon'}
+        return self._call_controller(
+            'set_garage_entry',
+            '入舱点已设置',
+            params.get('lat'),
+            params.get('lon')
+        )
 
     def _handle_get_status(self, params):
         return self._call_controller('get_status', '状态获取成功')

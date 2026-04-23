@@ -50,6 +50,8 @@ def createTask(taskName,areaList):
         startToChargingPilePointLength = int(taskParams.get('startToChargingPilePointLength'))
         originLat = float(taskParams.get('startLat'))
         originLon = float(taskParams.get('startLon'))
+        garageEntryLat = float(taskParams.get('garageEntryLat') or originLat)
+        garageEntryLon = float(taskParams.get('garageEntryLon') or originLon)
         # 原点航向角
         originHeading = float(taskParams.get('originHeading'))
         # 充电桩经纬度
@@ -107,6 +109,8 @@ def createTask(taskName,areaList):
             'taskName': taskName,
             'startLat': originLat,         # 起始点
             'startLon': originLon,
+            'garageEntryLat': garageEntryLat, # 入舱点经纬度，不等同于充电桩
+            'garageEntryLon': garageEntryLon,
             'goBackLen':int(taskParams.get('goBackLen')),
             'goLeftOrRightBackLen': int(taskParams.get('goLeftOrRightBackLen')),
             'turnBackLen':int(taskParams.get('turnBackLen')),
@@ -119,6 +123,7 @@ def createTask(taskName,areaList):
             'chargingPileLat':chargingPileLat,            # 充电桩经纬度
             'chargingPileLon':chargingPileLon,
             'startToChargingPilePointLength': startToChargingPilePointLength,
+            'lastTaskBackLength': int(taskParams.get('lastTaskBackLength')),
             'panelAngleX':panelAngleX,
             'panelAngle':panelAngle,
             'gap':int(taskParams.get('gap')),

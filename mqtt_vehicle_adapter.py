@@ -134,6 +134,9 @@ class VehicleControllerAdapter(object):
     def save_params(self, params):
         return self._call('/vehicle/saveParams', json_data=params or {})
 
+    def set_garage_entry(self, lat, lon):
+        return self._call('/vehicle/setGarageEntryInfo', params={'lat': lat, 'lon': lon})
+
     def get_status(self):
         return self._call('/vehicle/getInfo')
 
