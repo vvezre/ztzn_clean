@@ -115,6 +115,18 @@ redis_cli.delete('packVoltage')
 redis_cli.delete('packVoltageReportAt')
 redis_cli.set('bootSafeStopAt', int(time.time()))
 
+TASK_SWITCH_LOCK = threading.RLock()
+
+LOWER_MACHINE_OPEN_LOCK = threading.RLock()
+LOWER_MACHINE_READ_LOCK = threading.RLock()
+LOWER_MACHINE_WRITE_LOCK = threading.RLock()
+LOWER_MACHINE_RX_LOCK = threading.RLock()
+LOWER_MACHINE_RX_BUFFER = bytearray()
+LOWER_MACHINE_FRAME_START = 0x7b
+LOWER_MACHINE_FRAME_END = 0x7d
+LOWER_MACHINE_SHORT_STATUS_LEN = 14
+LOWER_MACHINE_RX_BUFFER_LIMIT = 512
+
 # 状态，0刹车，1速度模式，2距离速度模式，3旋转模式
 global_get_status = 0
 
@@ -164,6 +176,7 @@ global_start_angle_rtk = 350
 global_cur_rtk_lat = None
 global_cur_rtk_lon = None
 global_cur_rtk_heading = 0.0
+global_cur_rtk_heading_at = 0
 # 上一次距离目标距离，用于是否停止
 global_last_distance_to_target = 100000
 # 每个任务的时间间隔
@@ -198,6 +211,17 @@ BATTERY_SMOOTH_ALPHA = 0.18
 BATTERY_MAX_DROP_PER_SAMPLE = 0.3
 BATTERY_MAX_RISE_PER_SAMPLE = 0.6
 BATTERY_SMOOTH_RESET_AFTER_SEC = 60
+TURN_RTK_FALLBACK_TOLERANCE_DEG = 2.0
+TURN_RTK_FALLBACK_STABLE_COUNT = 1
+TURN_RTK_FALLBACK_MIN_WAIT_SEC = 1.0
+TURN_RTK_HEADING_MAX_AGE_SEC = 2.0
+TURN_RTK_CROSSING_WINDOW_DEG = 3.0
+STANLEY_GAIN = 0.8
+STANLEY_SOFTENING_SPEED_MPS = 0.2
+STANLEY_MIN_SPEED_MPS = 0.05
+STANLEY_SPEED_UNIT_TO_MPS = 0.001
+STANLEY_ZSPEED_PER_DEG = 10.0
+STANLEY_DEFAULT_SPEED_CMD = 250.0
 
 
 def set_current_action(action_name):
@@ -213,6 +237,7 @@ def sync_current_location(lat, lon, heading=None):
         redis_cli.hset('currentLocation', 'lon', lon)
         if heading is not None:
             redis_cli.hset('currentLocation', 'heading', heading)
+            redis_cli.hset('currentLocation', 'headingAt', time.time())
     except Exception as e:
         logger.warning("同步currentLocation失败: {}".format(str(e)))
 
@@ -226,6 +251,13 @@ def _decode_redis_value(value):
     except Exception:
         pass
     return value
+
+
+def _normalize_task_name(task_name):
+    value = _decode_redis_value(task_name)
+    if value is None:
+        return ''
+    return str(value).strip()
 
 
 def _coerce_float(value, default=None):
@@ -246,6 +278,20 @@ def _coerce_int(value, default=None):
         return int(float(value))
     except Exception:
         return default
+
+
+def _update_json_file_field(file_name, field_name, field_value):
+    if not file_name or not os.path.exists(file_name):
+        return False
+    try:
+        task_obj = util.readConfig(file_name)
+        task_obj[field_name] = field_value
+        with open(file_name, 'w') as f:
+            f.write(json.dumps(task_obj, indent=2))
+        return True
+    except Exception as e:
+        logger.warning("update json field failed: file={}, field={}, error={}".format(file_name, field_name, e))
+        return False
 
 
 def _coerce_bool(value, default=False):
@@ -286,6 +332,64 @@ def _load_runtime_detail():
         return json.loads(raw)
     except Exception:
         return {}
+
+
+def _normalize_heading_delta(current_heading, target_heading):
+    if current_heading is None or target_heading is None:
+        return None
+    try:
+        delta = float(current_heading) - float(target_heading)
+    except Exception:
+        return None
+    return (delta + 180.0) % 360.0 - 180.0
+
+
+def _speed_cmd_to_mps(speed_cmd):
+    speed_cmd = abs(_coerce_float(speed_cmd, STANLEY_DEFAULT_SPEED_CMD))
+    speed_mps = speed_cmd * STANLEY_SPEED_UNIT_TO_MPS
+    return max(STANLEY_MIN_SPEED_MPS, speed_mps)
+
+
+def _calc_stanley_steering(heading_error_deg, cte_m, speed_cmd=None):
+    heading_error = _coerce_float(heading_error_deg, 0.0)
+    heading_error = (heading_error + 180.0) % 360.0 - 180.0
+    cte = _coerce_float(cte_m, 0.0)
+    speed_mps = _speed_cmd_to_mps(speed_cmd)
+
+    cte_term_deg = math.degrees(
+        math.atan2(STANLEY_GAIN * cte, speed_mps + STANLEY_SOFTENING_SPEED_MPS)
+    )
+    steer_deg = heading_error - cte_term_deg
+    z_speed_output = int(round(steer_deg * STANLEY_ZSPEED_PER_DEG))
+    return z_speed_output, steer_deg, cte_term_deg, speed_mps
+
+
+def _heading_delta_crossed_target(previous_delta, current_delta):
+    if previous_delta is None or current_delta is None:
+        return False
+    try:
+        previous_delta = float(previous_delta)
+        current_delta = float(current_delta)
+    except Exception:
+        return False
+    if abs(previous_delta) <= TURN_RTK_FALLBACK_TOLERANCE_DEG or abs(current_delta) <= TURN_RTK_FALLBACK_TOLERANCE_DEG:
+        return True
+    if previous_delta * current_delta >= 0:
+        return False
+    return abs(previous_delta) <= TURN_RTK_CROSSING_WINDOW_DEG and abs(current_delta) <= TURN_RTK_CROSSING_WINDOW_DEG
+
+
+def _get_current_rtk_heading():
+    now_at = time.time()
+    redis_heading = _coerce_float(redis_cli.hget('currentLocation', 'heading'), None)
+    redis_heading_at = _coerce_float(redis_cli.hget('currentLocation', 'headingAt'), None)
+    if redis_heading is not None and redis_heading_at is not None and now_at - redis_heading_at <= TURN_RTK_HEADING_MAX_AGE_SEC:
+        return redis_heading
+
+    global_heading = _coerce_float(global_cur_rtk_heading, None)
+    if global_heading is not None and global_cur_rtk_heading_at and now_at - global_cur_rtk_heading_at <= TURN_RTK_HEADING_MAX_AGE_SEC:
+        return global_heading
+    return None
 
 
 def _get_power_on_state():
@@ -415,6 +519,63 @@ def _distance_to_task_start(task_params):
 def _build_runtime_detail(extra=None):
     task_params = _load_task_params_snapshot()
     detail = _load_runtime_detail()
+    # Runtime detail builder should always return a plain detail object.
+    power_on_state = _get_power_on_state()
+    detail.update({
+        'batteryReportAt': _coerce_int(redis_cli.get('batteryReportAt'), None),
+        'batteryPercent': _coerce_float(redis_cli.get('batteryPercent'), None),
+        'batteryPercentRaw': _coerce_float(redis_cli.get('batteryPercentRaw'), None),
+        'packVoltage': _coerce_float(redis_cli.get('packVoltage'), None),
+        'packVoltageReportAt': _coerce_int(redis_cli.get('packVoltageReportAt'), None),
+        'powerOnState': power_on_state,
+        'powerOnEnabled': power_on_state == 1,
+        'hardwareState': _coerce_int(redis_cli.get('hardwareState'), None),
+        'hardwareReportAt': _get_hardware_report_at(),
+        'hardwareReportAgeSec': _get_hardware_report_age_sec(),
+        'distanceToStartM': _distance_to_task_start(task_params),
+        'startToleranceM': START_POSITION_TOLERANCE_METERS,
+        'currentLat': global_cur_rtk_lat,
+        'currentLon': global_cur_rtk_lon,
+        'currentHeading': global_cur_rtk_heading,
+        'taskStartLat': _coerce_float(task_params.get('startLat'), None),
+        'taskStartLon': _coerce_float(task_params.get('startLon'), None),
+        'originHeading': _coerce_float(task_params.get('originHeading'), None),
+    })
+    if extra:
+        detail.update(extra)
+    return detail
+
+    current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
+    if not current_task_name:
+        return {
+            'success': False,
+            'faultState': 'CURRENT_TASK_NOT_SET',
+            'message': '未设置当前任务，请先选择任务并设为当前任务',
+            'data': detail,
+        }
+
+    try:
+        task_obj = util.readConfig("config.json")
+    except Exception as e:
+        logger.error("读取config.json失败: {}".format(str(e)))
+        return {
+            'success': False,
+            'faultState': 'CURRENT_TASK_CONFIG_MISSING',
+            'message': '当前任务配置不存在或不可读',
+            'data': detail,
+        }
+
+    config_task_name = _normalize_task_name(task_obj.get('taskName'))
+    if config_task_name != current_task_name:
+        detail['currentTaskName'] = current_task_name
+        detail['configTaskName'] = config_task_name
+        return {
+            'success': False,
+            'faultState': 'CURRENT_TASK_MISMATCH',
+            'message': '当前任务与执行配置不一致，请重新设置当前任务',
+            'data': detail,
+        }
+
     power_on_state = _get_power_on_state()
     detail.update({
         'batteryReportAt': _coerce_int(redis_cli.get('batteryReportAt'), None),
@@ -526,6 +687,352 @@ def _frame_u16_to_int(data, index):
     if high is None or low is None:
         return None
     return (high << 8) + low
+
+
+def _frame_hex(data):
+    if data is None:
+        return ''
+    try:
+        return binascii.b2a_hex(data)
+    except Exception:
+        parts = []
+        for item in data:
+            value = _frame_byte_to_int(item)
+            if value is None:
+                value = 0
+            parts.append("{:02x}".format(value))
+        return ''.join(parts)
+
+
+def _serial_is_open(port):
+    if port is None:
+        return False
+    state = getattr(port, 'is_open', None)
+    if state is not None:
+        return bool(state)
+    if hasattr(port, 'isOpen'):
+        try:
+            return bool(port.isOpen())
+        except Exception:
+            return False
+    return False
+
+
+def _serial_in_waiting(port):
+    try:
+        waiting = getattr(port, 'in_waiting', None)
+        if waiting is not None:
+            return int(waiting)
+        if hasattr(port, 'inWaiting'):
+            return int(port.inWaiting())
+    except Exception:
+        return 0
+    return 0
+
+
+def _reset_lower_machine_serial(reason=None):
+    global ser
+    with LOWER_MACHINE_OPEN_LOCK:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        ser = None
+    if reason is not None:
+        logger.warning("reset lower-machine serial: {}".format(reason), exc_info=True)
+
+
+def _get_lower_machine_serial():
+    global ser
+    global global_status
+    if sys.platform.startswith('win'):
+        return ser
+    with LOWER_MACHINE_OPEN_LOCK:
+        try:
+            if not _serial_is_open(ser):
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                ser = serial.Serial(xwj_port, 115200, timeout=0.05)
+            try:
+                ser.timeout = 0.05
+            except Exception:
+                pass
+            return ser
+        except serial.serialutil.SerialException as exc:
+            global_status = "fail open COM"
+            ser = None
+            logger.error("fail open lower-machine serial {}: {}".format(xwj_port, exc), exc_info=True)
+            return None
+
+
+def _find_byte_in_rx_buffer(value, start_index=0):
+    index = start_index
+    with LOWER_MACHINE_RX_LOCK:
+        while index < len(LOWER_MACHINE_RX_BUFFER):
+            if LOWER_MACHINE_RX_BUFFER[index] == value:
+                return index
+            index += 1
+    return -1
+
+
+def _trim_lower_machine_rx_buffer_locked():
+    if len(LOWER_MACHINE_RX_BUFFER) <= LOWER_MACHINE_RX_BUFFER_LIMIT:
+        return
+    keep_start = -1
+    index = len(LOWER_MACHINE_RX_BUFFER) - 1
+    while index >= 0:
+        if LOWER_MACHINE_RX_BUFFER[index] == LOWER_MACHINE_FRAME_START:
+            keep_start = index
+            break
+        index -= 1
+    if keep_start > 0:
+        del LOWER_MACHINE_RX_BUFFER[:keep_start]
+    if len(LOWER_MACHINE_RX_BUFFER) > LOWER_MACHINE_RX_BUFFER_LIMIT:
+        del LOWER_MACHINE_RX_BUFFER[:-LOWER_MACHINE_RX_BUFFER_LIMIT]
+
+
+def _append_lower_machine_rx_data(data):
+    if not data:
+        return
+    with LOWER_MACHINE_RX_LOCK:
+        LOWER_MACHINE_RX_BUFFER.extend(bytearray(data))
+        _trim_lower_machine_rx_buffer_locked()
+
+
+def _pop_lower_machine_rx_frame_locked():
+    while LOWER_MACHINE_RX_BUFFER and LOWER_MACHINE_RX_BUFFER[0] != LOWER_MACHINE_FRAME_START:
+        del LOWER_MACHINE_RX_BUFFER[0]
+
+    if not LOWER_MACHINE_RX_BUFFER:
+        return None
+
+    next_start_index = -1
+    end_index = -1
+    index = 1
+    while index < len(LOWER_MACHINE_RX_BUFFER):
+        byte_value = LOWER_MACHINE_RX_BUFFER[index]
+        if byte_value == LOWER_MACHINE_FRAME_START and next_start_index < 0:
+            next_start_index = index
+        if byte_value == LOWER_MACHINE_FRAME_END:
+            end_index = index
+            break
+        index += 1
+
+    if end_index >= 0 and (next_start_index < 0 or end_index < next_start_index):
+        frame = bytearray(LOWER_MACHINE_RX_BUFFER[:end_index + 1])
+        del LOWER_MACHINE_RX_BUFFER[:end_index + 1]
+        return frame
+
+    if next_start_index > 0 and next_start_index < LOWER_MACHINE_SHORT_STATUS_LEN:
+        frame = bytearray(LOWER_MACHINE_RX_BUFFER[:next_start_index])
+        del LOWER_MACHINE_RX_BUFFER[:next_start_index]
+        return frame
+
+    if len(LOWER_MACHINE_RX_BUFFER) >= LOWER_MACHINE_SHORT_STATUS_LEN:
+        frame_len = LOWER_MACHINE_SHORT_STATUS_LEN
+        if next_start_index > 0:
+            frame_len = min(frame_len, next_start_index)
+        frame = bytearray(LOWER_MACHINE_RX_BUFFER[:frame_len])
+        del LOWER_MACHINE_RX_BUFFER[:frame_len]
+        return frame
+
+    return None
+
+
+def _apply_lower_machine_status_frame(data, source):
+    global global_get_status
+    global global_get_powerOn
+    global global_get_HWstatus
+    global global_get_XSpeed
+    global global_get_ZSpeed
+    global global_get_brushSpeed
+    global global_get_edge
+    global global_get_voltage
+    global global_get_air
+    global global_get_moveFinish
+    global global_get_rotateFinish
+
+    if not data:
+        return False
+
+    first_byte = _frame_byte_to_int(data[0])
+    if first_byte != LOWER_MACHINE_FRAME_START:
+        logger.warn("{} ignore unsynced lower-machine frame, raw={}".format(source, _frame_hex(data)))
+        return False
+
+    frame_len = len(data)
+    report_at = int(time.time())
+
+    def byte_at(index):
+        if frame_len <= index:
+            return None
+        return _frame_byte_to_int(data[index])
+
+    if frame_len < 14:
+        logger.info("{} ignore short lower-machine frame, len={}, raw={}".format(source, frame_len, _frame_hex(data)))
+        return False
+
+    if frame_len < 20:
+        move_finish = byte_at(12)
+        rotate_finish = byte_at(13)
+        if move_finish == 0xbb:
+            global_get_moveFinish = 1
+        if rotate_finish == 0xbb:
+            global_get_rotateFinish = 1
+        if move_finish == 0xbb or rotate_finish == 0xbb:
+            logger.warn(
+                "{} parsed short finish frame, len={}, raw={}, moveFinish={}, rotateFinish={}".format(
+                    source,
+                    frame_len,
+                    _frame_hex(data),
+                    global_get_moveFinish,
+                    global_get_rotateFinish
+                )
+            )
+            return True
+        logger.info("{} ignore short non-finish frame, len={}, raw={}".format(source, frame_len, _frame_hex(data)))
+        return False
+
+    redis_cli.set("hardwareReportAt", report_at)
+
+    status = byte_at(1)
+    if status is not None:
+        global_get_status = status
+
+    power_on = byte_at(2)
+    if power_on is not None:
+        previous_power_on_state = _get_power_on_state()
+        global_get_powerOn = power_on
+        redis_cli.set("powerOnState", global_get_powerOn)
+        _maybe_brake_on_power_enable(previous_power_on_state, global_get_powerOn)
+
+    hardware_state = byte_at(3)
+    if hardware_state is not None:
+        global_get_HWstatus = hardware_state
+        redis_cli.set("hardwareState", global_get_HWstatus)
+
+    if frame_len > 5:
+        x_speed = _frame_u16_to_int(data, 4)
+        if x_speed is not None:
+            global_get_XSpeed = x_speed
+
+    if frame_len > 7:
+        z_speed = _frame_u16_to_int(data, 6)
+        if z_speed is not None:
+            global_get_ZSpeed = z_speed
+
+    brush_speed = byte_at(8)
+    if brush_speed is not None:
+        global_get_brushSpeed = brush_speed
+
+    edge_status = byte_at(9)
+    if edge_status is not None:
+        if edge_status == 0:
+            global_get_edge = 1
+        elif edge_status == 0xff:
+            logger.warn("lower-machine edge alarm, edge=0 raw={}".format(_frame_hex(data)))
+            redis_cli.set("ultraSonic", "true")
+            global_get_edge = 0
+        else:
+            global_get_edge = 0
+
+    voltage = byte_at(10)
+    if voltage is not None:
+        global_get_voltage = voltage
+        _cache_battery_percent(global_get_voltage, report_at)
+
+    air = byte_at(11)
+    if air is not None:
+        global_get_air = air
+
+    move_finish = byte_at(12)
+    if move_finish is not None:
+        global_get_moveFinish = 1 if move_finish == 0xbb else 0
+
+    rotate_finish = byte_at(13)
+    if rotate_finish is not None:
+        global_get_rotateFinish = 1 if rotate_finish == 0xbb else 0
+
+    if frame_len > 15:
+        pack_voltage_raw = _frame_u16_to_int(data, 14)
+        if pack_voltage_raw is not None:
+            redis_cli.set("packVoltage", round(pack_voltage_raw * 0.01, 1))
+            redis_cli.set("packVoltageReportAt", report_at)
+
+    if frame_len > 17:
+        angle = _frame_u16_to_int(data, 16)
+        if angle is not None:
+            redis_cli.set("angle", angle)
+
+    if frame_len > 19:
+        odometer = _frame_u16_to_int(data, 18)
+        if odometer is not None:
+            redis_cli.set("odometer", odometer)
+
+    if move_finish == 0xbb or rotate_finish == 0xbb:
+        logger.warn(
+            "{} parsed finish frame, len={}, raw={}, moveFinish={}, rotateFinish={}".format(
+                source,
+                frame_len,
+                _frame_hex(data),
+                global_get_moveFinish,
+                global_get_rotateFinish
+            )
+        )
+
+    return True
+
+
+def _drain_lower_machine_rx_buffer(source):
+    parsed = False
+    while True:
+        with LOWER_MACHINE_RX_LOCK:
+            frame = _pop_lower_machine_rx_frame_locked()
+        if frame is None:
+            break
+        if _apply_lower_machine_status_frame(frame, source):
+            parsed = True
+    return parsed
+
+
+def _read_lower_machine_status_frame(source, wait_seconds=0.25):
+    if _drain_lower_machine_rx_buffer(source):
+        return True
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        port = _get_lower_machine_serial()
+        if port is None:
+            time.sleep(0.05)
+            return False
+
+        try:
+            with LOWER_MACHINE_READ_LOCK:
+                waiting = _serial_in_waiting(port)
+                read_len = waiting if waiting > 0 else 1
+                read_len = min(max(read_len, 1), LOWER_MACHINE_RX_BUFFER_LIMIT)
+                data = port.read(read_len)
+        except serial.serialutil.SerialException as exc:
+            _reset_lower_machine_serial(exc)
+            time.sleep(0.05)
+            continue
+        except Exception as exc:
+            logger.warning("{} read lower-machine serial failed: {}".format(source, exc), exc_info=True)
+            time.sleep(0.02)
+            continue
+
+        if data:
+            _append_lower_machine_rx_data(data)
+            if _drain_lower_machine_rx_buffer(source):
+                return True
+        else:
+            time.sleep(0.02)
+
+    return False
 
 
 def _cache_hardware_status_frame(data):
@@ -732,7 +1239,7 @@ def _build_vehicle_status_payload():
     }
 
 
-def _validate_auto_drive_request():
+def _validate_auto_drive_request_legacy():
     task_params = _load_task_params_snapshot()
     start_lat = _coerce_float(task_params.get('startLat'), None)
     start_lon = _coerce_float(task_params.get('startLon'), None)
@@ -752,12 +1259,8 @@ def _validate_auto_drive_request():
         detail['lowerMachineStatusWarning'] = '尚未收到下位机使能状态上报，已按用户指令继续启动校验'
 
     elif power_on_state != 1:
-        return {
-            'success': False,
-            'faultState': 'LOWER_MACHINE_DISABLED',
-            'message': '下位机未使能，拒绝启动自动清扫',
-            'data': detail,
-        }
+        detail['lowerMachineStatusWarning'] = '下位机未使能，已取消启动限制，将继续尝试执行任务'
+        detail['lowerMachineStartBypass'] = True
 
     if start_lat is None or start_lon is None or origin_heading is None:
         return {
@@ -795,7 +1298,8 @@ def _validate_auto_drive_request():
             'data': detail,
         }
 
-    if len(_load_task_items_for_preview()) == 0:
+    task_items = task_obj.get('taskList') if isinstance(task_obj, dict) else None
+    if not isinstance(task_items, list) or len(task_items) == 0:
         return {
             'success': False,
             'faultState': 'TASK_PATH_EMPTY',
@@ -811,6 +1315,111 @@ def _validate_auto_drive_request():
 
 
 
+def _validate_auto_drive_request():
+    task_params = _load_task_params_snapshot()
+    start_lat = _coerce_float(task_params.get('startLat'), None)
+    start_lon = _coerce_float(task_params.get('startLon'), None)
+    origin_heading = _coerce_float(task_params.get('originHeading'), None)
+    detail = _build_runtime_detail()
+
+    if _decode_redis_value(redis_cli.get('mission')) == 'working':
+        return {
+            'success': False,
+            'faultState': 'ALREADY_RUNNING',
+            'message': '小车当前正在执行任务，请勿重复启动',
+            'data': detail,
+        }
+
+    current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
+    if not current_task_name:
+        return {
+            'success': False,
+            'faultState': 'CURRENT_TASK_NOT_SET',
+            'message': '未设置当前任务，请先设置当前任务',
+            'data': detail,
+        }
+
+    try:
+        task_obj = util.readConfig("config.json")
+    except Exception as e:
+        logger.error("读取config.json失败: {}".format(str(e)))
+        return {
+            'success': False,
+            'faultState': 'CURRENT_TASK_CONFIG_MISSING',
+            'message': '当前任务配置不存在或不可读',
+            'data': detail,
+        }
+
+    config_task_name = _normalize_task_name(task_obj.get('taskName'))
+    if config_task_name != current_task_name:
+        detail['currentTaskName'] = current_task_name
+        detail['configTaskName'] = config_task_name
+        return {
+            'success': False,
+            'faultState': 'CURRENT_TASK_MISMATCH',
+            'message': '当前任务与执行配置不一致，请重新设置当前任务',
+            'data': detail,
+        }
+
+    power_on_state = _get_power_on_state()
+    if power_on_state is None:
+        detail['lowerMachineStatusWarning'] = '尚未收到下位机使能状态上报，已按用户指令继续启动校验'
+    elif power_on_state != 1:
+        detail['lowerMachineStatusWarning'] = '下位机未使能，已取消启动限制，将继续尝试执行任务'
+        detail['lowerMachineStartBypass'] = True
+
+    if start_lat is None or start_lon is None or origin_heading is None:
+        return {
+            'success': False,
+            'faultState': 'TASK_PARAMS_MISSING',
+            'message': '任务起点或航向参数未配置完整，无法启动',
+            'data': detail,
+        }
+
+    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
+        return {
+            'success': False,
+            'faultState': 'RTK_NOT_READY',
+            'message': 'RTK 定位未就绪，无法校验任务起点',
+            'data': detail,
+        }
+
+    distance_to_start = _distance_to_task_start(task_params)
+    if distance_to_start is None:
+        return {
+            'success': False,
+            'faultState': 'START_POSITION_UNKNOWN',
+            'message': '无法计算当前位置与任务起点距离，拒绝启动',
+            'data': detail,
+        }
+
+    detail['distanceToStartM'] = distance_to_start
+    if distance_to_start > START_POSITION_TOLERANCE_METERS:
+        return {
+            'success': False,
+            'faultState': 'NOT_AT_TASK_START',
+            'message': '当前位置距离任务起点 {:.2f} 米，超过允许范围 {:.2f} 米'.format(
+                distance_to_start, START_POSITION_TOLERANCE_METERS
+            ),
+            'data': detail,
+        }
+
+    task_items = task_obj.get('taskList') if isinstance(task_obj, dict) else None
+    if not isinstance(task_items, list) or len(task_items) == 0:
+        return {
+            'success': False,
+            'faultState': 'TASK_PATH_EMPTY',
+            'message': '当前没有可执行任务路径，拒绝启动',
+            'data': detail,
+        }
+
+    return {
+        'success': True,
+        'message': '启动条件通过',
+        'data': detail,
+    }
+
+
 # =============== 可调整参数 ===============
 MIN_LINE_LENGTH = 100  # 最小线段长度
 MAX_ANGLE = 45  # 最大垂直偏差角度
@@ -823,20 +1432,43 @@ CONSENSUS_THRESHOLD = 7  # 共识阈值（需要多少个相同的角度值）
 angle_samples = []
 final_angle = None
 
-# 下位机端口
-xwj_port = "/dev/ttyACM0"
+def _can_access_serial_port(port):
+    return bool(port) and os.path.exists(port) and os.access(port, os.R_OK | os.W_OK)
+
+
+def _resolve_lower_machine_port(_rtk_port):
+    env_port = os.getenv("CLEANER_LOWER_MACHINE_PORT")
+    preferred = env_port or "/dev/ttyTHS1"
+
+    if _can_access_serial_port(preferred):
+        logger.warn("下位机串口已固定使用：{}".format(preferred))
+        return preferred
+
+    if os.path.exists(preferred):
+        logger.error("下位机串口固定为 {}，但当前进程无读写权限".format(preferred))
+    else:
+        logger.error("下位机串口固定为 {}，但设备节点不存在".format(preferred))
+
+    # Keep returning the fixed port; do not fallback to ttyACM0/ttyACM4.
+    return preferred
+
+
+# 下位机端口（固定 ttyTHS1）
+xwj_port = "/dev/ttyTHS1"
 # rtk端口
 rtk_port = util.findPort("$GN")
 logger.warn(rtk_port)
-if rtk_port == "/dev/ttyACM4":
-    xwj_port = "/dev/ttyACM0"
-elif rtk_port == "/dev/ttyUSB0":
-    xwj_port = "/dev/ttyACM0"
-elif rtk_port != None:
-    xwj_port = "/dev/ttyACM4"
+xwj_port = _resolve_lower_machine_port(rtk_port)
 logger.warn("下位机串口：{}".format(xwj_port))
 
 def globalDataSet(data):
+    return _apply_lower_machine_status_frame(data, "globalDataSet")
+    if not data or len(data) < 20:
+        logger.warn("globalDataSet() ignore short frame, len=%s raw=%s", len(data) if data else 0, binascii.b2a_hex(data or ''))
+        return
+    if binascii.b2a_hex(data[0]) != '7b':
+        logger.warn("globalDataSet() ignore unsynced frame, raw=%s", binascii.b2a_hex(data))
+        return
     i = 0
     global global_get_status
     global global_get_powerOn
@@ -872,7 +1504,7 @@ def globalDataSet(data):
             if binascii.b2a_hex(data[i]) == '00':
                 global_get_edge = 1
             elif binascii.b2a_hex(data[i]) == 'ff':
-                logger.info("返回到边指令")
+                logger.warn("收到边缘传感器报警帧，edge=0 raw=%s", binascii.b2a_hex(data))
                 redis_cli.set("ultraSonic", "true")
                 global_get_edge = 0
             else:
@@ -1088,6 +1720,12 @@ class websocket_server(threading.Thread):
 
 # 获取是否到边，1：表示在板子上，0：表示不在板子上
 def getEdge():
+    redis_cli.set('moveJudge', 'true')
+    try:
+        _read_lower_machine_status_frame("getEdge", 0.25)
+    finally:
+        redis_cli.set('moveJudge', 'false')
+    return str(global_get_edge)
     global global_status
     ser = serial.Serial(xwj_port, 115200, timeout=0.5)
     if ser.is_open:
@@ -1114,6 +1752,9 @@ def getEdge():
                         i = i + 1
                         continue
                 data = data[i:]
+                if len(data) < 20:
+                    logger.warn("getEdge() ignore short synced frame, len=%s raw=%s", len(data), binascii.b2a_hex(data))
+                    continue
                 globalDataSet(data)
                 break
             except serial.serialutil.SerialException:
@@ -1137,6 +1778,12 @@ def getEdge():
 
 # 获取是否到达距离，0：未到达；1：到达
 def getDistanceArrive():
+    redis_cli.set('moveJudge', 'true')
+    try:
+        _read_lower_machine_status_frame("getDistanceArrive", 0.25)
+    finally:
+        redis_cli.set('moveJudge', 'false')
+    return str(global_get_moveFinish)
     global global_status
     ser = serial.Serial(xwj_port, 115200, timeout=0.5)
     # ser = serial.Serial('COM3', 115200, timeout=0.5)
@@ -1158,6 +1805,9 @@ def getDistanceArrive():
                         i = i + 1
                         continue
                 data = data[i:]
+                if len(data) < 20:
+                    logger.warn("getDistanceArrive() ignore short synced frame, len=%s raw=%s", len(data), binascii.b2a_hex(data))
+                    continue
                 globalDataSet(data)
                 break
             except serial.serialutil.SerialException:
@@ -1179,6 +1829,12 @@ def getDistanceArrive():
 
 # 获取转圈是否完成，0：未完成；1：完成
 def getRotateArrive():
+    redis_cli.set('moveJudge', 'true')
+    try:
+        _read_lower_machine_status_frame("getRotateArrive", 0.05)
+    finally:
+        redis_cli.set('moveJudge', 'false')
+    return str(global_get_rotateFinish)
     global global_status
     ser = serial.Serial(xwj_port, 115200, timeout=0.5)
     # ser = serial.Serial('COM3', 115200, timeout=0.5)
@@ -1203,6 +1859,9 @@ def getRotateArrive():
                         i = i + 1
                         continue
                 data = data[i:]
+                if len(data) < 20:
+                    logger.warn("getRotateArrive() ignore short synced frame, len=%s raw=%s", len(data), binascii.b2a_hex(data))
+                    continue
 
                 globalDataSet(data)
                 break
@@ -1223,7 +1882,30 @@ def getRotateArrive():
     return str(global_get_rotateFinish)
 
 
-cap = cv2.VideoCapture(0)
+CAMERA_SOURCES = ['/dev/video0', '/dev/video1', '/dev/video2', 0, 1, 2]
+
+
+def _open_camera_capture():
+    for source in CAMERA_SOURCES:
+        if isinstance(source, str) and not os.path.exists(source):
+            continue
+        candidate = cv2.VideoCapture(source)
+        if candidate.isOpened():
+            logger.warn("Camera source {} is available".format(source))
+            return candidate
+        try:
+            candidate.release()
+        except Exception:
+            pass
+    logger.error("no camera source is available")
+    return cv2.VideoCapture(0)
+
+
+cap = _open_camera_capture()
+camera_http_lock = threading.Lock()
+latest_camera_frame = None
+latest_camera_frame_at = 0.0
+latest_camera_frame_lock = threading.Lock()
 drivingUp = False
 # command = bytearray(17)
 command = bytearray(19)
@@ -1351,7 +2033,7 @@ def enterGarage():
 
 
 # 车库
-def enter_garage_task():
+def _run_visual_enter_garage(max_wait_seconds=None):
     redis_cli.set("enterGarage", "true")
 
     redis_cli.set("detectQrcode", "false")
@@ -1359,6 +2041,8 @@ def enter_garage_task():
     redis_cli.set("correct", "true")
 
     redis_cli.set('action', 'true')
+
+    preBuildCommand()
 
     reSetStatus(ser)
 
@@ -1376,7 +2060,11 @@ def enter_garage_task():
 
     duplicateWriteCmd(ser, command)
 
-    while redis_cli.get('enterGarage') == 'true' and redis_cli.get("detectQrcode") == "false":
+    wait_start_time = time.time()
+    while redis_cli.get('enterGarage') == 'true':
+        if max_wait_seconds and (time.time() - wait_start_time) >= max_wait_seconds:
+            logger.warn("视觉入舱等待超时({}s)，主动结束本次入舱".format(max_wait_seconds))
+            break
         time.sleep(0.25)
 
     sendBraking()
@@ -1387,8 +2075,27 @@ def enter_garage_task():
 
     redis_cli.set('action', 'false')
 
+    return redis_cli.get("detectQrcode") == "true"
+
+
+def enter_garage_task():
+    detected = _run_visual_enter_garage(max_wait_seconds=30)
+    logger.warn("视觉入舱结束，detectQrcode={}".format("true" if detected else "false"))
+
 
 def writeCmd(ser, command):
+    port = _get_lower_machine_serial()
+    if port is None:
+        logger.warning('lower-machine serial is not ready')
+        return
+    try:
+        with LOWER_MACHINE_WRITE_LOCK:
+            port.write(command)
+    except serial.serialutil.SerialException as exc:
+        _reset_lower_machine_serial(exc)
+    except Exception as exc:
+        logger.warning("write lower-machine command failed: {}".format(exc), exc_info=True)
+    return
     if ser is None:
         logger.warning('??????????????')
         return
@@ -1400,12 +2107,102 @@ def writeCmd(ser, command):
 
 
 def duplicateWriteCmd(ser, command):
+    for i in range(5):
+        writeCmd(ser, command)
+    port = _get_lower_machine_serial()
+    if port is not None:
+        try:
+            with LOWER_MACHINE_WRITE_LOCK:
+                port.flushOutput()
+        except Exception as exc:
+            logger.warning("flush lower-machine serial failed: {}".format(exc), exc_info=True)
+    return
     if ser is None:
         logger.warning('????????????????')
         return
     for i in range(5):
         writeCmd(ser, command)
     ser.flushOutput()
+
+
+def _remember_camera_frame(frame):
+    global latest_camera_frame
+    global latest_camera_frame_at
+    if frame is None:
+        return
+    try:
+        with latest_camera_frame_lock:
+            latest_camera_frame = frame.copy()
+            latest_camera_frame_at = time.time()
+    except Exception as exc:
+        logger.warning("cache camera frame failed: {}".format(exc))
+
+
+def _get_recent_camera_frame(max_age_seconds=2.0):
+    with latest_camera_frame_lock:
+        if latest_camera_frame is None:
+            return None
+        if time.time() - latest_camera_frame_at > max_age_seconds:
+            return None
+        return latest_camera_frame.copy()
+
+
+def _read_camera_frame_for_http():
+    global cap
+    frame = _get_recent_camera_frame()
+    if frame is not None:
+        return frame
+
+    with camera_http_lock:
+        try:
+            if cap is None or not cap.isOpened():
+                stopThenStart()
+            for _ in range(3):
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    _remember_camera_frame(frame)
+                    return frame
+                time.sleep(0.05)
+            stopThenStart()
+        except Exception as exc:
+            logger.warning("read camera frame failed: {}".format(exc), exc_info=True)
+    return None
+
+
+def _encode_camera_frame(frame):
+    ok, encoded = cv2.imencode('.jpg', frame)
+    if not ok:
+        return None
+    return encoded.tostring()
+
+
+@app.route("/vehicle/cameraSnapshot", methods=['GET'])
+def cameraSnapshot():
+    frame = _read_camera_frame_for_http()
+    if frame is None:
+        return jsonify({'success': False, 'message': 'camera frame unavailable'}), 503
+    payload = _encode_camera_frame(frame)
+    if payload is None:
+        return jsonify({'success': False, 'message': 'camera frame encode failed'}), 500
+    return Response(payload, mimetype='image/jpeg')
+
+
+def _camera_stream_generator():
+    while True:
+        frame = _read_camera_frame_for_http()
+        if frame is None:
+            time.sleep(0.2)
+            continue
+        payload = _encode_camera_frame(frame)
+        if payload is not None:
+            yield '--frame\r\nContent-Type: image/jpeg\r\n\r\n' + payload + '\r\n'
+        time.sleep(0.1)
+
+
+@app.route("/vehicle/cameraStream", methods=['GET'])
+def cameraStream():
+    return Response(_camera_stream_generator(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 @app.route("/vehicle/exitGarage", methods=['GET'])
@@ -1554,6 +2351,7 @@ def correctByRTKTest():
     global global_cur_rtk_lat
     global global_cur_rtk_lon
     global global_cur_rtk_heading
+    global global_cur_rtk_heading_at
 
     rtk_generator = util.readRTK_v2(ser_rtk_params)
     try:
@@ -1562,6 +2360,7 @@ def correctByRTKTest():
             global_cur_rtk_lat = lat
             global_cur_rtk_lon = lon
             global_cur_rtk_heading = heading_deg
+            global_cur_rtk_heading_at = time.time()
             # 是否启动RTK纠偏,0:表示没有开启RTK纠偏，1表示开启
             if global_open_rtk == 0:
                 time.sleep(0.01)
@@ -1589,11 +2388,20 @@ def correctByRTKTest():
             heading_error = (heading_error + 180) % 360 - 180
             # 只有直行，才发送纠偏指令
             cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, lat, lon)
-            stree_output = heading_error * 10 - int(1000 * cte)
+            speed_cmd = _coerce_float(global_cur_taskPointTest.get('speed'), STANLEY_DEFAULT_SPEED_CMD)
+            stree_output, stanley_steer_deg, stanley_cte_term_deg, stanley_speed_mps = _calc_stanley_steering(
+                heading_error, cte, speed_cmd
+            )
             # 发送电机控制指令
             # 正数左轮快，向右偏，负数右轮快，向左偏
             setZSpeed(stree_output)
             duplicateWriteCmd(ser, command)
+            logger.warn(
+                "stanley target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} distance={:.2f}m speed={:.2f}m/s cte_term={:.2f} steer={:.2f} z={}".format(
+                    const_target_h, heading_deg, heading_error, cte, distance_to_target,
+                    stanley_speed_mps, stanley_cte_term_deg, stanley_steer_deg, stree_output
+                )
+            )
             # 打印状态
             logger.warn("航向角:{:.2f} | 当前航向角:{:.2f} | heading_error:{:.2f}横向偏差:{:.2f}距离目标:{:.2f}m | 转向输出: {:.2f}"
                         .format(const_target_h, heading_deg, heading_error, cte, distance_to_target, stree_output))
@@ -1630,7 +2438,7 @@ def justMoveByRTK(distance, head_target):
     endLat, endLon = util.get_B_GPS(global_cur_rtk_lat, global_cur_rtk_lon, distance, head_target)
     # 获取当前任务开始点和结束点的经纬度
     global_cur_taskPoint = {"startLat": global_cur_rtk_lat, "startLon": global_cur_rtk_lon, "endLat": endLat,
-                                "endLon": endLon, "heading": head_target}
+                                "endLon": endLon, "heading": head_target, "speed": 100}
 
     goCommand(100)
     # 开启RTK纠偏
@@ -1911,6 +2719,20 @@ def getTaskNameByLoc():
                 return taskName
     return None
 
+def log_task_turn_command(task, index, source):
+    task_id = task.get('id', index + 1)
+    angle = round(float(task.get('angle', 0)), 2)
+    heading = round(float(task.get('heading', 0)), 2)
+    logger.warn(
+        u"[{}] 已发送第{}段转向命令: taskId={}, 目标角度={}°, 目标航向={}°".format(
+            source,
+            index + 1,
+            task_id,
+            angle,
+            heading,
+        )
+    )
+
 def autoDriveByRTKThread():
     global global_status
     global taskList  # 申明使用全局变量
@@ -1938,7 +2760,7 @@ def autoDriveByRTKThread():
             if isGarage(chargingPileLat, chargingPileLon):
                 goOutGarage(backLength)
     # 获取是否开启定点找寻任务功能
-    if redis_cli.get("isOpenFindTaskName") == '1':
+    if False and redis_cli.get("isOpenFindTaskName") == '1':
         taskName = getTaskNameByLoc()
         logger.warn("搜索当前任务....")
         if taskName:
@@ -1962,6 +2784,28 @@ def autoDriveByRTKThread():
         logger.warn("小车已经在工作了，无法再开启工作")
         _mark_runtime_blocked('ALREADY_WORKING', '小车当前已经在执行任务，请勿重复启动')
         return 0
+    current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
+    if not current_task_name:
+        _mark_runtime_blocked('CURRENT_TASK_NOT_SET', '未设置当前任务，请先设置当前任务后再启动')
+        return
+
+    try:
+        taskObj = util.readConfig("config.json")
+    except Exception as e:
+        logger.error("读取config.json失败: {}".format(str(e)))
+        _mark_runtime_blocked('CURRENT_TASK_CONFIG_MISSING', '当前任务配置不存在或不可读')
+        return
+
+    config_task_name = _normalize_task_name(taskObj.get('taskName'))
+    if config_task_name != current_task_name:
+        _mark_runtime_blocked('CURRENT_TASK_MISMATCH', '当前任务与执行配置不一致，请重新设置当前任务')
+        return
+
+    taskList = taskObj.get('taskList')
+    if not isinstance(taskList, list) or len(taskList) == 0:
+        _mark_runtime_blocked('TASK_PATH_EMPTY', '当前任务没有可执行路径，请先生成并设置任务')
+        return
+
     global_status = 'working'
     redis_cli.set("mission", "working")
     redis_cli.set("parking", "0")
@@ -1969,7 +2813,7 @@ def autoDriveByRTKThread():
     _mark_runtime_running('自动清扫启动成功，任务执行中')
 
     # 根据缓存中是否存在任务，来构建新的任务
-    resultTask = buildTask(taskParams)
+    resultTask = []
     # 如果缓存中没有任务，则读取当前任务中的数据
     if len(resultTask) == 0:
         taskObj = util.readConfig("config.json")
@@ -2009,8 +2853,23 @@ def autoDriveByRTKThread():
         endLon = task['endLon']
         mode = task['mode']
 
-        if index != 0:
-            turn(ser, angle*10)
+        if index == 0:
+            logger.warn(
+                u"[auto_drive] 第{}段为起始段，不发送转向命令: taskId={}, 目标角度={}°, 目标航向={}°".format(
+                    index + 1,
+                    task.get('id', index + 1),
+                    round(float(angle), 2),
+                    round(float(heading), 2),
+                )
+            )
+        else:
+            log_task_turn_command(task, index, 'auto_drive')
+            turn_result = turn(ser, angle * 10, target_heading=heading, source='auto_drive', segment_index=index + 1, task_id=task.get('id', index + 1))
+            if turn_result != 1:
+                logger.warn("[auto_drive] 第{}段转向未确认完成，停止自动清扫，避免航向错误后继续直行".format(index + 1))
+                sendBraking()
+                global_doCleanThreadStop = 1
+                break
             if redis_cli.get('parking') == '1':
                 global_doCleanThreadStop = 1
                 break
@@ -2074,8 +2933,17 @@ def intoGarage(backLength):
     logger.warn('进充电桩')
     reset_odometer(ser)
     turn(ser, 180 * 10)
-    # justMoveByRTK(1.20,186)
-    goByLength(ser, backLength, 100)
+    # 最后一段强制走视觉对接：先预靠近，再进入视觉闭环。
+    visual_final_length = 80
+    pre_approach_len = max(int(backLength) - visual_final_length, 0)
+    if pre_approach_len > 0:
+        logger.warn("自动回舱预靠近 {}cm，最后 {}cm 使用视觉对接".format(pre_approach_len, int(backLength) - pre_approach_len))
+        goByLength(ser, pre_approach_len, 100)
+    else:
+        logger.warn("自动回舱直接进入视觉对接，backLength={}cm".format(backLength))
+
+    detected = _run_visual_enter_garage(max_wait_seconds=25)
+    logger.warn("自动回舱视觉对接结束，detectQrcode={}".format("true" if detected else "false"))
     # 关闭视觉纠偏
     redis_cli.set("correct", "false")
     # 充电命令
@@ -2216,6 +3084,29 @@ def setCharginPileInfo():
     # redis_cli.hset('taskParams','startToChargingPilePointLength',startToChargingPilePointLength)
     result = {"success":True,"msg":"设置成功","chargingPileLat":lat,"chargingPileLon":lon,'startToChargingPilePointLength':startToChargingPilePointLength}
     return jsonify(result)
+
+
+def _set_current_task(task_name):
+    global taskList
+    taskName = _normalize_task_name(task_name)
+    if not taskName:
+        return {"success": False, "msg": "taskName不能为空"}
+
+    fileName = taskName + '.json'
+    if not os.path.exists(fileName):
+        return {"success": False, "msg": u"文件不存在 {}".format(fileName)}
+
+    with TASK_SWITCH_LOCK:
+        with open(fileName, 'r') as src, open('config.json', 'w') as dst:
+            for line in src:
+                dst.write(line)
+        redis_cli.set('currentTaskName', taskName)
+        redis_cli.set('curTaskIndex', 0)
+        redis_cli.delete('taskList')
+        syncCurTaskFileToRedis()
+        taskList = []
+
+    return {"success": True, "msg": "淇濆瓨鏁版嵁鎴愬姛", "data": {"taskName": taskName}}
 # 设置入舱点，入舱点是小车进入充电桩前的入口位置，不等同于充电桩位置
 @app.route("/vehicle/setGarageEntryInfo", methods=['GET'])
 def setGarageEntryInfo():
@@ -2263,6 +3154,7 @@ def correctByRTK():
     global global_cur_rtk_lat
     global global_cur_rtk_lon
     global global_cur_rtk_heading
+    global global_cur_rtk_heading_at
 
     rtk_generator = util.readRTK_v2(ser_rtk_params)
     try:
@@ -2278,6 +3170,7 @@ def correctByRTK():
             global_cur_rtk_lat = lat
             global_cur_rtk_lon = lon
             global_cur_rtk_heading = heading_deg
+            global_cur_rtk_heading_at = time.time()
             # 是否启动RTK纠偏,0:表示没有开启RTK纠偏，1表示开启
             if global_open_rtk == 0:
                 time.sleep(0.01)
@@ -2309,7 +3202,10 @@ def correctByRTK():
             heading_error = (heading_error + 180) % 360 - 180
             # 只有直行，才发送纠偏指令
             cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, lat, lon)
-            stree_output = heading_error * 10 - int(1000 * cte)
+            speed_cmd = _coerce_float(global_cur_taskPoint.get('speed'), STANLEY_DEFAULT_SPEED_CMD)
+            stree_output, stanley_steer_deg, stanley_cte_term_deg, stanley_speed_mps = _calc_stanley_steering(
+                heading_error, cte, speed_cmd
+            )
             if global_go == 1:
                 if abs(heading_error) > 1 or abs(cte) > 0.02:
                     # logger.warning("视觉纠偏关闭，RTK纠偏开启")
@@ -2318,6 +3214,12 @@ def correctByRTK():
                     # 正数左轮快，向右偏，负数右轮快，向左偏
                     setZSpeed(stree_output)
                     duplicateWriteCmd(ser, command)
+                    logger.warn(
+                        "stanley target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} distance={:.2f}m speed={:.2f}m/s cte_term={:.2f} steer={:.2f} z={}".format(
+                            target_heading, heading_deg, heading_error, cte, distance_to_target,
+                            stanley_speed_mps, stanley_cte_term_deg, stanley_steer_deg, stree_output
+                        )
+                    )
                     # 打印状态
                     logger.warn("航向角:{:.2f} | 当前航向角:{:.2f} | heading_error:{:.2f}横向偏差:{:.2f}距离目标:{:.2f}m | 转向输出: {:.2f}"
                                 .format(target_heading, heading_deg, heading_error, cte, distance_to_target,
@@ -2436,6 +3338,10 @@ def saveParams():
     redis_cli.hset('taskParams', "startToChargingPilePointLength", data['startToChargingPilePointLength'])
     # 最后一个任务结束后的后退距离
     redis_cli.hset('taskParams', "lastTaskBackLength", data['lastTaskBackLength'])
+    current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
+    if current_task_name:
+        _update_json_file_field(current_task_name + '.json', 'lastTaskBackLength', data['lastTaskBackLength'])
+    _update_json_file_field('config.json', 'lastTaskBackLength', data['lastTaskBackLength'])
 
     redis_cli.hset('taskParams', "panelAngle", data['panelAngle'])
     redis_cli.hset('taskParams', "panelAngleX", data['panelAngleX'])
@@ -2453,8 +3359,10 @@ def saveParams():
 @app.route("/vehicle/createTask", methods=['POST'])
 def createTask():
     global taskList
-    data = request.get_json()
-    taskName = data['taskName']
+    data = request.get_json() or {}
+    taskName = _normalize_task_name(data.get('taskName'))
+    if not taskName:
+        return jsonify({"success": False, "msg": "taskName不能为空"})
     # 将任务名称放在一个set集合中
     redis_cli.sadd('taskNameSet', taskName)
     taskParams = redis_cli.hgetall("taskParams")
@@ -2462,7 +3370,9 @@ def createTask():
     startLon = float(taskParams.get('startLon'))
     point = {'startLat': startLat, 'startLon': startLon}
     redis_cli.hset('loc_start_lat_lon',taskName,json.dumps(point))
-    areaList = data['areaList']
+    areaList = data.get('areaList')
+    if not isinstance(areaList, list) or len(areaList) == 0:
+        return jsonify({"success": False, "msg": "areaList不能为空"})
     result = service.createTask(taskName, areaList)
     # 需要将原本来的任务列表置空，让其重新加载任务列表文件
     taskList = []
@@ -2501,8 +3411,9 @@ def selectTaskName():
 # 根据任务名称获取任务信息
 @app.route("/vehicle/selectTaskByName", methods=['GET'])
 def selectTaskByName():
-    global taskList
-    taskName = request.args.get('taskName')
+    taskName = _normalize_task_name(request.args.get('taskName'))
+    if not taskName:
+        return jsonify({"success": False, "msg": "taskName不能为空"})
     fileName = taskName + '.json'
     try:
         taskList = util.readConfig(fileName)
@@ -2516,22 +3427,12 @@ def selectTaskByName():
 # 保存当前任务
 @app.route("/vehicle/saveCurrentTaskName", methods=['GET'])
 def saveCurrentTaskName():
-    global taskList
-    taskName = request.args.get('taskName')
-    fileName = taskName + '.json'
-    # 将文件内容复制到执行任务的文件中
-    with open(fileName, 'r') as src, open('config.json', 'w') as dst:
-        for line in src:
-            dst.write(line)
-    redis_cli.set('currentTaskName', taskName)
-    # 删除redis中taskList任务
-    redis_cli.delete('taskList')
-    syncCurTaskFileToRedis()
-    # 把当前任务列表置空
-    taskList = []
-    result = {"success": True, "msg": "保存数据成功"}
+    return jsonify(_set_current_task(request.args.get('taskName')))
 
-    return jsonify(result)
+
+@app.route("/vehicle/setCurrentTask", methods=['GET'])
+def setCurrentTask():
+    return jsonify(_set_current_task(request.args.get('taskName')))
 
 # 将当前任务中的参数信息同步到redis中
 def syncCurTaskFileToRedis():
@@ -2558,7 +3459,9 @@ def syncCurTaskFileToRedis():
     redis_cli.hset('taskParams', "chargingPileLon", taskObj['chargingPileLon'])
     # 入舱点到充电桩距离
     redis_cli.hset('taskParams', "startToChargingPilePointLength", taskObj['startToChargingPilePointLength'])
-    redis_cli.hset('taskParams', "lastTaskBackLength", taskObj.get('lastTaskBackLength', 0))
+    existing_last_task_back_length = _coerce_int(redis_cli.hget('taskParams', 'lastTaskBackLength'), 0)
+    last_task_back_length = taskObj.get('lastTaskBackLength', existing_last_task_back_length)
+    redis_cli.hset('taskParams', "lastTaskBackLength", last_task_back_length)
 
     redis_cli.hset('taskParams', "panelAngle", taskObj['panelAngle'])
     redis_cli.hset('taskParams', "panelAngleX", taskObj['panelAngleX'])
@@ -2695,7 +3598,7 @@ def moveByRTK(endLat, endLon,heading=0):
     # 获取当前任务开始点和结束点的经纬度
     # dis,heading = util.get_distance_angle(global_cur_rtk_lat,global_cur_rtk_lon,endLat,endLon)
     global_cur_taskPoint = {"heading":heading,"startLat": global_cur_rtk_lat, "startLon": global_cur_rtk_lon,
-                            "endLat": endLat,"endLon": endLon}
+                            "endLat": endLat,"endLon": endLon, "speed": 100}
     # 开启RTK纠偏
     global_go = 1
     goCommand(100)
@@ -2727,7 +3630,8 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
     # 返回结果，0：不成功，1：任务执行成功
     result = 1
     global_interval = 0
-    global_cur_taskPoint = {"heading": heading, "startLat": startLat, "startLon": startLon,"endLat": endLat, "endLon": endLon}
+    global_cur_taskPoint = {"heading": heading, "startLat": startLat, "startLon": startLon,
+                            "endLat": endLat, "endLon": endLon, "speed": speed}
     # 开启RTK纠偏
     global_go = 1
     # 设置滚刷
@@ -2782,11 +3686,12 @@ def observer_go_correct(data):
     global global_last_distance_to_target,global_last_cte
     if redis_cli.get('openLog') == '1':
         logger.info(data)
-    global global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading,global_go
+    global global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading, global_cur_rtk_heading_at, global_go
     global_cur_rtk_lat = data.lat
     global_cur_rtk_lon = data.lon
     if data.heading is not None:
         global_cur_rtk_heading = data.heading
+        global_cur_rtk_heading_at = time.time()
     sync_current_location(data.lat, data.lon, data.heading)
     # global_go=1表示直行启动
     if global_go == 1:
@@ -2815,7 +3720,10 @@ def observer_go_correct(data):
 
         # stree_output = int(raw_output)
         # stree_output = heading_error*10 - int(450 * cte)
-        stree_output = heading_error*10 - int(800 * cte)
+        speed_cmd = _coerce_float(global_cur_taskPoint.get('speed'), STANLEY_DEFAULT_SPEED_CMD)
+        stree_output, stanley_steer_deg, stanley_cte_term_deg, stanley_speed_mps = _calc_stanley_steering(
+            heading_error, cte, speed_cmd
+        )
         # if abs(heading_error) > 1 or abs(cte) > 0.02:
             # logger.warning("视觉纠偏关闭，RTK纠偏开启")
             # redis_cli.set("correct", "false")
@@ -2823,6 +3731,12 @@ def observer_go_correct(data):
         # 正数左轮快，向右偏，负数右轮快，向左偏
         setZSpeed(-stree_output)
         duplicateWriteCmd(ser, command)
+        logger.info(
+            "stanley target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m speed={:.2f}m/s cte_term={:.2f} steer={:.2f} z={}".format(
+                target_heading, data.heading, heading_error, cte, global_last_cte, distance_to_target,
+                stanley_speed_mps, stanley_cte_term_deg, stanley_steer_deg, -stree_output
+            )
+        )
 
         # 打印状态
         logger.info("航向角:{:.2f} | 当前航向角:{:.2f} | heading_error:{:.2f}横向偏差:{:.2f}上次横向偏差:{:.2f}距离目标:{:.2f}m | 转向输出: {:.2f}"
@@ -2885,8 +3799,23 @@ def goOnDoCleanByRTK():
         endLon = task['endLon']
         mode = task['mode']
 
-        if index != 0:
-            turn(ser, angle * 10)
+        if index == 0:
+            logger.warn(
+                u"[go_on] 第{}段为续跑列表的首段，不发送转向命令: taskId={}, 目标角度={}°, 目标航向={}°".format(
+                    index + 1,
+                    task.get('id', index + 1),
+                    round(float(angle), 2),
+                    round(float(heading), 2),
+                )
+            )
+        else:
+            log_task_turn_command(task, index, 'go_on')
+            turn_result = turn(ser, angle * 10, target_heading=heading, source='go_on', segment_index=index + 1, task_id=task.get('id', index + 1))
+            if turn_result != 1:
+                logger.warn("[go_on] 第{}段转向未确认完成，停止续跑，避免航向错误后继续直行".format(index + 1))
+                sendBraking()
+                global_doCleanThreadStop = 1
+                break
             if redis_cli.get('parking') == '1':
                 global_doCleanThreadStop = 1
                 break
@@ -3050,7 +3979,19 @@ def calculate_angle(x0, y0, x1, y1):
     angle_rad = math.atan2(dx, dy)  # dx 放前
     angle_deg = math.degrees(angle_rad)
 
-    return angle_deg
+    return normalize_visual_line_angle(angle_deg)
+
+
+def normalize_visual_line_angle(angle_deg):
+    try:
+        angle = float(angle_deg)
+    except Exception:
+        return 0.0
+    while angle > 90.0:
+        angle -= 180.0
+    while angle <= -90.0:
+        angle += 180.0
+    return angle
 
 
 def is_vertical_line(x0, y0, x1, y1, max_angle=MAX_ANGLE):
@@ -3192,8 +4133,8 @@ def turnCheckPoint(originHeading):
         # 获取原点航向角
         # heading = int(redis_cli.hget('taskParams', 'originHeading'))
         logger.warn("获取原点航向角：{}".format(originHeading))
-        turn(ser, originHeading * 10)
-        if getRotateArrive() == '1':
+        turn_result = turn(ser, originHeading * 10, target_heading=originHeading, source='start_heading_check')
+        if turn_result == 1 or getRotateArrive() == '1':
             return 1
         else:
             return 0
@@ -3947,15 +4888,7 @@ def stopThenStart():
             except Exception as e:
                 print("释放失败，重试")
                 global_status = "释放失败，重试"
-    activeIndex = 0
-    for i in range(3):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            logger.warn("Camera index {} is available".format(i))
-            activeIndex = i
-            cap.release()
-            break
-    cap = cv2.VideoCapture(activeIndex)
+    cap = _open_camera_capture()
 
 
 def justMove(ser, arriveable=False):
@@ -4129,7 +5062,7 @@ def moveDiatance(ser, length, speed=100):
         return 0
 
 
-def turn(ser, roundTo):
+def turn(ser, roundTo, target_heading=None, source='turn', segment_index=None, task_id=None):
     logger.warn('转向:{}'.format(roundTo))
     redis_cli.set("ultraSonic", "false")
     redis_cli.set("mission","working")
@@ -4145,12 +5078,86 @@ def turn(ser, roundTo):
     logger.warn(' '.join(format(x, '02x') for x in command))
     duplicateWriteCmd(ser, command)
 
+    target_heading = _coerce_float(target_heading, None)
+    turn_start_at = time.time()
+    stable_count = 0
+    last_fallback_log_at = 0
+    turn_result = 0
+    previous_delta = None
+    logger.warn(
+        "[turn_start] source={}, segment={}, taskId={}, roundTo={}, targetHeading={}".format(
+            source, segment_index, task_id, roundTo, target_heading
+        )
+    )
+
     # 如果未完成，则继续阻塞，等待旋转完成 and redis_cli.get("mission") == "working"
-    while getRotateArrive() == "0" and redis_cli.get("mission") == "working":
+    while redis_cli.get("mission") == "working":
+        rotate_arrive = getRotateArrive()
+        if rotate_arrive != "0":
+            logger.warn(
+                "[turn_finish] lower-machine finish source={}, segment={}, taskId={}, elapsed={:.2f}s".format(
+                    source, segment_index, task_id, time.time() - turn_start_at
+                )
+            )
+            turn_result = 1
+            break
         # if redis_cli.get("ultraSonic") == "true":
         #     break
         logger.info("wait rotate finish")
         # global_status = "wait rotate finish"
+        if target_heading is None:
+            continue
+
+        elapsed = time.time() - turn_start_at
+        current_heading = _get_current_rtk_heading()
+        delta = _normalize_heading_delta(current_heading, target_heading)
+        crossed_target = False
+        if delta is not None and elapsed >= TURN_RTK_FALLBACK_MIN_WAIT_SEC:
+            crossed_target = _heading_delta_crossed_target(previous_delta, delta)
+            if abs(delta) <= TURN_RTK_FALLBACK_TOLERANCE_DEG:
+                stable_count += 1
+            else:
+                stable_count = 0
+            if stable_count >= TURN_RTK_FALLBACK_STABLE_COUNT or crossed_target:
+                finish_reason = 'crossed_target' if crossed_target else 'within_tolerance'
+                logger.warn(
+                    "[turn_rtk_fallback] source={}, segment={}, taskId={}, reason={}, target={:.2f}, current={:.2f}, delta={:.2f}, previousDelta={}, elapsed={:.2f}s, stableCount={}; sending brake".format(
+                        source,
+                        segment_index,
+                        task_id,
+                        finish_reason,
+                        target_heading,
+                        current_heading,
+                        delta,
+                        previous_delta,
+                        elapsed,
+                        stable_count,
+                    )
+                )
+                sendBraking()
+                turn_result = 1
+                break
+        else:
+            stable_count = 0
+
+        if delta is not None:
+            previous_delta = delta
+
+        if elapsed - last_fallback_log_at >= 2.0:
+            logger.info(
+                "[turn_wait] source={}, segment={}, taskId={}, target={}, current={}, delta={}, previousDelta={}, elapsed={:.2f}s, stableCount={}".format(
+                    source,
+                    segment_index,
+                    task_id,
+                    target_heading,
+                    current_heading,
+                    delta,
+                    previous_delta,
+                    elapsed,
+                    stable_count,
+                )
+            )
+            last_fallback_log_at = elapsed
 
     time.sleep(0.5)
 
@@ -4159,6 +5166,7 @@ def turn(ser, roundTo):
     # if redis_cli.get("ultraSonic") == "true":
     #     moveBack(ser, distance=9)
     #     turn(ser, roundTo)
+    return turn_result
 
 
 def exit_uav(ser):
@@ -4540,7 +5548,7 @@ def doClean(tmpTaskList, goon=False):
                     heading = item['heading']
                     # 获取当前任务开始点和结束点的经纬度
                     global_cur_taskPoint = {"startLat": startLat, "startLon": startLon, "endLat": endLat,
-                                            "endLon": endLon, "heading": heading}
+                                            "endLon": endLon, "heading": heading, "speed": 250}
                 except (KeyError, TypeError) as e:
                     logger.error(e)
                     pass
@@ -4659,7 +5667,7 @@ def doCleanByRTK(tmpTaskList, goon=False):
                     endLat, endLon = util.get_B_GPS(startLat, startLon, length, heading)
                     # 获取当前任务开始点和结束点的经纬度
                     global_cur_taskPoint = {"startLat": startLat, "startLon": startLon, "endLat": endLat,
-                                            "endLon": endLon}
+                                            "endLon": endLon, "heading": heading, "speed": 250}
                 except (KeyError, TypeError) as e:
                     logger.error(e)
                     pass
@@ -5084,6 +6092,17 @@ def cmdConsumer():
 
 
 def listenerSlavePort():
+    while True:
+        try:
+            if _coerce_bool(redis_cli.get("moveJudge"), False):
+                time.sleep(0.05)
+                continue
+            _read_lower_machine_status_frame("listenerSlavePort", 0.25)
+        except Exception as e:
+            logging.info('鐩戝惉鎶ラ敊:{}'.format(e))
+            time.sleep(0.5)
+        time.sleep(0.1)
+
     cur_sn_signal = 0
     previous_sn_signal = 0
     while True:
@@ -5199,8 +6218,11 @@ def startOpencv():
         ret, image = cap.read()
         if not ret:
             logger.error('无法读取视频流或文件结束')
-            return
+            stopThenStart()
+            time.sleep(0.2)
+            continue
         else:
+            _remember_camera_frame(image)
             height, width = image.shape[:2]
             logger.info('图片高度: %d, 宽度: %d', height, width)
             image = image[100:380, 125:515]
@@ -5230,6 +6252,7 @@ def startOpencv():
                 stopThenStart()
                 continue
 
+            _remember_camera_frame(image)
             image = image[100:380, 125:515]
             image = cv2.blur(image, (5, 5))
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -5270,7 +6293,7 @@ def startOpencv():
                         f_x1 = x1
                         f_y1 = y1
                         selected_length = length
-                        line_angle = math.degrees(math.atan2(dx, dy))
+                        line_angle = calculate_angle(x0, y0, x1, y1)
             if line is None:
                 logger.info("没有找到线")
                 line = 0
@@ -5286,7 +6309,7 @@ def startOpencv():
             setZSpeed(line)
             duplicateWriteCmd(ser, command)
 
-            if redis_cli.get("enterGarage") == "true" and redis_cli.get("detectQrcode") == "false":
+            if redis_cli.get("enterGarage") == "true":
                 hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
                 mask1 = cv2.inRange(hsv_img, lower1, upper1)
                 mask2 = cv2.inRange(hsv_img, lower2, upper2)
@@ -5295,8 +6318,7 @@ def startOpencv():
                 if np.sum(mask) > 0:
                     redis_cli.set("detectQrcode", "true")
                     redis_cli.set('enterGarage', 'false')
-                else:
-                    continue
+                    logger.warn("视觉入舱识别成功，准备停车")
 
             # if redis_cli.get('video') == 'finish':
 

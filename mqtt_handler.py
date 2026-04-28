@@ -27,6 +27,7 @@ class MQTTCommandHandler(object):
             'createTask': self._handle_create_task,
             'selectTask': self._handle_select_task,
             'saveTask': self._handle_save_task,
+            'setCurrentTask': self._handle_set_current_task,
             'saveParams': self._handle_save_params,
             'setGarageEntry': self._handle_set_garage_entry,
             'getStatus': self._handle_get_status,
@@ -56,6 +57,7 @@ class MQTTCommandHandler(object):
             'create_task': self._handle_create_task,
             'select_task': self._handle_select_task,
             'save_task': self._handle_save_task,
+            'set_current_task': self._handle_set_current_task,
             'save_params': self._handle_save_params,
             'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
@@ -109,6 +111,14 @@ class MQTTCommandHandler(object):
             return {'success': False, 'message': '车辆控制器不支持 {} 方法'.format(method_name)}
         result = getattr(self.vehicle_controller, method_name)(*args)
         return self._normalize_controller_result(result, default_message)
+
+    def _extract_task_name(self, params):
+        if not isinstance(params, dict):
+            return ''
+        task_name = params.get('taskName')
+        if task_name is None:
+            return ''
+        return str(task_name).strip()
 
     def _handle_drive(self, params):
         return self._call_controller('drive', '前进命令已执行', params.get('distance', 0), params.get('speed'))
@@ -164,15 +174,6 @@ class MQTTCommandHandler(object):
     def _handle_toggle_path_planning(self, params):
         return self._call_controller('toggle_path_planning', '路径规划模式已切换', params.get('path', 'left'))
 
-    def _handle_create_task(self, params):
-        return self._call_controller('create_task', '任务创建成功', params)
-
-    def _handle_select_task(self, params):
-        return self._call_controller('select_task', '任务已选择', params.get('taskName', ''))
-
-    def _handle_save_task(self, params):
-        return self._call_controller('save_task', '任务已保存', params.get('taskName', ''))
-
     def _handle_save_params(self, params):
         return self._call_controller('save_params', '参数已保存', params)
 
@@ -188,6 +189,34 @@ class MQTTCommandHandler(object):
 
     def _handle_get_status(self, params):
         return self._call_controller('get_status', '状态获取成功')
+
+    # Override task-related handlers to enforce non-empty task name
+    # and make current-task switch single-step.
+    def _handle_create_task(self, params):
+        task_name = self._extract_task_name(params)
+        if not task_name:
+            return {'success': False, 'message': 'taskName不能为空'}
+        if not isinstance(params, dict):
+            return {'success': False, 'message': 'create_task参数格式错误'}
+        area_list = params.get('areaList')
+        if not isinstance(area_list, list) or len(area_list) == 0:
+            return {'success': False, 'message': 'areaList不能为空'}
+        return self._call_controller('create_task', '任务创建成功', params)
+
+    def _handle_select_task(self, params):
+        task_name = self._extract_task_name(params)
+        if not task_name:
+            return {'success': False, 'message': 'taskName不能为空'}
+        return self._call_controller('select_task', '任务已选择', task_name)
+
+    def _handle_save_task(self, params):
+        return self._handle_set_current_task(params)
+
+    def _handle_set_current_task(self, params):
+        task_name = self._extract_task_name(params)
+        if not task_name:
+            return {'success': False, 'message': 'taskName不能为空'}
+        return self._call_controller('set_current_task', '任务已设置为当前任务', task_name)
 
     def _fallback_task_path(self, params):
         config_path = 'config.json'

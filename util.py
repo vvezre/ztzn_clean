@@ -16,6 +16,46 @@ from AppLogger import logger
 from ntrip_runtime import extract_gga_quality, get_shared_runtime
 
 ser_rtk = None
+rtk_output_configured = False
+RTK_OUTPUT_CONFIG_COMMANDS = (
+    'unlog\r\n',
+    'gngga 0.1\r\n',
+    'gphpr 0.1\r\n',
+    'savaconfig\r\n',
+)
+
+
+def configure_rtk_output(ser):
+    global rtk_output_configured
+    if rtk_output_configured:
+        return True
+    if ser is None:
+        return False
+
+    try:
+        for command_text in RTK_OUTPUT_CONFIG_COMMANDS:
+            ser.write(command_text.encode('ascii'))
+            try:
+                ser.flush()
+            except Exception:
+                pass
+            logger.warning("RTK config command sent: {}".format(command_text.strip()))
+            time.sleep(0.15)
+
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            try:
+                ser.flushInput()
+            except Exception:
+                pass
+
+        rtk_output_configured = True
+        logger.warning("RTK output configured: GNGGA/GPHPR interval=0.1s")
+        return True
+    except Exception as e:
+        logger.error("RTK output config failed: {}".format(e))
+        return False
 
 def readConfig(fileName):
     # 打开并读取 JSON 文件
@@ -442,7 +482,7 @@ def parse_GPTHS(line):
 
 # 分析GNHPR数据,返回航向角和俯仰角
 def parse_GNHPR(line):
-    if not line.startswith("$GNHPR"):
+    if not line.startswith(("$GNHPR", "$GPHPR")):
         return None
     try:
         parts = line.strip().split(',')
@@ -613,6 +653,7 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
 
             with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=0.1) as ser_rtk:
                 logger.warning("RTK涓插彛宸叉墦寮€: {}".format(rtk_port))
+                configure_rtk_output(ser_rtk)
                 while ser_rtk.is_open:
                     try:
                         correction_runtime.step(ser_rtk)
@@ -672,7 +713,7 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                                     'heading': heading
                                 }
 
-                        elif line_str.startswith("$GNHPR"):
+                        elif line_str.startswith(("$GNHPR", "$GPHPR")):
                             heading_info = parse_GNHPR(line_str)
                             if heading_info is not None:
                                 last_heading = heading_info[0]

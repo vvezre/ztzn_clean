@@ -69,6 +69,24 @@ def build_panel_segments(cells):
     return result
 
 
+def _build_cells_by_row(cells):
+    rows = {}
+    for row, col in cells:
+        rows.setdefault(row, []).append(col)
+    for row in rows:
+        rows[row] = sorted(set(rows[row]))
+    return rows
+
+
+def _build_cells_by_col(cells):
+    cols = {}
+    for row, col in cells:
+        cols.setdefault(col, []).append(row)
+    for col in cols:
+        cols[col] = sorted(set(cols[col]))
+    return cols
+
+
 def _connector_length(connector):
     return _as_int(connector.get("length"), 0)
 
@@ -81,6 +99,74 @@ def _connector_row_match(connector, row):
 def _connector_col_match(connector, col):
     col_start, col_end = _range_bounds(connector, "col")
     return col_start <= col <= col_end
+
+
+def _connector_edges(cells, connectors):
+    cells = set(cells)
+    rows = _build_cells_by_row(cells)
+    cols = _build_cells_by_col(cells)
+    edges = []
+
+    for connector in connectors or []:
+        connector_type = connector.get("type")
+        if connector_type == "col":
+            row_start, row_end = _range_bounds(connector, "row")
+            after_col = _as_int(connector.get("afterCol"))
+            for row in range(row_start, row_end + 1):
+                row_cols = rows.get(row, [])
+                left_cols = [col for col in row_cols if col <= after_col]
+                right_cols = [col for col in row_cols if col > after_col]
+                if left_cols and right_cols:
+                    edges.append(((row, max(left_cols)), (row, min(right_cols))))
+        elif connector_type == "row":
+            col_start, col_end = _range_bounds(connector, "col")
+            after_row = _as_int(connector.get("afterRow"))
+            for col in range(col_start, col_end + 1):
+                col_rows = cols.get(col, [])
+                top_rows = [row for row in col_rows if row <= after_row]
+                bottom_rows = [row for row in col_rows if row > after_row]
+                if top_rows and bottom_rows:
+                    edges.append(((max(top_rows), col), (min(bottom_rows), col)))
+
+    return edges
+
+
+def connected_panel_components(cells, connectors=None):
+    cells = set(cells)
+    adjacency = {}
+    for cell in cells:
+        adjacency[cell] = set()
+
+    for row, col in cells:
+        for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbor in cells:
+                adjacency[(row, col)].add(neighbor)
+                adjacency[neighbor].add((row, col))
+
+    for left, right in _connector_edges(cells, connectors or []):
+        if left in cells and right in cells:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+
+    components = []
+    seen = set()
+    for cell in sorted(cells):
+        if cell in seen:
+            continue
+        stack = [cell]
+        component = set()
+        seen.add(cell)
+        while stack:
+            current = stack.pop()
+            component.add(current)
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        components.append(component)
+
+    return sorted(components, key=lambda component: (-max(row for row, col in component),
+                                                     min(col for row, col in component)))
 
 
 def panel_point_xy(row, col, step_x, step_y, connectors=None):
@@ -173,6 +259,67 @@ def _append_transition(tasks, current, target, turn_back_len):
     return current
 
 
+def _task_total_length(tasks):
+    return sum(_as_int(task.get("length")) for task in tasks)
+
+
+def _plan_component_tasks(component_cells, current, left_to_right, step_x, step_y, connectors,
+                          turn_back_len, go_left_or_right_back_len):
+    segments_by_row = build_panel_segments(component_cells)
+    rows = sorted(segments_by_row.keys(), reverse=True)
+    tasks = []
+
+    for row in rows:
+        row_segments = segments_by_row[row]
+        if not row_segments:
+            continue
+
+        ordered_segments = row_segments if left_to_right else list(reversed(row_segments))
+
+        for col_start, col_end in ordered_segments:
+            if left_to_right:
+                clean_start_col = col_start
+                clean_end_col = col_end
+            else:
+                clean_start_col = col_end
+                clean_end_col = col_start
+
+            clean_start = panel_point_xy(row, clean_start_col, step_x, step_y, connectors)
+            clean_end = panel_point_xy(row, clean_end_col, step_x, step_y, connectors)
+
+            current = _append_transition(tasks, current, clean_start, turn_back_len)
+            current = _append_move(
+                tasks,
+                current,
+                clean_end,
+                mode=1,
+                turn_back_len=turn_back_len,
+                back_len=go_left_or_right_back_len,
+            )
+
+        left_to_right = not left_to_right
+
+    return tasks, current
+
+
+def _append_return_to_origin(tasks, current, turn_back_len):
+    before_count = len(tasks)
+    current = _append_transition(tasks, current, (0, 0), turn_back_len)
+    for task in tasks[before_count:]:
+        task["action"] = "return_origin"
+    return current
+
+
+def create_return_to_origin_tasks(current, turnBackLen=10, areaNumber=None, start_id=1):
+    tasks = []
+    _append_return_to_origin(tasks, current, turnBackLen)
+    for index, task in enumerate(tasks):
+        task["id"] = start_id + index
+        if areaNumber is not None:
+            task["areaNumber"] = areaNumber
+    return tasks
+
+
 def create_task_by_panel_layout(
     layout,
     areaNumber=1,
@@ -210,50 +357,51 @@ def create_task_by_panel_layout(
     y_projection = math.cos(angle_radians_y or 0)
     step_x = int(round((_as_int(panelWidth) + _as_int(gapX)) * x_projection))
     step_y = int(round((_as_int(panelHeight) + _as_int(gapY)) * y_projection))
-    connectors = (layout or {}).get("connectors", []) or []
+    layout = layout or {}
+    connectors = layout.get("connectors", []) or []
     cells = expand_panel_cells(layout)
-    segments_by_row = build_panel_segments(cells)
-    rows = sorted(segments_by_row.keys(), reverse=True)
+    components = connected_panel_components(cells, connectors)
+    visit_strategy = layout.get("visitStrategy", "nearest")
 
     tasks = []
     current = (int(round(startX)), int(round(startY)))
-    left_to_right = direction != "right"
+    preferred_left_to_right = direction != "right"
+    remaining_components = list(components)
 
-    for row in rows:
-        row_segments = segments_by_row[row]
-        if not row_segments:
-            continue
-
-        if left_to_right:
-            ordered_segments = row_segments
-        else:
-            ordered_segments = list(reversed(row_segments))
-
-        for col_start, col_end in ordered_segments:
-            if left_to_right:
-                clean_start_col = col_start
-                clean_end_col = col_end
-            else:
-                clean_start_col = col_end
-                clean_end_col = col_start
-
-            clean_start = panel_point_xy(row, clean_start_col, step_x, step_y, connectors)
-            clean_end = panel_point_xy(row, clean_end_col, step_x, step_y, connectors)
-
-            current = _append_transition(tasks, current, clean_start, turnBackLen)
-            current = _append_move(
-                tasks,
-                current,
-                clean_end,
-                mode=1,
-                turn_back_len=turnBackLen,
-                back_len=goLeftOrRightBackLen,
+    while remaining_components:
+        if visit_strategy == "row":
+            component = remaining_components.pop(0)
+            component_tasks, current = _plan_component_tasks(
+                component, current, preferred_left_to_right, step_x, step_y,
+                connectors, turnBackLen, goLeftOrRightBackLen
             )
+        else:
+            best_index = None
+            best_tasks = None
+            best_current = None
+            best_score = None
+            for component_index, component in enumerate(remaining_components):
+                for left_to_right in (preferred_left_to_right, not preferred_left_to_right):
+                    candidate_tasks, candidate_current = _plan_component_tasks(
+                        component, current, left_to_right, step_x, step_y,
+                        connectors, turnBackLen, goLeftOrRightBackLen
+                    )
+                    orientation_penalty = 0 if left_to_right == preferred_left_to_right else 1
+                    score = (_task_total_length(candidate_tasks), orientation_penalty, component_index)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_index = component_index
+                        best_tasks = candidate_tasks
+                        best_current = candidate_current
 
-        left_to_right = not left_to_right
+            component_tasks = best_tasks or []
+            current = best_current if best_current is not None else current
+            del remaining_components[best_index]
+
+        tasks.extend(component_tasks)
 
     if returnToOrigin:
-        current = _append_transition(tasks, current, (0, 0), turnBackLen)
+        current = _append_return_to_origin(tasks, current, turnBackLen)
 
     for index, task in enumerate(tasks):
         task["id"] = index + 1

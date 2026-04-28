@@ -2,7 +2,7 @@
 import json
 import math
 
-from layout_planner import create_task_by_panel_layout
+from layout_planner import create_return_to_origin_tasks, create_task_by_panel_layout
 import util
 import redis
 from AppLogger import logger
@@ -98,9 +98,25 @@ def createTask(taskName,areaList):
             startY = task['endY']
 
             totalTaskList = totalTaskList + taskList
-        # 最后一个任务，endX和endY必须是0
-        totalTaskList[-1]['endX'] = 0
-        totalTaskList[-1]['endY'] = 0
+        returnToOrigin = True
+        if len(areaList) > 0:
+            lastAreaInfo = areaList[-1]
+            if isinstance(lastAreaInfo, dict):
+                lastLayout = lastAreaInfo.get('layout', {})
+                returnToOrigin = lastAreaInfo.get('returnToOrigin', lastLayout.get('returnToOrigin', True))
+        if isinstance(returnToOrigin, str):
+            returnToOrigin = returnToOrigin.lower() not in ('false', '0', 'no')
+        if returnToOrigin and totalTaskList:
+            lastTask = totalTaskList[-1]
+            lastPoint = (int(round(lastTask.get('endX', 0))), int(round(lastTask.get('endY', 0))))
+            if lastPoint != (0, 0):
+                returnTasks = create_return_to_origin_tasks(
+                    lastPoint,
+                    turnBackLen=turnBackLen,
+                    areaNumber=lastTask.get('areaNumber', areaLength),
+                    start_id=len(totalTaskList) + 1
+                )
+                totalTaskList = totalTaskList + returnTasks
         # 添加每个任务起始点结束点经纬度
         for index,item in enumerate(totalTaskList):
             item['heading'] = (startHeading + item['angle'])%360

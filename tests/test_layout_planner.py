@@ -3,6 +3,7 @@ import math
 
 from layout_planner import (
     build_panel_segments,
+    connected_panel_components,
     create_task_by_panel_layout,
     expand_panel_cells,
     panel_point_xy,
@@ -116,6 +117,74 @@ class LayoutPlannerTest(unittest.TestCase):
 
         self.assertEqual(tasks[0]["angle"], 90)
         self.assertEqual(tasks[0]["length"], 50)
+
+    def test_disconnected_regions_are_visited_by_nearest_entry(self):
+        layout = {
+            "areas": [
+                {"rowStart": 10, "rowEnd": 10, "colStart": 0, "colEnd": 1},
+                {"rowStart": 0, "rowEnd": 0, "colStart": 2, "colEnd": 3},
+            ],
+        }
+
+        tasks = create_task_by_panel_layout(
+            layout,
+            panelWidth=10,
+            panelHeight=10,
+            gapX=0,
+            gapY=0,
+            startX=0,
+            startY=0,
+            direction="left",
+        )
+
+        self.assertEqual(
+            [(task["angle"], task["mode"], task["length"], task["endX"], task["endY"]) for task in tasks[:2]],
+            [
+                (90, 2, 20, 20, 0),
+                (90, 1, 10, 30, 0),
+            ],
+        )
+
+    def test_connectors_bridge_matching_rows_into_one_component(self):
+        layout = {
+            "areas": [
+                {"rowStart": 0, "rowEnd": 1, "colStart": 0, "colEnd": 0},
+                {"rowStart": 0, "rowEnd": 1, "colStart": 4, "colEnd": 4},
+            ],
+            "connectors": [
+                {"type": "col", "rowStart": 0, "rowEnd": 1, "afterCol": 0, "length": 100},
+            ],
+        }
+
+        without_connector = connected_panel_components(expand_panel_cells(layout), [])
+        with_connector = connected_panel_components(expand_panel_cells(layout), layout["connectors"])
+
+        self.assertEqual(len(without_connector), 2)
+        self.assertEqual(len(with_connector), 1)
+
+    def test_return_to_origin_adds_explicit_return_segment(self):
+        layout = {
+            "areas": [
+                {"rowStart": 0, "rowEnd": 0, "colStart": 0, "colEnd": 1},
+            ],
+        }
+
+        tasks = create_task_by_panel_layout(
+            layout,
+            panelWidth=10,
+            panelHeight=20,
+            gapX=0,
+            gapY=0,
+            returnToOrigin=True,
+        )
+
+        self.assertEqual(tasks[0]["mode"], 1)
+        self.assertEqual(tasks[0]["endX"], 10)
+        self.assertEqual(tasks[0]["endY"], 0)
+        self.assertEqual(tasks[-1]["action"], "return_origin")
+        self.assertEqual(tasks[-1]["mode"], 2)
+        self.assertEqual(tasks[-1]["endX"], 0)
+        self.assertEqual(tasks[-1]["endY"], 0)
 
 
 if __name__ == "__main__":

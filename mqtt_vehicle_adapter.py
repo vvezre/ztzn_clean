@@ -129,7 +129,10 @@ class VehicleControllerAdapter(object):
         return self._call('/vehicle/selectTaskByName', params={'taskName': task_name})
 
     def save_task(self, task_name):
-        return self._call('/vehicle/saveCurrentTaskName', params={'taskName': task_name})
+        return self.set_current_task(task_name)
+
+    def set_current_task(self, task_name):
+        return self._call('/vehicle/setCurrentTask', params={'taskName': task_name})
 
     def save_params(self, params):
         return self._call('/vehicle/saveParams', json_data=params or {})
