@@ -2,6 +2,7 @@
 import json
 import math
 
+from layout_planner import create_task_by_panel_layout
 import util
 import redis
 from AppLogger import logger
@@ -70,11 +71,8 @@ def createTask(taskName,areaList):
             areaInfoStr = json.dumps(areaInfo)
             redis_cli.lpush('areaList', areaInfoStr)
 
-            direction = areaInfo['direction']
-            panelInfoList = areaInfo['panelInfo']
+            direction = areaInfo.get('direction', 'left')
             areaNumber = int(areaInfo['areaNumber'])
-
-            lineCount = areaInfo['lineCount']
 
             # 获取到任务列表
             # taskList = util.createTask(direction, info, areaNumber,goBackLen, goLeftOrRightBackLen,
@@ -82,8 +80,17 @@ def createTask(taskName,areaList):
             #                            gap,lineCount,columnCount,angle_radians)
             # 判断当前区域是否是最后一个区域
             isLastArea = index == len(areaList)-1
-            taskList = util.createTaskByPanelInfo(panelInfoList,areaNumber,startX,startY,direction,isLastArea,lineCount,goBackLen,goLeftOrRightBackLen,turnBackLen,
-                                       panelWidth,panelHeight,leftOrRightBridgeLen,gap,angle_radians,angle_to,gapX,gapY,angle_radians_x,angle_radians_y)
+            if int(areaInfo.get('layoutVersion', 1)) == 2:
+                layout = areaInfo.get('layout', areaInfo)
+                taskList = create_task_by_panel_layout(layout,areaNumber,startX,startY,direction,isLastArea,0,goBackLen,goLeftOrRightBackLen,turnBackLen,
+                                           panelWidth,panelHeight,leftOrRightBridgeLen,gap,angle_radians,angle_to,gapX,gapY,angle_radians_x,angle_radians_y)
+            else:
+                panelInfoList = areaInfo['panelInfo']
+                lineCount = areaInfo['lineCount']
+                taskList = util.createTaskByPanelInfo(panelInfoList,areaNumber,startX,startY,direction,isLastArea,lineCount,goBackLen,goLeftOrRightBackLen,turnBackLen,
+                                           panelWidth,panelHeight,leftOrRightBridgeLen,gap,angle_radians,angle_to,gapX,gapY,angle_radians_x,angle_radians_y)
+            if not taskList:
+                raise ValueError("任务区域没有可生成的路径")
             # 获取这个区域中最后一个任务，留给下个区域作为起始点
             task = taskList[-1]
 
@@ -138,8 +145,8 @@ def createTask(taskName,areaList):
             f.write(json_str)
         return {"success":True,"msg":"生成任务成功"}
     except Exception as e:
-        logger.error(e.message)
-        return {"success":False,"msg":e.message}
+        logger.error(str(e))
+        return {"success":False,"msg":str(e)}
 
 
 
