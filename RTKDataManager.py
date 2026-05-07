@@ -142,7 +142,7 @@ class RTKDataManager:
             if heading_deg is None:
                 c_lat, c_lon = lat, lon
             else:
-                c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.11, 0.17)
+                c_lat,c_lon = util.compute_center_from_master(lat, lon, heading_deg, 0.18, 0.10)
             # c_lat,c_lon = util.calculate_center_offset(lat,lon,heading_deg,0.1,0.2)
             # c_lat, c_lon = util.calculate_center_gps(lat,lon,heading_deg,0.1,0.2)
             # rtk_data.lat = round(result['center_lat'], 8)

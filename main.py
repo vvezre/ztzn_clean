@@ -44,6 +44,23 @@ import util
 import traceback
 
 import service
+from garage_state import (
+    EXIT_DECISION_ALLOW,
+    EXIT_DECISION_BLOCKED,
+    EXIT_DECISION_CONFIRM,
+    GARAGE_STATE_DOCKED_BY_COMMAND,
+    GARAGE_STATE_DOCKED_MANUAL_CONFIRMED,
+    GARAGE_STATE_ENTERING,
+    GARAGE_STATE_EXITING,
+    GARAGE_STATE_KEY,
+    GARAGE_STATE_OUTSIDE,
+    GARAGE_STATE_REASON_KEY,
+    GARAGE_STATE_UNKNOWN,
+    GARAGE_STATE_UPDATED_AT_KEY,
+    decide_auto_exit_garage,
+    normalize_garage_state,
+)
+from rtk_correction import compute_linear_steering
 from DynamicCronScheduler import DynamicCronScheduler
 from FixedPositiveChecker import FixedPositiveChecker
 
@@ -82,7 +99,7 @@ ip = "218.2.130.246"
 
 id = "30f4b4af-c1a8-f3f6-072d-3807918c0dc0"
 
-redis_cli = redis.Redis(host='localhost', port=6379, db=0)
+redis_cli = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 redis_cli.set("forwardSpeed", high_speed)
 redis_cli.set("brushSpeed", high_brush_speed)
@@ -92,6 +109,10 @@ redis_cli.set(PATH_PLANNING_KEY, LEFT_PATH_PLANNING)
 redis_cli.set('detectQrcode', 'false')
 redis_cli.set('enterGarage', 'false')
 redis_cli.set('currentAction', 'idle')
+if redis_cli.get(GARAGE_STATE_KEY) is None:
+    redis_cli.set(GARAGE_STATE_KEY, GARAGE_STATE_UNKNOWN)
+    redis_cli.set(GARAGE_STATE_REASON_KEY, 'startup_unset')
+    redis_cli.set(GARAGE_STATE_UPDATED_AT_KEY, int(time.time()))
 redis_cli.set('curTaskIndex', 0)
 redis_cli.set('mission', 'complete')
 redis_cli.set('parking', '1')
@@ -216,12 +237,6 @@ TURN_RTK_FALLBACK_STABLE_COUNT = 1
 TURN_RTK_FALLBACK_MIN_WAIT_SEC = 1.0
 TURN_RTK_HEADING_MAX_AGE_SEC = 2.0
 TURN_RTK_CROSSING_WINDOW_DEG = 3.0
-STANLEY_GAIN = 0.8
-STANLEY_SOFTENING_SPEED_MPS = 0.2
-STANLEY_MIN_SPEED_MPS = 0.05
-STANLEY_SPEED_UNIT_TO_MPS = 0.001
-STANLEY_ZSPEED_PER_DEG = 10.0
-STANLEY_DEFAULT_SPEED_CMD = 250.0
 
 
 def set_current_action(action_name):
@@ -229,6 +244,31 @@ def set_current_action(action_name):
         redis_cli.set('currentAction', action_name)
     except Exception as e:
         logger.warning("设置currentAction失败: {}".format(str(e)))
+
+
+def set_garage_state(state, reason):
+    state = normalize_garage_state(state)
+    try:
+        redis_cli.set(GARAGE_STATE_KEY, state)
+        redis_cli.set(GARAGE_STATE_REASON_KEY, reason or '')
+        redis_cli.set(GARAGE_STATE_UPDATED_AT_KEY, int(time.time()))
+    except Exception as e:
+        logger.warning("设置garageState失败: {}".format(str(e)))
+
+
+def get_garage_state():
+    try:
+        return normalize_garage_state(redis_cli.get(GARAGE_STATE_KEY))
+    except Exception:
+        return GARAGE_STATE_UNKNOWN
+
+
+def _garage_state_payload():
+    return {
+        'garage_state': get_garage_state(),
+        'garage_state_reason': _decode_redis_value(redis_cli.get(GARAGE_STATE_REASON_KEY)) or '',
+        'garage_state_updated_at': _coerce_int(redis_cli.get(GARAGE_STATE_UPDATED_AT_KEY), 0),
+    }
 
 
 def sync_current_location(lat, lon, heading=None):
@@ -342,26 +382,6 @@ def _normalize_heading_delta(current_heading, target_heading):
     except Exception:
         return None
     return (delta + 180.0) % 360.0 - 180.0
-
-
-def _speed_cmd_to_mps(speed_cmd):
-    speed_cmd = abs(_coerce_float(speed_cmd, STANLEY_DEFAULT_SPEED_CMD))
-    speed_mps = speed_cmd * STANLEY_SPEED_UNIT_TO_MPS
-    return max(STANLEY_MIN_SPEED_MPS, speed_mps)
-
-
-def _calc_stanley_steering(heading_error_deg, cte_m, speed_cmd=None):
-    heading_error = _coerce_float(heading_error_deg, 0.0)
-    heading_error = (heading_error + 180.0) % 360.0 - 180.0
-    cte = _coerce_float(cte_m, 0.0)
-    speed_mps = _speed_cmd_to_mps(speed_cmd)
-
-    cte_term_deg = math.degrees(
-        math.atan2(STANLEY_GAIN * cte, speed_mps + STANLEY_SOFTENING_SPEED_MPS)
-    )
-    steer_deg = heading_error - cte_term_deg
-    z_speed_output = int(round(steer_deg * STANLEY_ZSPEED_PER_DEG))
-    return z_speed_output, steer_deg, cte_term_deg, speed_mps
 
 
 def _heading_delta_crossed_target(previous_delta, current_delta):
@@ -1194,6 +1214,7 @@ def _build_vehicle_status_payload():
     mission_state = _derive_mission_state(control_state)
     fault_state = _derive_fault_state()
     current_action = _decode_redis_value(redis_cli.get('currentAction')) or ('parking' if _coerce_bool(redis_cli.get('parking'), False) else 'idle')
+    garage_state = get_garage_state()
     battery_percent = _clamp_percent(redis_cli.get('batteryPercent'))
     battery_percent_raw = _clamp_percent(redis_cli.get('batteryPercentRaw'))
 
@@ -1201,6 +1222,7 @@ def _build_vehicle_status_payload():
         'lastCommandMessage': _decode_redis_value(redis_cli.get('lastCommandMessage')) or '',
         'startCheckReady': _coerce_bool(redis_cli.get('startCheckReady'), False),
         'startCheckReason': _decode_redis_value(redis_cli.get('startCheckReason')) or '',
+        'garageStateReason': _decode_redis_value(redis_cli.get(GARAGE_STATE_REASON_KEY)) or '',
     })
 
     return {
@@ -1231,9 +1253,11 @@ def _build_vehicle_status_payload():
         'move_judge': _coerce_bool(redis_cli.get('moveJudge'), False),
         'detect_qrcode': _coerce_bool(redis_cli.get('detectQrcode'), False),
         'enter_garage': _coerce_bool(redis_cli.get('enterGarage'), False),
+        'garage_state': garage_state,
+        'garage_state_updated_at': _coerce_int(redis_cli.get(GARAGE_STATE_UPDATED_AT_KEY), 0),
         'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'],
         'supported_params': ['taskName', 'speed', 'tracking', 'path'],
-        'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state'],
+        'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state', 'garage_state'],
         'detail': detail,
         'timestamp': int(time.time()),
     }
@@ -2218,6 +2242,8 @@ def exitGarage():
 
 
 def exit_garage_task():
+    set_current_action('exit_garage')
+    set_garage_state(GARAGE_STATE_EXITING, 'manual_exit_garage_started')
     redis_cli.set("reverse", "false")
 
     redis_cli.set("correct", "true")
@@ -2257,6 +2283,8 @@ def exit_garage_task():
     redis_cli.set("correct", "false")
 
     redis_cli.set('mission', 'complete')
+    set_garage_state(GARAGE_STATE_OUTSIDE, 'manual_exit_garage_completed')
+    set_current_action('idle')
 
 
 @app.route("/vehicle/getVehicleInfo", methods=['GET'])
@@ -2388,18 +2416,14 @@ def correctByRTKTest():
             heading_error = (heading_error + 180) % 360 - 180
             # 只有直行，才发送纠偏指令
             cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, lat, lon)
-            speed_cmd = _coerce_float(global_cur_taskPointTest.get('speed'), STANLEY_DEFAULT_SPEED_CMD)
-            stree_output, stanley_steer_deg, stanley_cte_term_deg, stanley_speed_mps = _calc_stanley_steering(
-                heading_error, cte, speed_cmd
-            )
+            stree_output = compute_linear_steering(heading_error, cte)
             # 发送电机控制指令
             # 正数左轮快，向右偏，负数右轮快，向左偏
             setZSpeed(stree_output)
             duplicateWriteCmd(ser, command)
             logger.warn(
-                "stanley target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} distance={:.2f}m speed={:.2f}m/s cte_term={:.2f} steer={:.2f} z={}".format(
-                    const_target_h, heading_deg, heading_error, cte, distance_to_target,
-                    stanley_speed_mps, stanley_cte_term_deg, stanley_steer_deg, stree_output
+                "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} distance={:.2f}m z={}".format(
+                    const_target_h, heading_deg, heading_error, cte, distance_to_target, stree_output
                 )
             )
             # 打印状态
@@ -2752,13 +2776,34 @@ def autoDriveByRTKThread():
     # initHeading = taskObj['heading']
     # 起始点航向角,用于位置转正
     originHeading = float(taskParams.get('originHeading'))
-    # 如果不等于0，原点和起始点不是同一点
-    if backLength != 0:
-        if global_status == 'goCharging':
-            goOutGarage(backLength)
-        else:
-            if isGarage(chargingPileLat, chargingPileLon):
-                goOutGarage(backLength)
+    exit_decision = decide_auto_exit_garage(get_garage_state(), backLength)
+    logger.warn("自动清扫前出舱判定: {}".format(exit_decision))
+    if exit_decision.get('decision') == EXIT_DECISION_ALLOW:
+        goOutGarage(backLength)
+        if get_garage_state() != GARAGE_STATE_OUTSIDE:
+            _mark_runtime_blocked(
+                'GARAGE_EXIT_NOT_CONFIRMED',
+                '出舱未确认完成，自动清扫未启动',
+                {
+                    'garage_state': get_garage_state(),
+                    'garage_state_reason': _decode_redis_value(redis_cli.get(GARAGE_STATE_REASON_KEY)) or '',
+                }
+            )
+            return
+    elif exit_decision.get('decision') == EXIT_DECISION_CONFIRM:
+        _mark_runtime_blocked(
+            'GARAGE_STATE_UNKNOWN',
+            '无法确认车辆是否在舱内，请人工确认后再启动自动清扫',
+            exit_decision
+        )
+        return
+    elif exit_decision.get('decision') == EXIT_DECISION_BLOCKED:
+        _mark_runtime_blocked(
+            'GARAGE_STATE_BUSY',
+            '车辆正在进舱或出舱，自动清扫未启动',
+            exit_decision
+        )
+        return
     # 获取是否开启定点找寻任务功能
     if False and redis_cli.get("isOpenFindTaskName") == '1':
         taskName = getTaskNameByLoc()
@@ -2917,10 +2962,11 @@ def autoDriveByRTKThread():
 
 # 根据充电桩的lat,lon和当前的lat,lon距离是否大于1.3m,如果小于1.3m,则表明小车在车库中，返回1，否则返回0
 def isGarage(lat,lon):
-    # 如果当前没有rtk信号，则说明小车在充电桩中，也可以直接出仓
+    # RTK unavailable means position is unknown, not that the vehicle is docked.
     logger.info("当前经纬度：{}".format(lat))
     if global_cur_rtk_lat is None:
-        return 1
+        logger.warn("RTK信号不可用，无法通过距离确认是否在车库中")
+        return 0
     dis,angle = util.get_distance_angle(global_cur_rtk_lat,global_cur_rtk_lon,lat,lon)
     logger.warn(dis)
     if dis < 1:
@@ -2931,6 +2977,7 @@ def isGarage(lat,lon):
 def intoGarage(backLength):
     global global_status
     logger.warn('进充电桩')
+    set_garage_state(GARAGE_STATE_ENTERING, 'into_garage_started')
     reset_odometer(ser)
     turn(ser, 180 * 10)
     # 最后一段强制走视觉对接：先预靠近，再进入视觉闭环。
@@ -2953,17 +3000,21 @@ def intoGarage(backLength):
     duplicateWriteCmd(ser, command)
 
     global_status = 'goCharging'
+    set_garage_state(GARAGE_STATE_DOCKED_BY_COMMAND, 'into_garage_charge_command_sent')
     # moveByRTK(chargingPileLat, chargingPileLon, (originHeading + 180) % 360)
 # 出充电桩
 def goOutGarage(backLength):
     global global_status
+    set_garage_state(GARAGE_STATE_EXITING, 'auto_drive_exit_garage_started')
     global_status = 'move back'
     reset_odometer(ser)
     redis_cli.set("mission", "working")
     moveBack(ser, backLength)
     # 如果后退没有到达，则不往下执行
-    if getDistanceArrive() == 0:
+    if str(getDistanceArrive()) == "0":
+        set_garage_state(GARAGE_STATE_UNKNOWN, 'auto_drive_exit_garage_not_arrived')
         return
+    set_garage_state(GARAGE_STATE_OUTSIDE, 'auto_drive_exit_garage_completed')
 
 @app.route("/vehicle/intoGarage", methods=['GET'])
 def intoGarage_api():
@@ -3116,6 +3167,24 @@ def setGarageEntryInfo():
     redis_cli.hset('taskParams','garageEntryLon',lon)
     result = {"success":True,"msg":"设置成功","garageEntryLat":lat,"garageEntryLon":lon}
     return jsonify(result)
+
+
+@app.route("/vehicle/confirmInGarage", methods=['GET'])
+def confirmInGarage():
+    set_garage_state(GARAGE_STATE_DOCKED_MANUAL_CONFIRMED, 'manual_confirm_in_garage')
+    return jsonify({"success": True, "msg": "已人工确认车辆在舱内", "data": _garage_state_payload()})
+
+
+@app.route("/vehicle/confirmOutGarage", methods=['GET'])
+def confirmOutGarage():
+    set_garage_state(GARAGE_STATE_OUTSIDE, 'manual_confirm_out_garage')
+    return jsonify({"success": True, "msg": "已人工确认车辆在舱外", "data": _garage_state_payload()})
+
+
+@app.route("/vehicle/resetGarageState", methods=['GET'])
+def resetGarageState():
+    set_garage_state(GARAGE_STATE_UNKNOWN, 'manual_reset_garage_state')
+    return jsonify({"success": True, "msg": "已重置舱位状态为未知", "data": _garage_state_payload()})
 # 设置原点，也就是起始点
 @app.route("/vehicle/setOrigin", methods=['GET'])
 def setOrigin():
@@ -3202,10 +3271,7 @@ def correctByRTK():
             heading_error = (heading_error + 180) % 360 - 180
             # 只有直行，才发送纠偏指令
             cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, lat, lon)
-            speed_cmd = _coerce_float(global_cur_taskPoint.get('speed'), STANLEY_DEFAULT_SPEED_CMD)
-            stree_output, stanley_steer_deg, stanley_cte_term_deg, stanley_speed_mps = _calc_stanley_steering(
-                heading_error, cte, speed_cmd
-            )
+            stree_output = compute_linear_steering(heading_error, cte)
             if global_go == 1:
                 if abs(heading_error) > 1 or abs(cte) > 0.02:
                     # logger.warning("视觉纠偏关闭，RTK纠偏开启")
@@ -3215,9 +3281,8 @@ def correctByRTK():
                     setZSpeed(stree_output)
                     duplicateWriteCmd(ser, command)
                     logger.warn(
-                        "stanley target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} distance={:.2f}m speed={:.2f}m/s cte_term={:.2f} steer={:.2f} z={}".format(
-                            target_heading, heading_deg, heading_error, cte, distance_to_target,
-                            stanley_speed_mps, stanley_cte_term_deg, stanley_steer_deg, stree_output
+                        "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} distance={:.2f}m z={}".format(
+                            target_heading, heading_deg, heading_error, cte, distance_to_target, stree_output
                         )
                     )
                     # 打印状态
@@ -3720,10 +3785,7 @@ def observer_go_correct(data):
 
         # stree_output = int(raw_output)
         # stree_output = heading_error*10 - int(450 * cte)
-        speed_cmd = _coerce_float(global_cur_taskPoint.get('speed'), STANLEY_DEFAULT_SPEED_CMD)
-        stree_output, stanley_steer_deg, stanley_cte_term_deg, stanley_speed_mps = _calc_stanley_steering(
-            heading_error, cte, speed_cmd
-        )
+        stree_output = compute_linear_steering(heading_error, cte, cte_gain=800)
         # if abs(heading_error) > 1 or abs(cte) > 0.02:
             # logger.warning("视觉纠偏关闭，RTK纠偏开启")
             # redis_cli.set("correct", "false")
@@ -3732,9 +3794,9 @@ def observer_go_correct(data):
         setZSpeed(-stree_output)
         duplicateWriteCmd(ser, command)
         logger.info(
-            "stanley target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m speed={:.2f}m/s cte_term={:.2f} steer={:.2f} z={}".format(
+            "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m cte_gain=800 z={}".format(
                 target_heading, data.heading, heading_error, cte, global_last_cte, distance_to_target,
-                stanley_speed_mps, stanley_cte_term_deg, stanley_steer_deg, -stree_output
+                -stree_output
             )
         )
 

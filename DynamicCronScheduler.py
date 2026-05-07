@@ -3,12 +3,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import threading
 import logging
+import pytz
 
 logging.basicConfig(level=logging.INFO)
 
 class DynamicCronScheduler(object):
     def __init__(self):
-        self.scheduler = BackgroundScheduler()
+        self.timezone = pytz.timezone('Asia/Shanghai')
+        self.scheduler = BackgroundScheduler(timezone=self.timezone)
         self.scheduler.start()
         self._lock = threading.Lock()
 
@@ -19,7 +21,7 @@ class DynamicCronScheduler(object):
         :param func: callable
         :param cron: str, e.g., "*/5 * * * *"
         """
-        trigger = CronTrigger.from_crontab(cron)
+        trigger = CronTrigger.from_crontab(cron, timezone=self.timezone)
         with self._lock:
             self.scheduler.add_job(
                 func=func,
@@ -31,7 +33,7 @@ class DynamicCronScheduler(object):
 
     def update_cron(self, job_id, new_cron):
         """动态更新 cron"""
-        trigger = CronTrigger.from_crontab(new_cron)
+        trigger = CronTrigger.from_crontab(new_cron, timezone=self.timezone)
         with self._lock:
             self.scheduler.reschedule_job(job_id=job_id, trigger=trigger)
         logging.info("Updated job %s to cron: %s", job_id, new_cron)
