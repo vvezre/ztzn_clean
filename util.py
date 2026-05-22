@@ -2,6 +2,7 @@
 import binascii
 import copy
 import json
+import threading
 import time
 from collections import defaultdict
 
@@ -23,6 +24,231 @@ RTK_OUTPUT_CONFIG_COMMANDS = (
     'gphpr 0.1\r\n',
     'savaconfig\r\n',
 )
+RTK_NMEA_MAX_AGE_SECONDS = 2.0
+RTK_DRAIN_MAX_LINES = 300
+RTK_NTRIP_STEP_INTERVAL_SECONDS = 0.02
+
+
+def _flush_serial_input(ser, reason='', port=''):
+    try:
+        if hasattr(ser, 'reset_input_buffer'):
+            ser.reset_input_buffer()
+        else:
+            ser.flushInput()
+        if reason:
+            logger.warning("RTK_DIAG serial_input_flushed port={} reason={}".format(port, reason))
+        return True
+    except Exception as e:
+        logger.warning("RTK_DIAG serial_input_flush_failed port={} reason={} error={}".format(port, reason, e))
+        return False
+
+
+def _parse_nmea_utc_seconds(utc_text):
+    if not utc_text:
+        return None
+    try:
+        value = float(utc_text)
+        hour = int(value / 10000)
+        minute = int((value - hour * 10000) / 100)
+        second = value - hour * 10000 - minute * 100
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+        if second < 0 or second >= 61:
+            return None
+        return hour * 3600 + minute * 60 + second
+    except Exception:
+        return None
+
+
+def _nmea_utc_age_seconds(utc_text, now_time=None):
+    nmea_seconds = _parse_nmea_utc_seconds(utc_text)
+    if nmea_seconds is None:
+        return None
+    if now_time is None:
+        now_time = time.time()
+    now_utc = time.gmtime(now_time)
+    now_seconds = now_utc.tm_hour * 3600 + now_utc.tm_min * 60 + now_utc.tm_sec
+    age = now_seconds - nmea_seconds
+    if age > 43200:
+        age -= 86400
+    elif age < -43200:
+        age += 86400
+    return age
+
+
+def _is_stale_nmea_utc(utc_text, now_time=None, max_age_seconds=RTK_NMEA_MAX_AGE_SECONDS):
+    age = _nmea_utc_age_seconds(utc_text, now_time)
+    return age is not None and age > max_age_seconds
+
+
+def _rtk_line_to_text(line):
+    if line is None:
+        return ''
+    if isinstance(line, bytes):
+        try:
+            return line.decode('utf-8', errors='ignore').strip()
+        except TypeError:
+            return line.decode('utf-8', 'ignore').strip()
+    return str(line).strip()
+
+
+def _rtk_nmea_utc(line_str):
+    parts = line_str.split(',')
+    if len(parts) > 1:
+        return parts[1]
+    return ''
+
+
+def _serial_in_waiting(ser):
+    try:
+        return int(getattr(ser, 'in_waiting'))
+    except Exception:
+        pass
+    try:
+        return int(ser.inWaiting())
+    except Exception:
+        return 0
+
+
+def _serial_is_open(ser):
+    if ser is None:
+        return False
+    try:
+        return bool(getattr(ser, 'is_open'))
+    except Exception:
+        pass
+    try:
+        return bool(ser.isOpen())
+    except Exception:
+        return False
+
+
+class _RtkLatestState(object):
+    """Keep only the latest usable GGA/HPR pair; old backlog is intentionally skipped."""
+
+    def __init__(self, sync_threshold=0.5):
+        self.sync_threshold = sync_threshold
+        self.buffer = {}
+        self.last_heading = None
+        self.last_quality = None
+
+
+def _consume_rtk_nmea_lines(state, lines, now_time=None, port='', correction_runtime=None,
+                            max_age_seconds=RTK_NMEA_MAX_AGE_SECONDS, log_events=False):
+    stats = {
+        'lines': 0,
+        'stale': 0,
+        'samples': 0,
+        'first_stale_utc': None,
+        'first_stale_age': None,
+    }
+    latest_sample = None
+
+    for raw_line in lines:
+        line_str = _rtk_line_to_text(raw_line)
+        if not line_str:
+            continue
+        stats['lines'] += 1
+        timestamp = time.time() if now_time is None else now_time
+
+        if line_str.startswith(("$GNGGA", "$GPGGA", "$GNHPR", "$GPHPR")):
+            nmea_utc = _rtk_nmea_utc(line_str)
+            nmea_age = _nmea_utc_age_seconds(nmea_utc, timestamp)
+            if nmea_age is not None and nmea_age > max_age_seconds:
+                stats['stale'] += 1
+                if stats['first_stale_utc'] is None:
+                    stats['first_stale_utc'] = nmea_utc
+                    stats['first_stale_age'] = nmea_age
+                state.buffer.clear()
+                continue
+
+        if line_str.startswith(("$GNGGA", "$GPGGA")):
+            if correction_runtime is not None:
+                correction_runtime.observe_gga(line_str)
+            quality = extract_gga_quality(line_str)
+            if quality != state.last_quality:
+                if log_events:
+                    logger.warning("RTK GGA瀹氫綅鐘舵€佹洿鏂? fix={}".format(quality))
+                state.last_quality = quality
+
+            gps = parse_gngga(line_str)
+            if not gps:
+                continue
+
+            state.buffer['gga'] = {
+                'timestamp': timestamp,
+                'lat': gps[0],
+                'lon': gps[1]
+            }
+            if 'ths' in state.buffer:
+                gga_ts = state.buffer['gga']['timestamp']
+                ths_ts = state.buffer['ths']['timestamp']
+                if abs(gga_ts - ths_ts) < state.sync_threshold:
+                    heading_deg = state.buffer['ths']['heading']
+                    state.last_heading = heading_deg
+                    latest_sample = (state.buffer['gga']['lat'], state.buffer['gga']['lon'], heading_deg)
+                    del state.buffer['gga']
+                    del state.buffer['ths']
+                else:
+                    heading_deg = state.last_heading if state.last_heading is not None else state.buffer['ths']['heading']
+                    latest_sample = (state.buffer['gga']['lat'], state.buffer['gga']['lon'], heading_deg)
+                    del state.buffer['gga']
+            else:
+                latest_sample = (state.buffer['gga']['lat'], state.buffer['gga']['lon'], state.last_heading)
+                del state.buffer['gga']
+
+            stats['samples'] += 1
+
+        elif line_str.startswith(("$GNTHS", "$GPTHS")):
+            heading = parse_GPTHS(line_str)
+            if heading is not None:
+                state.last_heading = heading
+                state.buffer['ths'] = {
+                    'timestamp': timestamp,
+                    'heading': heading
+                }
+
+        elif line_str.startswith(("$GNHPR", "$GPHPR")):
+            heading_info = parse_GNHPR(line_str)
+            if heading_info is not None:
+                state.last_heading = heading_info[0]
+                state.buffer['ths'] = {
+                    'timestamp': timestamp,
+                    'heading': heading_info[0]
+                }
+
+    return latest_sample, stats
+
+
+def _read_serial_lines_now(ser, max_lines=RTK_DRAIN_MAX_LINES):
+    lines = []
+    first_line = ser.readline()
+    if first_line:
+        lines.append(first_line)
+    while len(lines) < max_lines and _serial_in_waiting(ser) > 0:
+        line = ser.readline()
+        if not line:
+            break
+        lines.append(line)
+    return lines
+
+
+def _start_ntrip_serial_worker(correction_runtime, serial_port,
+                               interval_seconds=RTK_NTRIP_STEP_INTERVAL_SECONDS):
+    stop_event = threading.Event()
+
+    def _worker():
+        while not stop_event.is_set() and _serial_is_open(serial_port):
+            try:
+                correction_runtime.step(serial_port)
+            except Exception as exc:
+                logger.error("NTRIP correction worker error: {}".format(exc))
+            stop_event.wait(interval_seconds)
+
+    thread = threading.Thread(target=_worker, name="NtripRTCMWriter")
+    thread.daemon = True
+    thread.start()
+    return stop_event, thread
 
 
 def configure_rtk_output(ser):
@@ -42,13 +268,7 @@ def configure_rtk_output(ser):
             logger.warning("RTK config command sent: {}".format(command_text.strip()))
             time.sleep(0.15)
 
-        try:
-            ser.reset_input_buffer()
-        except Exception:
-            try:
-                ser.flushInput()
-            except Exception:
-                pass
+        _flush_serial_input(ser, 'after_config')
 
         rtk_output_configured = True
         logger.warning("RTK output configured: GNGGA/GPHPR interval=0.1s")
@@ -636,12 +856,78 @@ def readRTK(ser_rtk_params, sync_threshold = 0.5,timeout = 1):
             logger.error("其他错误: {}".format(e))
 
         time.sleep(1)  # 确保休眠在所有情况（包括失败）下都执行，防止死循环
-def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
+def _readRTK_v2_legacy(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
     global ser_rtk
     buffer = {}
     last_heading = None
     last_quality = None
     correction_runtime = get_shared_runtime(logger)
+    last_diag_gga_at = [0.0]
+    last_diag_hpr_at = [0.0]
+    last_diag_yield_at = [0.0]
+    last_yield_at = [0.0]
+
+    def _nmea_utc(line):
+        parts = line.split(',')
+        if len(parts) > 1:
+            return parts[1]
+        return ''
+
+    def _age_text(ts, now):
+        if ts is None:
+            return 'none'
+        try:
+            return '%.3f' % (now - float(ts))
+        except Exception:
+            return 'bad'
+
+    def _diag_raw_gga(port, line, quality, gps):
+        # RTK_DIAG raw_gga log disabled.
+        return
+        now = time.time()
+        if now - last_diag_gga_at[0] < 1.0:
+            return
+        last_diag_gga_at[0] = now
+        logger.warning(
+            "RTK_DIAG raw_gga port={} utc={} quality={} lat={} lon={} last_heading={}".format(
+                port, _nmea_utc(line), quality,
+                gps[0] if gps else None,
+                gps[1] if gps else None,
+                last_heading
+            )
+        )
+
+    def _diag_raw_hpr(port, line, heading_info):
+        # RTK_DIAG raw_hpr log disabled.
+        return
+        now = time.time()
+        if now - last_diag_hpr_at[0] < 1.0:
+            return
+        last_diag_hpr_at[0] = now
+        logger.warning(
+            "RTK_DIAG raw_hpr port={} utc={} heading={} pitch={}".format(
+                port, _nmea_utc(line), heading_info[0], heading_info[1]
+            )
+        )
+
+    def _diag_yield(reason, lat, lon, heading_deg, gga_ts, ths_ts):
+        # RTK_DIAG yield log disabled.
+        return
+        now = time.time()
+        gap = 0.0
+        if last_yield_at[0] > 0:
+            gap = now - last_yield_at[0]
+        last_yield_at[0] = now
+        if now - last_diag_yield_at[0] < 1.0 and gap <= 0.3:
+            return
+        last_diag_yield_at[0] = now
+        logger.warning(
+            "RTK_DIAG yield reason={} lat={} lon={} heading={} gap={:.3f}s gga_age={}s hpr_age={}s".format(
+                reason, lat, lon, heading_deg, gap,
+                _age_text(gga_ts, now),
+                _age_text(ths_ts, now)
+            )
+        )
 
     while True:
         try:
@@ -654,6 +940,7 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
             with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=0.1) as ser_rtk:
                 logger.warning("RTK涓插彛宸叉墦寮€: {}".format(rtk_port))
                 configure_rtk_output(ser_rtk)
+                _flush_serial_input(ser_rtk, 'open', rtk_port)
                 while ser_rtk.is_open:
                     try:
                         correction_runtime.step(ser_rtk)
@@ -667,6 +954,21 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                         if not line_str:
                             continue
 
+                        if line_str.startswith(("$GNGGA", "$GPGGA", "$GNHPR", "$GPHPR")):
+                            nmea_utc = _nmea_utc(line_str)
+                            nmea_age = _nmea_utc_age_seconds(nmea_utc, timestamp)
+                            if nmea_age is not None and nmea_age > RTK_NMEA_MAX_AGE_SECONDS:
+                                logger.warning(
+                                    "RTK_DIAG stale_nmea port={} utc={} age={:.3f}s max_age={:.3f}s; flushing input".format(
+                                        rtk_port, nmea_utc, nmea_age, RTK_NMEA_MAX_AGE_SECONDS
+                                    )
+                                )
+                                _flush_serial_input(ser_rtk, 'stale_nmea', rtk_port)
+                                buffer.clear()
+                                last_heading = None
+                                time.sleep(0.02)
+                                continue
+
                         if line_str.startswith(("$GNGGA", "$GPGGA")):
                             correction_runtime.observe_gga(line_str)
                             quality = extract_gga_quality(line_str)
@@ -675,6 +977,7 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                                 last_quality = quality
 
                             gps = parse_gngga(line_str)
+                            _diag_raw_gga(rtk_port, line_str, quality, gps)
                             if gps:
                                 buffer['gga'] = {
                                     'timestamp': timestamp,
@@ -691,17 +994,21 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                                         del buffer['gga']
                                         del buffer['ths']
                                         last_heading = heading_deg
+                                        _diag_yield('matched_gga_hpr', lat, lon, heading_deg, gga_ts, ths_ts)
                                         yield lat, lon, heading_deg
                                     else:
                                         heading_deg = last_heading if last_heading is not None else buffer['ths']['heading']
                                         lat = buffer['gga']['lat']
                                         lon = buffer['gga']['lon']
                                         del buffer['gga']
+                                        _diag_yield('stale_heading', lat, lon, heading_deg, gga_ts, ths_ts)
                                         yield lat, lon, heading_deg
                                 else:
                                     lat = buffer['gga']['lat']
                                     lon = buffer['gga']['lon']
+                                    gga_ts = buffer['gga']['timestamp']
                                     del buffer['gga']
+                                    _diag_yield('last_heading', lat, lon, last_heading, gga_ts, None)
                                     yield lat, lon, last_heading
 
                         elif line_str.startswith(("$GNTHS", "$GPTHS")):
@@ -716,6 +1023,7 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                         elif line_str.startswith(("$GNHPR", "$GPHPR")):
                             heading_info = parse_GNHPR(line_str)
                             if heading_info is not None:
+                                _diag_raw_hpr(rtk_port, line_str, heading_info)
                                 last_heading = heading_info[0]
                                 buffer['ths'] = {
                                     'timestamp': timestamp,
@@ -729,6 +1037,83 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
         except Exception as e:
             logger.error("RTK涓插彛鍏朵粬閿欒: {}".format(e))
         finally:
+            correction_runtime.close()
+
+        time.sleep(1)
+
+
+def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
+    global ser_rtk
+    correction_runtime = get_shared_runtime(logger)
+    last_stale_log_at = 0.0
+
+    while True:
+        ntrip_stop_event = None
+        ntrip_thread = None
+        try:
+            rtk_port = util.findPort('$GN')
+            if not rtk_port:
+                logger.warning("鏈壘鍒癛TK涓插彛锛岀瓑寰呴噸璇?...")
+                time.sleep(1)
+                continue
+
+            with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=0.1) as ser_rtk:
+                logger.warning("RTK涓插彛宸叉墦寮€: {}".format(rtk_port))
+                state = _RtkLatestState(sync_threshold=sync_threshold)
+                configure_rtk_output(ser_rtk)
+                _flush_serial_input(ser_rtk, 'open', rtk_port)
+                ntrip_stop_event, ntrip_thread = _start_ntrip_serial_worker(correction_runtime, ser_rtk)
+
+                while _serial_is_open(ser_rtk):
+                    try:
+                        lines = _read_serial_lines_now(ser_rtk, RTK_DRAIN_MAX_LINES)
+                        if not lines:
+                            time.sleep(0.01)
+                            continue
+
+                        latest_sample, stats = _consume_rtk_nmea_lines(
+                            state,
+                            lines,
+                            port=rtk_port,
+                            correction_runtime=correction_runtime,
+                            log_events=True
+                        )
+
+                        if stats.get('stale'):
+                            now = time.time()
+                            if now - last_stale_log_at >= 1.0:
+                                first_age = stats.get('first_stale_age')
+                                logger.warning(
+                                    "RTK_DIAG stale_nmea skipped port={} count={} first_utc={} first_age={} max_age={:.3f}".format(
+                                        rtk_port,
+                                        stats.get('stale'),
+                                        stats.get('first_stale_utc'),
+                                        "%.3f" % first_age if first_age is not None else "none",
+                                        RTK_NMEA_MAX_AGE_SECONDS
+                                    )
+                                )
+                                last_stale_log_at = now
+
+                        if len(lines) >= RTK_DRAIN_MAX_LINES and _serial_in_waiting(ser_rtk) > 0:
+                            _flush_serial_input(ser_rtk, 'backlog_overflow', rtk_port)
+
+                        if latest_sample is not None:
+                            yield latest_sample[0], latest_sample[1], latest_sample[2]
+                    except Exception as e:
+                        logger.error("璇诲彇RTK鏁版嵁寮傚父: {}".format(e))
+                        break
+        except serial.SerialException as e:
+            logger.error("鎵撳紑RTK涓插彛澶辫触: {}".format(e))
+        except Exception as e:
+            logger.error("RTK涓插彛鍏朵粬閿欒: {}".format(e))
+        finally:
+            if ntrip_stop_event is not None:
+                ntrip_stop_event.set()
+            if ntrip_thread is not None:
+                try:
+                    ntrip_thread.join(1.0)
+                except Exception:
+                    pass
             correction_runtime.close()
 
         time.sleep(1)
