@@ -173,7 +173,7 @@ def createTask(taskName,areaList):
 
         # 初始航向角
         startHeading = float(taskParams.get('heading'))
-        startToChargingPilePointLength = int(taskParams.get('startToChargingPilePointLength'))
+        startToChargingPilePointLength = _task_int(taskParams, 'startToChargingPilePointLength', 0)
         originLat = float(taskParams.get('startLat'))
         originLon = float(taskParams.get('startLon'))
         garageEntryLat = float(taskParams.get('garageEntryLat') or originLat)
@@ -290,7 +290,7 @@ def createTask(taskName,areaList):
             'chargingPileLat':chargingPileLat,            # 充电桩经纬度
             'chargingPileLon':chargingPileLon,
             'startToChargingPilePointLength': startToChargingPilePointLength,
-            'lastTaskBackLength': int(taskParams.get('lastTaskBackLength')),
+            'lastTaskBackLength': _task_int(taskParams, 'lastTaskBackLength', 0),
             'panelAngleX':panelAngleX,
             'panelAngle':panelAngle,
             'gap':int(taskParams.get('gap')),

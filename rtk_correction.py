@@ -10,5 +10,5 @@ def compute_heading_error(target_heading, current_heading):
 
 
 def compute_linear_steering(heading_error, cte, heading_gain=10.0, cte_gain=1000.0):
-    """Legacy linear RTK correction: heading term minus cross-track term."""
-    return float(heading_error) * heading_gain - int(float(cte_gain) * float(cte))
+    """Linear RTK correction with reversed heading and cross-track directions."""
+    return -float(heading_error) * heading_gain + int(float(cte_gain) * float(cte))

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 高鲁棒性 RTK + NTRIP 客户端
@@ -44,11 +44,15 @@ rtcm_last_time = 0          # 最后收到 RTCM 的时间戳
 gga_quality = 0             # 当前定位质量（0=无效, 4=固定）
 
 # ==================== 行缓冲器 ====================
+class NtripDataError(Exception):
+    pass
+
+
 class LineBuffer:
     def __init__(self):
         self.buf = bytearray()
 
-    def feed(self, data: bytes):
+    def feed(self, data):
         self.buf.extend(data)
         lines = []
         while b'\r\n' in self.buf:
@@ -113,7 +117,7 @@ def serial_reader():
             if not stop_event.is_set():
                 logger.exception("串口读取异常")
 
-def parse_mixed_stream(data: bytes):
+def parse_mixed_stream(data):
     """解析 NMEA + RTCM 混合流"""
     global latest_gga, gga_quality, rtcm_last_time
     buffer = bytearray(data)
@@ -194,7 +198,7 @@ def ntrip_forwarder():
                     ntrip_socket.settimeout(1.0)
                     data = ntrip_socket.recv(4096)
                     if not data:
-                        raise ConnectionError("NTRIP 无数据")
+                        raise NtripDataError("NTRIP 无数据")
                     rtk_serial.write(data)
                 except socket.timeout:
                     continue
@@ -221,7 +225,7 @@ def monitor_rtk_status():
         # 状态变化才打印
         if current_quality != last_quality:
             status_map = {0: "无效", 1: "单点", 2: "DGPS", 4: "RTK固定", 5: "RTK浮点"}
-            status = status_map.get(current_quality, f"未知({current_quality})")
+            status = status_map.get(current_quality, "未知({})".format(current_quality))
             logger.info("📍 定位状态更新: %s (quality=%d)", status, current_quality)
             last_quality = current_quality
 
@@ -242,9 +246,17 @@ def main():
         return
 
     # 启动线程
-    threading.Thread(target=serial_reader, daemon=True, name="SerialReader").start()
-    threading.Thread(target=ntrip_forwarder, daemon=True, name="NTRIPForwarder").start()
-    threading.Thread(target=monitor_rtk_status, daemon=True, name="StatusMonitor").start()
+    serial_thread = threading.Thread(target=serial_reader, name="SerialReader")
+    serial_thread.daemon = True
+    serial_thread.start()
+
+    forward_thread = threading.Thread(target=ntrip_forwarder, name="NTRIPForwarder")
+    forward_thread.daemon = True
+    forward_thread.start()
+
+    monitor_thread = threading.Thread(target=monitor_rtk_status, name="StatusMonitor")
+    monitor_thread.daemon = True
+    monitor_thread.start()
 
     logger.info("🚀 RTK + NTRIP 客户端已启动！按 Ctrl+C 退出...")
 

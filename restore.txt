@@ -1,0 +1,112 @@
+            # 在这里根据 action 值执行不同操作，1无限走，2有限
+            if mode == 1 and angle == 0:
+                # 打开清扫
+                switch_on_clean_mode(ser)
+                turn(ser, angle * 10)
+                reset_odometer(ser)
+                goUp(back_len)
+                drivingUp = False
+                redis_cli.set("forwardSpeed", high_speed)
+            elif mode == 1 and angle != 0:
+                turn(ser, angle * 10)
+                reset_odometer(ser)
+                if angle == 180:
+                    pass
+                else:
+                    moveBack(ser, back_len)
+                justMove(ser)
+                logger.info("前进结束")
+                moveBack(ser, back_len)
+            elif mode == 2:
+                turn(ser, angle * 10)
+                reset_odometer(ser)
+                if angle == 180:
+                    pass
+                else:
+                    moveBack(ser, 26)
+                moveDiatance(ser, length)
+            elif mode == 3:
+                turn(ser, angle * 10)
+                moveBack(ser, 26)
+                redis_cli.set("odometer_arrive", "false")
+                reset_odometer(ser)
+                justMove(ser)
+            # 任务完成，从redis list中清除该任务
+            redis_cli.lpop("taskList")
+        else:
+            logger.warn('外部设置停止自动清扫，任务未执行完！')
+            break
+    sendBraking()
+    logger.warn("任务执行结束")
+    redis_cli.set("mission", "complete")
+    redis_cli.set("correct", "false")
+    redis_cli.set('action', 'false')
+    set_current_action('idle')
+    redis_cli.set('curTaskIndex', 0)
+
+    return "1"
+
+
+def startGPS():
+    pass
+    # while True:
+
+    #     try:
+
+    #         ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+
+    #         time.sleep(60)  # 等待串口准备就绪（可选）
+
+    #         line = ser.readline()  # 读取一行数据，直到遇到换行符'\n'
+
+    #         try:
+
+    #             requests.get('http://'+ip+':7899/sendGPS?id='+id+'&gps=' + line.decode().strip())
+
+    #         except requests.exceptions.ConnectionError as e:
+
+    #             print("链接失败")
+
+    #     except serial.serialutil.SerialException as eee:
+
+    #         print("串口链接失败")
+
+    #     finally:
+
+    #         ser.close()
+
+    #         time.sleep(10)
+
+
+def testOpencv():
+    '''
+
+    global cap
+    fourcc = cv2.VideoWriter_fourcc(*'MP4V')
+
+    # out = cv2.VideoWriter('testwrite.mp4', fourcc, 20.0, (1920, 1080), True)
+
+    out = cv2.VideoWriter('testwrite.mp4', fourcc, 20.0, (640, 480), True)
+
+    while (cap.isOpened()):
+        ret, frame = cap.read()
+        if ret == True:
+            cv2.imshow('frame', frame)
+            out.write(frame)
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                break
+        else:
+            break
+
+
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    '''
+
+    center_x = 0
+    center_y = 0
+
+    # file_name = 'D://testPics//WIN_20250417_15_25_29_Pro - Trim - frame at 0m46s.jpg'
+

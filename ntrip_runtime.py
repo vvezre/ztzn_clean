@@ -152,15 +152,16 @@ class NtripCorrectionRuntime(object):
             self._sock = sock
             if not self._connected_once:
                 self.logger.warning(
-                    'NTRIP差分链路已连接: %s:%s/%s',
-                    self.config.host,
-                    self.config.port,
-                    self.config.mountpoint,
+                    'NTRIP connected: %s:%s/%s' % (
+                        self.config.host,
+                        self.config.port,
+                        self.config.mountpoint,
+                    )
                 )
                 self._connected_once = True
         except Exception as exc:
             self.close()
-            self.logger.error('NTRIP连接失败: %s', exc)
+            self.logger.error('NTRIP connect failed: {}'.format(exc))
 
     def _build_request_header(self):
         user_pwd = ('%s:%s' % (self.config.username, self.config.password)).encode('utf-8')

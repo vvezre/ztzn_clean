@@ -63,6 +63,7 @@ class RTKDataManager:
         self.observers = []          # 存储回调函数的列表
         self.lock = threading.RLock()  # 线程安全锁
         self.current_data = None     # RTKData or None
+        self._last_diag_at = 0.0
 
     def register_observer(self, callback):
         """
@@ -111,9 +112,6 @@ class RTKDataManager:
             logger.warning("RTKDataManager is already running.")
             return
 
-        if not self._open_serial():
-            return
-
         self.running = True
         thread = threading.Thread(target=self._serial_reader_loop, name="RTKReader")
         # thread = threading.Thread(target=self._serial_reader_loop2, name="RTKReader")
@@ -152,7 +150,18 @@ class RTKDataManager:
             # rtk_data.lat = lat
             # rtk_data.lon = lon
             rtk_data.heading = heading_deg
+            notify_start = time.time()
             self._notify_observers(rtk_data)
+            notify_ms = (time.time() - notify_start) * 1000.0
+            now = time.time()
+            # RTK_DIAG manager log disabled.
+            if False and (now - self._last_diag_at >= 1.0 or notify_ms > 100.0):
+                logger.warning(
+                    "RTK_DIAG manager raw_lat={} raw_lon={} center_lat={} center_lon={} heading={} notify_ms={:.1f}".format(
+                        lat, lon, rtk_data.lat, rtk_data.lon, heading_deg, notify_ms
+                    )
+                )
+                self._last_diag_at = now
 
     def _serial_reader_loop2(self):
         # ==================== 配置 ====================

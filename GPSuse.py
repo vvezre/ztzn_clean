@@ -103,7 +103,7 @@ def try_connect(port, baudrate):
     try:
         return serial.Serial(port, baudrate, timeout=1)
     except SerialException as e:
-        print(f"[连接失败] 无法打开串口 {port}，原因：{e}")
+        print("[连接失败] 无法打开串口 {}，原因：{}".format(port, e))
         return None
 
 def main():
@@ -125,30 +125,30 @@ def main():
             if line.startswith("$GNGGA"):
                 gps = parse_gngga(line)
                 if gps:
-                    print(f"[GNGGA] Lat: {gps[0]}°, Lon: {gps[1]}°")
+                    print("[GNGGA] Lat: {}°, Lon: {}°".format(gps[0], gps[1]))
 
             elif line.startswith("#UNIHEADINGA"):
                 heading = parse_uniheadinga(line)
                 if heading is not None:
-                    print(f"[UNIHEADINGA] Heading: {heading}°")
+                    print("[UNIHEADINGA] Heading: {}°".format(heading))
 
             elif line.startswith("$GPTHS"):
                 heading = parse_GPTHS(line)
                 if heading is not None:
-                    print(f"[GPTHS] Heading: {heading}°")
+                    print("[GPTHS] Heading: {}°".format(heading))
         except KeyboardInterrupt:
             print("Stopped by user.")
             break
 
         except SerialException as e:
-            print(f"[串口异常] {e}")
+            print("[串口异常] {}".format(e))
             if ser:
                 ser.close()
             ser = None
             time.sleep(1)  # 等待后重新连接
 
         except Exception as e:
-            print(f"Error: {e}")
+            print("Error: {}".format(e))
 
 
 

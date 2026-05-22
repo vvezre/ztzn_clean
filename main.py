@@ -61,6 +61,12 @@ from garage_state import (
     normalize_garage_state,
 )
 from rtk_correction import compute_linear_steering
+from battery_return import should_return_to_charge
+from edge_target_guard import (
+    DEFAULT_EDGE_TARGET_TOLERANCE_M,
+    should_accept_edge_stop,
+    should_recover_from_edge_stop,
+)
 from DynamicCronScheduler import DynamicCronScheduler
 from FixedPositiveChecker import FixedPositiveChecker
 
@@ -73,6 +79,7 @@ from RTKDataManager import RTKDataManager
 
 from mqtt_integration import MQTTIntegration
 from mqtt_vehicle_adapter import VehicleControllerAdapter
+from vision_line_detection import GuidanceBandTracker, find_vertical_bright_band, resolve_guidance_command
 
 app = Flask(__name__)
 CORS(app)
@@ -227,6 +234,12 @@ vehicleType = 'tracklayer'
 drive_thread = None
 global_last_cte = 0.0
 START_POSITION_TOLERANCE_METERS = 2.0
+EDGE_TARGET_TOLERANCE_M = DEFAULT_EDGE_TARGET_TOLERANCE_M
+EDGE_RECOVERY_BACK_CM = 5
+EDGE_RECOVERY_MAX_ATTEMPTS = 3
+EDGE_STOP_ACTION_TARGET = 'target'
+EDGE_STOP_ACTION_RECOVER = 'recover'
+EDGE_STOP_ACTION_ABORT = 'abort'
 global_power_on_guard_sent = False
 BATTERY_SMOOTH_ALPHA = 0.18
 BATTERY_MAX_DROP_PER_SAMPLE = 0.3
@@ -534,6 +547,78 @@ def _distance_to_task_start(task_params):
         return round(float(distance), 3)
     except Exception:
         return None
+
+
+def _distance_to_current_task_target():
+    if not global_cur_taskPoint:
+        return None
+    target_lat = _coerce_float(global_cur_taskPoint.get('endLat'), None)
+    target_lon = _coerce_float(global_cur_taskPoint.get('endLon'), None)
+    if target_lat is None or target_lon is None:
+        return None
+    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
+        return None
+    try:
+        distance, _ = util.get_distance_angle(global_cur_rtk_lat, global_cur_rtk_lon, target_lat, target_lon)
+        return round(float(distance), 3)
+    except Exception:
+        return None
+
+
+def _handle_edge_stop_for_current_task(source):
+    distance_to_target = _distance_to_current_task_target()
+    try:
+        redis_cli.set('edgeDistanceToTargetM', '' if distance_to_target is None else distance_to_target)
+    except Exception:
+        pass
+
+    if should_accept_edge_stop(distance_to_target, EDGE_TARGET_TOLERANCE_M):
+        logger.warn(
+            "edge accepted near task target: source={}, distanceToTarget={}m, tolerance={}m".format(
+                source,
+                distance_to_target,
+                EDGE_TARGET_TOLERANCE_M
+            )
+        )
+        return EDGE_STOP_ACTION_TARGET
+
+    if should_recover_from_edge_stop(distance_to_target, EDGE_TARGET_TOLERANCE_M):
+        logger.warn(
+            "edge abnormal but target is still far; recover and continue: source={}, distanceToTarget={}m, tolerance={}m".format(
+                source,
+                distance_to_target,
+                EDGE_TARGET_TOLERANCE_M
+            )
+        )
+        try:
+            redis_cli.set('edgeStopReason', 'far_from_task_target_recover')
+        except Exception:
+            pass
+        return EDGE_STOP_ACTION_RECOVER
+
+    reason = 'target_distance_unavailable' if distance_to_target is None else 'far_from_task_target'
+    logger.warn(
+        "edge rejected; stop current task: source={}, reason={}, distanceToTarget={}m, tolerance={}m".format(
+            source,
+            reason,
+            distance_to_target,
+            EDGE_TARGET_TOLERANCE_M
+        )
+    )
+    try:
+        redis_cli.set('edgeStopReason', reason)
+    except Exception:
+        pass
+    doParking()
+    return EDGE_STOP_ACTION_ABORT
+
+
+def _recover_from_abnormal_edge(source):
+    logger.warn("edge recovery: source={}, brake and back {}cm".format(source, EDGE_RECOVERY_BACK_CM))
+    sendBraking()
+    moveBack(ser, EDGE_RECOVERY_BACK_CM)
+    reset_odometer(ser)
+    return True
 
 
 def _build_runtime_detail(extra=None):
@@ -922,6 +1007,27 @@ def _apply_lower_machine_status_frame(data, source):
     status = byte_at(1)
     if status is not None:
         global_get_status = status
+        
+        current_g_state = get_garage_state()
+        # 1. 硬件强装充电
+        if status == 5 and current_g_state != GARAGE_STATE_DOCKED_BY_COMMAND:
+            logger.warn("嗅探到下位机硬件处于充电状态(5)，自动恢复 garageState 为 docked_by_command")
+            set_garage_state(GARAGE_STATE_DOCKED_BY_COMMAND, 'auto_recovered_by_hardware_status')
+            
+        # 2. 如果当前状态处于未知
+        elif current_g_state == GARAGE_STATE_UNKNOWN:
+            if global_cur_rtk_lat is None:
+                # 按照业务确认：没有信号默认视为在舱内（光伏板遮挡）。如果误判，可通过人工页面强制修改
+                logger.warn("无 RTK 信号，推断为在光伏舱内，恢复为 docked_by_command (若误判请人工确认)")
+                set_garage_state(GARAGE_STATE_DOCKED_BY_COMMAND, 'auto_recovered_by_no_signal')
+            else:
+                logger.warn("嗅探到有 RTK 固定解，推断为舱外 outside")
+                set_garage_state(GARAGE_STATE_OUTSIDE, 'auto_recovered_by_rtk_fix')
+                
+        # 3. 如果已经被判定为舱内(或未判定)，但突然有了 RTK 信号，强制转为舱外 (解决开机搜星慢导致的误判)
+        elif current_g_state == GARAGE_STATE_DOCKED_BY_COMMAND and global_cur_rtk_lat is not None:
+            logger.warn("在判定为舱内的状态下获取到了 RTK 信号，自动修正推断为舱外 outside")
+            set_garage_state(GARAGE_STATE_OUTSIDE, 'auto_corrected_by_rtk_fix')
 
     power_on = byte_at(2)
     if power_on is not None:
@@ -1921,15 +2027,24 @@ def _open_camera_capture():
             candidate.release()
         except Exception:
             pass
-    logger.error("no camera source is available")
-    return cv2.VideoCapture(0)
+    logger.warning("no camera source is available")
+    return None
 
 
 cap = _open_camera_capture()
-camera_http_lock = threading.Lock()
+camera_http_lock = threading.RLock()
 latest_camera_frame = None
 latest_camera_frame_at = 0.0
 latest_camera_frame_lock = threading.Lock()
+last_camera_open_attempt_at = 0.0
+GUIDANCE_CROP_TOP = 70
+GUIDANCE_CROP_BOTTOM = 430
+GUIDANCE_CROP_LEFT = 60
+GUIDANCE_CROP_RIGHT = 580
+ENTER_GARAGE_FIXED_SPEED = 90
+ENTER_GARAGE_MAX_WAIT_SECONDS = 45
+VISUAL_ENTER_GARAGE_SPEED = ENTER_GARAGE_FIXED_SPEED
+VISUAL_ENTER_GARAGE_FINAL_LENGTH = 80
 drivingUp = False
 # command = bytearray(17)
 command = bytearray(19)
@@ -2057,7 +2172,67 @@ def enterGarage():
 
 
 # 车库
-def _run_visual_enter_garage(max_wait_seconds=None):
+def _get_task_enter_garage_length():
+    taskParams = redis_cli.hgetall("taskParams")
+    try:
+        return int(float(taskParams.get('startToChargingPilePointLength') or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _run_fixed_enter_garage(travel_length_cm, max_wait_seconds=ENTER_GARAGE_MAX_WAIT_SECONDS,
+                            forward_speed=ENTER_GARAGE_FIXED_SPEED):
+    global global_get_moveFinish
+    try:
+        travel_length_cm = int(float(travel_length_cm))
+    except (TypeError, ValueError):
+        travel_length_cm = 0
+
+    if travel_length_cm <= 0:
+        logger.warn("入舱点到充电桩距离未配置，无法固定距离进舱: {}".format(travel_length_cm))
+        return False
+
+    redis_cli.set("enterGarage", "false")
+    redis_cli.set("detectQrcode", "false")
+    redis_cli.set("correct", "false")
+    redis_cli.set('action', 'true')
+    reset_odometer(ser)
+    global_get_moveFinish = 0
+
+    preBuildCommand()
+    reSetStatus(ser)
+    setBrushSpeed(0)
+    setStatus(1)
+    setPowerOn(1)
+    setHWstatus(0, 0, 0, 0, 0)
+    setXSpeed(forward_speed)
+    setZSpeed(0)
+    setDistance(travel_length_cm)
+    command[17] = tem_listener(command, 17)
+    logger.warn("固定距离低速进舱: distance={}cm, speed={}".format(travel_length_cm, forward_speed))
+    duplicateWriteCmd(ser, command)
+
+    wait_start_time = time.time()
+    distance_arrived = False
+    while redis_cli.get('action') == 'true':
+        if getDistanceArrive() == "1":
+            distance_arrived = True
+            logger.warn("固定距离进舱达到 {}cm".format(travel_length_cm))
+            break
+        if max_wait_seconds and (time.time() - wait_start_time) >= max_wait_seconds:
+            logger.warn("固定距离进舱等待超时({}s)，主动结束".format(max_wait_seconds))
+            break
+        time.sleep(0.25)
+
+    sendBraking()
+    redis_cli.set("enterGarage", "false")
+    redis_cli.set("correct", "false")
+    redis_cli.set('action', 'false')
+    return distance_arrived
+
+
+def _run_visual_enter_garage(max_wait_seconds=None, travel_length_cm=None, forward_speed=VISUAL_ENTER_GARAGE_SPEED):
+    global global_get_moveFinish
     redis_cli.set("enterGarage", "true")
 
     redis_cli.set("detectQrcode", "false")
@@ -2065,6 +2240,10 @@ def _run_visual_enter_garage(max_wait_seconds=None):
     redis_cli.set("correct", "true")
 
     redis_cli.set('action', 'true')
+
+    if travel_length_cm is not None:
+        reset_odometer(ser)
+        global_get_moveFinish = 0
 
     preBuildCommand()
 
@@ -2078,14 +2257,26 @@ def _run_visual_enter_garage(max_wait_seconds=None):
 
     setHWstatus(0, 0, 0, 0, 0)
 
-    setXSpeed(90)
+    setXSpeed(forward_speed)
+    setZSpeed(0)
+    if travel_length_cm is None:
+        setDistance(0)
+    else:
+        travel_length_cm = max(int(travel_length_cm), 0)
+        setDistance(travel_length_cm)
+        logger.warn("视觉入舱直行距离限制 {}cm，速度={}".format(travel_length_cm, forward_speed))
 
     command[17] = tem_listener(command, 17)
 
     duplicateWriteCmd(ser, command)
 
+    distance_arrived = False
     wait_start_time = time.time()
     while redis_cli.get('enterGarage') == 'true':
+        if travel_length_cm is not None and getDistanceArrive() == "1":
+            distance_arrived = True
+            logger.warn("视觉入舱直行达到 {}cm，结束本次入舱".format(travel_length_cm))
+            break
         if max_wait_seconds and (time.time() - wait_start_time) >= max_wait_seconds:
             logger.warn("视觉入舱等待超时({}s)，主动结束本次入舱".format(max_wait_seconds))
             break
@@ -2103,8 +2294,14 @@ def _run_visual_enter_garage(max_wait_seconds=None):
 
 
 def enter_garage_task():
-    detected = _run_visual_enter_garage(max_wait_seconds=30)
-    logger.warn("视觉入舱结束，detectQrcode={}".format("true" if detected else "false"))
+    redis_cli.set('mission', 'working')
+    travel_length_cm = _get_task_enter_garage_length()
+    arrived = _run_fixed_enter_garage(travel_length_cm)
+    redis_cli.set('mission', 'complete')
+    logger.warn("手动固定距离进舱结束，distance={}cm, arrived={}".format(
+        travel_length_cm,
+        "true" if arrived else "false"
+    ))
 
 
 def writeCmd(ser, command):
@@ -2181,6 +2378,8 @@ def _read_camera_frame_for_http():
         try:
             if cap is None or not cap.isOpened():
                 stopThenStart()
+                if cap is None or not cap.isOpened():
+                    return None
             for _ in range(3):
                 ret, frame = cap.read()
                 if ret and frame is not None:
@@ -2198,6 +2397,18 @@ def _encode_camera_frame(frame):
     if not ok:
         return None
     return encoded.tostring()
+
+
+def _crop_guidance_region(image):
+    if image is None:
+        return image
+
+    height, width = image.shape[:2]
+    top = max(0, min(GUIDANCE_CROP_TOP, height - 1))
+    bottom = max(top + 1, min(GUIDANCE_CROP_BOTTOM, height))
+    left = max(0, min(GUIDANCE_CROP_LEFT, width - 1))
+    right = max(left + 1, min(GUIDANCE_CROP_RIGHT, width))
+    return image[top:bottom, left:right]
 
 
 @app.route("/vehicle/cameraSnapshot", methods=['GET'])
@@ -2225,8 +2436,48 @@ def _camera_stream_generator():
 
 @app.route("/vehicle/cameraStream", methods=['GET'])
 def cameraStream():
+    if _get_recent_camera_frame() is None:
+        with camera_http_lock:
+            if cap is None or not cap.isOpened():
+                stopThenStart()
+                if cap is None or not cap.isOpened():
+                    return jsonify({'success': False, 'message': 'camera frame unavailable'}), 503
     return Response(_camera_stream_generator(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def _get_task_exit_back_length():
+    taskParams = redis_cli.hgetall("taskParams")
+    try:
+        return int(float(taskParams.get('startToChargingPilePointLength') or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _run_exit_garage_by_back_length(backLength, reason_prefix):
+    global global_status
+    try:
+        backLength = int(float(backLength))
+    except (TypeError, ValueError):
+        backLength = 0
+
+    if backLength <= 0:
+        logger.warn("出库距离未配置，无法按任务距离出库: {}".format(backLength))
+        set_garage_state(GARAGE_STATE_UNKNOWN, reason_prefix + '_back_length_not_configured')
+        return False
+
+    set_garage_state(GARAGE_STATE_EXITING, reason_prefix + '_started')
+    global_status = 'move back'
+    redis_cli.set("correct", "false")
+    redis_cli.set("enterGarage", "false")
+    reset_odometer(ser)
+    redis_cli.set("mission", "working")
+    moveBack(ser, backLength)
+    if str(getDistanceArrive()) == "0":
+        set_garage_state(GARAGE_STATE_UNKNOWN, reason_prefix + '_not_arrived')
+        return False
+    set_garage_state(GARAGE_STATE_OUTSIDE, reason_prefix + '_completed')
+    return True
 
 
 @app.route("/vehicle/exitGarage", methods=['GET'])
@@ -2243,47 +2494,16 @@ def exitGarage():
 
 def exit_garage_task():
     set_current_action('exit_garage')
-    set_garage_state(GARAGE_STATE_EXITING, 'manual_exit_garage_started')
     redis_cli.set("reverse", "false")
-
-    redis_cli.set("correct", "true")
-
-    redis_cli.set('action', 'true')
-
-    redis_cli.set('mission', 'working')
-
-    exit_uav(ser)
-
-    justMove(ser)
-
-    reSetStatus(ser)
-
-    moveBack(ser)
-
-    turn(ser, 180 * 10)
-
-    moveDiatance(ser, 110)
-
-    moveBack(ser)
-
-    turn(ser, 0)
-
-    path = redis_cli.get(PATH_PLANNING_KEY)
-
-    if LEFT_PATH_PLANNING == path:
-
-        redis_cli.set(PATH_PLANNING_KEY, RIGHT_PATH_PLANNING)
-
-    else:
-
-        redis_cli.set(PATH_PLANNING_KEY, LEFT_PATH_PLANNING)
-
-    redis_cli.set('action', 'false')
-
     redis_cli.set("correct", "false")
-
+    redis_cli.set('action', 'true')
+    redis_cli.set('mission', 'working')
+    backLength = _get_task_exit_back_length()
+    logger.warn("手动出库按任务距离后退: {}cm".format(backLength))
+    _run_exit_garage_by_back_length(backLength, 'manual_exit_garage')
+    redis_cli.set('action', 'false')
+    redis_cli.set("correct", "false")
     redis_cli.set('mission', 'complete')
-    set_garage_state(GARAGE_STATE_OUTSIDE, 'manual_exit_garage_completed')
     set_current_action('idle')
 
 
@@ -2473,7 +2693,15 @@ def justMoveByRTK(distance, head_target):
     # 如果global_go = 1，则说明直行未结束
     while global_go == 1:
         # 表示到边了
-        if getEdge() == 0:
+        if getEdge() == "0":
+            edge_action = _handle_edge_stop_for_current_task('justMoveByRTK')
+            if edge_action == EDGE_STOP_ACTION_TARGET:
+                global_go = 0
+                break
+            if edge_action == EDGE_STOP_ACTION_RECOVER:
+                _recover_from_abnormal_edge('justMoveByRTK')
+                goCommand(100)
+                continue
             break
         endTime = time.time()
         # 获取时间间隔
@@ -2514,7 +2742,7 @@ def returnToPointByRTKThread():
     garageEntryLat = float(taskParams.get('garageEntryLat') or originLat)
     garageEntryLon = float(taskParams.get('garageEntryLon') or originLon)
     start_angle_rtk = float(taskParams.get('heading'))
-    backLength = int(taskParams.get('startToChargingPilePointLength'))
+    backLength = _coerce_int(taskParams.get('startToChargingPilePointLength'), 0)
     # 返回路线任务
     routes = []
     # 判断当前到那个任务了
@@ -2767,8 +2995,8 @@ def autoDriveByRTKThread():
     # 获取当前坐标点，判断当前点位是否在充电桩中
     chargingPileLat = float(taskParams.get('chargingPileLat'))
     chargingPileLon = float(taskParams.get('chargingPileLon'))
-    backLength = int(taskParams.get('startToChargingPilePointLength'))
-    lastTaskBackLength = int(taskParams.get('lastTaskBackLength'))
+    backLength = _coerce_int(taskParams.get('startToChargingPilePointLength'), 0)
+    lastTaskBackLength = _coerce_int(taskParams.get('lastTaskBackLength'), 0)
     # 起始点经纬度
     global_originLat = float(taskParams.get('startLat'))
     global_originLon = float(taskParams.get('startLon'))
@@ -2980,18 +3208,11 @@ def intoGarage(backLength):
     set_garage_state(GARAGE_STATE_ENTERING, 'into_garage_started')
     reset_odometer(ser)
     turn(ser, 180 * 10)
-    # 最后一段强制走视觉对接：先预靠近，再进入视觉闭环。
-    visual_final_length = 80
-    pre_approach_len = max(int(backLength) - visual_final_length, 0)
-    if pre_approach_len > 0:
-        logger.warn("自动回舱预靠近 {}cm，最后 {}cm 使用视觉对接".format(pre_approach_len, int(backLength) - pre_approach_len))
-        goByLength(ser, pre_approach_len, 100)
-    else:
-        logger.warn("自动回舱直接进入视觉对接，backLength={}cm".format(backLength))
-
-    detected = _run_visual_enter_garage(max_wait_seconds=25)
-    logger.warn("自动回舱视觉对接结束，detectQrcode={}".format("true" if detected else "false"))
-    # 关闭视觉纠偏
+    arrived = _run_fixed_enter_garage(backLength)
+    logger.warn("自动固定距离进舱结束，distance={}cm, arrived={}".format(
+        backLength,
+        "true" if arrived else "false"
+    ))
     redis_cli.set("correct", "false")
     # 充电命令
     reset_odometer(ser)
@@ -3004,17 +3225,7 @@ def intoGarage(backLength):
     # moveByRTK(chargingPileLat, chargingPileLon, (originHeading + 180) % 360)
 # 出充电桩
 def goOutGarage(backLength):
-    global global_status
-    set_garage_state(GARAGE_STATE_EXITING, 'auto_drive_exit_garage_started')
-    global_status = 'move back'
-    reset_odometer(ser)
-    redis_cli.set("mission", "working")
-    moveBack(ser, backLength)
-    # 如果后退没有到达，则不往下执行
-    if str(getDistanceArrive()) == "0":
-        set_garage_state(GARAGE_STATE_UNKNOWN, 'auto_drive_exit_garage_not_arrived')
-        return
-    set_garage_state(GARAGE_STATE_OUTSIDE, 'auto_drive_exit_garage_completed')
+    return _run_exit_garage_by_back_length(backLength, 'auto_drive_exit_garage')
 
 @app.route("/vehicle/intoGarage", methods=['GET'])
 def intoGarage_api():
@@ -3377,9 +3588,17 @@ def selectParams():
 # 保存参数接口
 @app.route('/vehicle/saveParams', methods=['POST'])
 def saveParams():
-    data = request.get_json()
+    data = request.get_json() or {}
     garageEntryLat = data.get('garageEntryLat') or data['startLat']
     garageEntryLon = data.get('garageEntryLon') or data['startLon']
+    last_task_back_length = _coerce_int(
+        data.get('lastTaskBackLength', redis_cli.hget('taskParams', 'lastTaskBackLength')),
+        0,
+    )
+    start_to_charging_pile_point_length = _coerce_int(
+        data.get('startToChargingPilePointLength', redis_cli.hget('taskParams', 'startToChargingPilePointLength')),
+        0,
+    )
     redis_cli.hset('taskParams', "goBackLen", data['goBackLen'])
     redis_cli.hset('taskParams', "goLeftOrRightBackLen", data['goLeftOrRightBackLen'])
     redis_cli.hset('taskParams', "turnBackLen", data['turnBackLen'])
@@ -3400,13 +3619,13 @@ def saveParams():
     redis_cli.hset('taskParams', "chargingPileLat", data['chargingPileLat'])
     redis_cli.hset('taskParams', "chargingPileLon", data['chargingPileLon'])
     # 入舱点到充电桩距离
-    redis_cli.hset('taskParams', "startToChargingPilePointLength", data['startToChargingPilePointLength'])
+    redis_cli.hset('taskParams', "startToChargingPilePointLength", start_to_charging_pile_point_length)
     # 最后一个任务结束后的后退距离
-    redis_cli.hset('taskParams', "lastTaskBackLength", data['lastTaskBackLength'])
+    redis_cli.hset('taskParams', "lastTaskBackLength", last_task_back_length)
     current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
     if current_task_name:
-        _update_json_file_field(current_task_name + '.json', 'lastTaskBackLength', data['lastTaskBackLength'])
-    _update_json_file_field('config.json', 'lastTaskBackLength', data['lastTaskBackLength'])
+        _update_json_file_field(current_task_name + '.json', 'lastTaskBackLength', last_task_back_length)
+    _update_json_file_field('config.json', 'lastTaskBackLength', last_task_back_length)
 
     redis_cli.hset('taskParams', "panelAngle", data['panelAngle'])
     redis_cli.hset('taskParams', "panelAngleX", data['panelAngleX'])
@@ -3675,7 +3894,15 @@ def moveByRTK(endLat, endLon,heading=0):
     # 如果global_go = 1，则说明直行未结束
     while global_go == 1:
         # 表示到边了
-        if getEdge() == 0:
+        if getEdge() == "0":
+            edge_action = _handle_edge_stop_for_current_task('moveByRTK')
+            if edge_action == EDGE_STOP_ACTION_TARGET:
+                global_go = 0
+                break
+            if edge_action == EDGE_STOP_ACTION_RECOVER:
+                _recover_from_abnormal_edge('moveByRTK')
+                goCommand(100)
+                continue
             break
         # 如果时间过长也需要停止
         if global_interval > 30:
@@ -3711,6 +3938,15 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
             break
         # 表示到边了
         if getEdge() == '0':
+            edge_action = _handle_edge_stop_for_current_task('pointToPointByRTK')
+            if edge_action == EDGE_STOP_ACTION_TARGET:
+                global_go = 0
+                break
+            if edge_action == EDGE_STOP_ACTION_RECOVER:
+                _recover_from_abnormal_edge('pointToPointByRTK')
+                goCommand(speed)
+                continue
+            result = 0
             global_go = 0
             break
         endTime = time.time()
@@ -3735,7 +3971,15 @@ def observer_rtk_data(data):
     heading = float(data.heading)
     # preBuildCommand()
     setHeadingToVehicle(heading)
+    write_start = time.time()
     duplicateWriteCmd(ser, command)
+    write_ms = (time.time() - write_start) * 1000.0
+    now = time.time()
+    last_diag_at = getattr(observer_rtk_data, '_last_diag_at', 0.0)
+    # RTK_DIAG lower_machine_heading log disabled.
+    if False and (now - last_diag_at >= 1.0 or write_ms > 100.0):
+        logger.warning("RTK_DIAG lower_machine_heading heading={} write_ms={:.1f}".format(heading, write_ms))
+        observer_rtk_data._last_diag_at = now
     time.sleep(0.01)
 
 # zSpeed_pid = PID(Kp=2,Ki=0.5,Kd=1,setpoint=0)
@@ -3757,7 +4001,19 @@ def observer_go_correct(data):
     if data.heading is not None:
         global_cur_rtk_heading = data.heading
         global_cur_rtk_heading_at = time.time()
+    sync_start = time.time()
     sync_current_location(data.lat, data.lon, data.heading)
+    sync_ms = (time.time() - sync_start) * 1000.0
+    now = time.time()
+    last_diag_at = getattr(observer_go_correct, '_last_diag_at', 0.0)
+    # RTK_DIAG redis_update log disabled.
+    if False and (now - last_diag_at >= 1.0 or sync_ms > 100.0):
+        logger.warning(
+            "RTK_DIAG redis_update lat={} lon={} heading={} heading_at={} sync_ms={:.1f} global_go={}".format(
+                data.lat, data.lon, data.heading, global_cur_rtk_heading_at, sync_ms, global_go
+            )
+        )
+        observer_go_correct._last_diag_at = now
     # global_go=1表示直行启动
     if global_go == 1:
         if data.heading is None:
@@ -4054,6 +4310,72 @@ def normalize_visual_line_angle(angle_deg):
     while angle <= -90.0:
         angle += 180.0
     return angle
+
+
+def _detect_guidance_line(image, center_x, allow_lsd=True):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    bright_band = find_vertical_bright_band(
+        gray,
+        center_x,
+        min_band_width=14,
+        min_band_height=max(120, int(image.shape[0] * 0.45)),
+        min_column_ratio=0.28,
+        max_vertical_angle=45.0
+    )
+    if bright_band is not None:
+        return {
+            'offset': bright_band['center_x'] - center_x,
+            'angle': bright_band['angle'],
+            'mode': 'bright_band',
+            'width': bright_band['width'],
+        }
+
+    if not allow_lsd:
+        return None
+
+    lsd = cv2.createLineSegmentDetector(0)
+    dlines = lsd.detect(gray)
+    line = None
+    selected_length = 0.0
+    line_angle = 0.0
+
+    if not (dlines[0] is None):
+        for dline in dlines[0]:
+            x0 = int(round(dline[0][0]))
+            y0 = int(round(dline[0][1]))
+            x1 = int(round(dline[0][2]))
+            y1 = int(round(dline[0][3]))
+
+            vertical_span = abs(y1 - y0)
+            if vertical_span <= 90:
+                continue
+
+            dx = x1 - x0
+            dy = y1 - y0
+            length = math.hypot(dx, dy)
+            if length < 130:
+                continue
+
+            vertical_angle = math.degrees(math.atan2(abs(dx), abs(dy))) if abs(dy) >= 1e-5 else 90
+            if vertical_angle > 25:
+                continue
+
+            xmid = (x1 + x0) / 2.0
+            offset = xmid - center_x
+            if line is None or abs(offset) < abs(line) or (abs(offset) == abs(line) and length > selected_length):
+                line = offset
+                selected_length = length
+                line_angle = calculate_angle(x0, y0, x1, y1)
+
+    if line is None:
+        return None
+
+    return {
+        'offset': line,
+        'angle': line_angle,
+        'mode': 'lsd',
+        'width': 0,
+    }
 
 
 def is_vertical_line(x0, y0, x1, y1, max_angle=MAX_ANGLE):
@@ -4938,19 +5260,21 @@ def reSetStatus(ser):
 def stopThenStart():
     global cap
     global global_status
-    if cap is not None:
-        for _ in range(20):
+    global last_camera_open_attempt_at
+    with camera_http_lock:
+        now = time.time()
+        if now - last_camera_open_attempt_at < 3.0:
+            return
+        last_camera_open_attempt_at = now
+        if cap is not None:
             try:
                 cap.release()
-                time.sleep(0.1)
-                if cap is None:
-                    print("成功退出视频")
-                    global_status = "成功退出视频"
-                    break
-            except Exception as e:
-                print("释放失败，重试")
+                global_status = "成功退出视频"
+            except Exception:
                 global_status = "释放失败，重试"
-    cap = _open_camera_capture()
+        cap = _open_camera_capture()
+        if cap is None:
+            global_status = "no camera source is available"
 
 
 def justMove(ser, arriveable=False):
@@ -5084,6 +5408,18 @@ def goByLength(ser, length, speed=100):
         return 0
 
 
+def _send_distance_move_command(length, speed):
+    reSetStatus(ser)
+    setStatus(2)
+    setPowerOn(1)
+    setHWstatus(0, 0, 0, 0, 0)
+    setXSpeed(speed)
+    setDistance(length)
+    command[17] = tem_listener(command, 17)
+    logger.warn(' '.join(format(x, '02x') for x in command))
+    duplicateWriteCmd(ser, command)
+
+
 def moveDiatance(ser, length, speed=100):
     logger.warn("向前移动{}cm".format(length))
     logger.warn(redis_cli.get("mission"))
@@ -5105,7 +5441,26 @@ def moveDiatance(ser, length, speed=100):
     duplicateWriteCmd(ser, command)
 
     # 这里开始判断路径和到边,1能走，0不行
-    while getEdge() == "1" and getDistanceArrive() == "0" and redis_cli.get("mission") == "working":
+    edge_accepted = False
+    edge_recovery_attempts = 0
+    while getDistanceArrive() == "0" and redis_cli.get("mission") == "working":
+        if getEdge() != "1":
+            edge_action = _handle_edge_stop_for_current_task('moveDiatance')
+            if edge_action == EDGE_STOP_ACTION_TARGET:
+                edge_accepted = True
+                break
+            if edge_action == EDGE_STOP_ACTION_RECOVER and edge_recovery_attempts < EDGE_RECOVERY_MAX_ATTEMPTS:
+                edge_recovery_attempts += 1
+                _recover_from_abnormal_edge('moveDiatance')
+                _send_distance_move_command(length, speed)
+                continue
+            if edge_action == EDGE_STOP_ACTION_RECOVER:
+                logger.warn("edge recovery exceeded max attempts: source=moveDiatance, attempts={}".format(
+                    edge_recovery_attempts
+                ))
+                doParking()
+                return 0
+            return 0
         if global_go == 0:
             break
         if redis_cli.get("mission") == "complete":
@@ -5114,7 +5469,7 @@ def moveDiatance(ser, length, speed=100):
         # global_status = "keep walking"
         time.sleep(0.25)
     time.sleep(0.5)
-    if getDistanceArrive() == "1":
+    if edge_accepted or getDistanceArrive() == "1":
         global_status = "到达"
         print("到达")
         return 1
@@ -5670,7 +6025,9 @@ def doClean(tmpTaskList, goon=False):
                         global_go = 1
                     # redis_cli.set("correct","true")
                     global_go = 1
-                    moveDiatance(ser, length, 250)
+                    if not moveDiatance(ser, length, 250):
+                        logger.warn("mode2 moveDiatance failed; stop current task without deleting taskList")
+                        return 0
                     global_go = 0
                     if voltage <= voltageWarn:
                         parking()
@@ -5785,7 +6142,9 @@ def doCleanByRTK(tmpTaskList, goon=False):
                         moveBack(ser, turn_back_len)
                     # 这个标记，表示是否向下位机发送纠偏指令的信号，1：表示正在直行，需要纠偏；0：表示不是直行，不需要纠偏
                     # global_go = 1
-                    moveDiatance(ser, length, 250)
+                    if not moveDiatance(ser, length, 250):
+                        logger.warn("mode2 moveDiatance failed; stop current task without deleting taskList")
+                        return 0
                     # global_go = 0
                     if voltage <= voltageWarn:
                         parking()
@@ -5868,7 +6227,9 @@ def starttt():
                     pass
                 else:
                     moveBack(ser, 26)
-                moveDiatance(ser, length)
+                if not moveDiatance(ser, length):
+                    logger.warn("mode2 moveDiatance failed; stop current task without deleting taskList")
+                    break
             elif mode == 3:
                 turn(ser, angle * 10)
                 moveBack(ser, 26)
@@ -6277,17 +6638,22 @@ def startOpencv():
     center_y = 0
 
     while True:
-        ret, image = cap.read()
+        with camera_http_lock:
+            if cap is None or not cap.isOpened():
+                ret = False
+                image = None
+            else:
+                ret, image = cap.read()
         if not ret:
             logger.error('无法读取视频流或文件结束')
             stopThenStart()
-            time.sleep(0.2)
+            time.sleep(2)
             continue
         else:
             _remember_camera_frame(image)
             height, width = image.shape[:2]
             logger.info('图片高度: %d, 宽度: %d', height, width)
-            image = image[100:380, 125:515]
+            image = _crop_guidance_region(image)
             height, width = image.shape[:2]
             center_x = width // 2
             center_y = height // 2
@@ -6302,9 +6668,18 @@ def startOpencv():
     upper1 = np.array([10, 255, 255])
     lower2 = np.array([170, 140, 140])
     upper2 = np.array([180, 255, 255])
+    guidance_tracking = False
+    guidance_band_tracker = GuidanceBandTracker(
+        max_abs_offset=60,
+        max_offset_jump=25,
+        max_width_change=8,
+        min_stable_frames=3,
+    )
     while True:
         try:
             if "false" == redis_cli.get("correct"):
+                guidance_tracking = False
+                guidance_band_tracker.reset()
                 time.sleep(0.1)
                 continue
 
@@ -6315,8 +6690,10 @@ def startOpencv():
                 continue
 
             _remember_camera_frame(image)
-            image = image[100:380, 125:515]
+            image = _crop_guidance_region(image)
             image = cv2.blur(image, (5, 5))
+            enter_garage_mode = redis_cli.get("enterGarage") == "true"
+            guidance_line = _detect_guidance_line(image, center_x, allow_lsd=False)
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             lsd = cv2.createLineSegmentDetector(0)
             dlines = lsd.detect(gray)
@@ -6335,15 +6712,15 @@ def startOpencv():
                     y1 = int(round(dline[0][3]))
 
                     vertical_span = abs(y1 - y0)
-                    if vertical_span <= 70:
+                    if vertical_span <= 90:
                         continue
                     dx = x1 - x0
                     dy = y1 - y0
                     length = math.hypot(dx, dy)
-                    if length < 100:
+                    if length < 130:
                         continue
                     vertical_angle = math.degrees(math.atan2(abs(dx), abs(dy))) if abs(dy) >= 1e-5 else 90
-                    if vertical_angle > 35:
+                    if vertical_angle > 25:
                         continue
 
                     xmid = (x1 + x0) / 2
@@ -6356,6 +6733,33 @@ def startOpencv():
                         f_y1 = y1
                         selected_length = length
                         line_angle = calculate_angle(x0, y0, x1, y1)
+            if guidance_line is not None:
+                raw_guidance_line = guidance_line
+                guidance_line = guidance_band_tracker.update(raw_guidance_line)
+                if guidance_line is None:
+                    logger.info(
+                        'bright_band rejected: offset=%.1f, width=%s',
+                        raw_guidance_line.get('offset'),
+                        raw_guidance_line.get('width')
+                    )
+                    line = None
+                    line_angle = 0
+                if guidance_line is not None:
+                    line = guidance_line['offset']
+                    line_angle = guidance_line['angle']
+                    logger.info(
+                        'visual guidance using %s correction: offset=%.1f, angle=%.1f, width=%s',
+                        guidance_line.get('mode'),
+                        line,
+                        line_angle,
+                        guidance_line.get('width')
+                    )
+            else:
+                guidance_band_tracker.reset()
+                line = None
+                line_angle = 0
+            guidance_decision = resolve_guidance_command(line, line_angle, guidance_tracking)
+            guidance_tracking = guidance_decision['tracking']
             if line is None:
                 logger.info("没有找到线")
                 line = 0
@@ -6366,10 +6770,15 @@ def startOpencv():
                 # 存储角度
                 redis_cli.set("angle", int(line_angle))
             # 小车直行时，角度大于10度，就操作下面逻辑
-            if line_angle > 10:
+            if guidance_decision['mode'] == 'no_detection':
+                logger.info('visual guidance no detection; keep straight without z command')
+            elif guidance_decision['mode'] == 'tracking_lost':
+                logger.info('visual guidance tracking lost; send one zero z command')
+            if abs(line_angle) > 10:
                 line = -line_angle * 2
-            setZSpeed(line)
-            duplicateWriteCmd(ser, command)
+            if guidance_decision['send']:
+                setZSpeed(guidance_decision['z_speed'])
+                duplicateWriteCmd(ser, command)
 
             if redis_cli.get("enterGarage") == "true":
                 hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -6446,8 +6855,14 @@ def varifyGps():
         pass
 # 判断是否需要回充电桩
 def isNeedReturnCharging():
-    length = 0
+    voltage = redis_cli.get("voltage")
+    need_return = should_return_to_charge(voltage)
+    logger.info("low battery return check: voltage={}, threshold=10, need_return={}".format(voltage, need_return))
+    if not need_return:
+        return False
+
     if None == global_cur_rtk_lat:
+        logger.warning("low battery return skipped: RTK position unavailable")
         return False
 
     # 判断当前到那个任务了
@@ -6455,39 +6870,9 @@ def isNeedReturnCharging():
     json_next_item = redis_cli.lindex('taskList', 1)
 
     if json_item == None or json_next_item == None:
+        logger.warning("low battery return skipped: taskList needs current and next task")
         return False
-    next_item = json.loads(json_next_item)
-    item = json.loads(json_item)
-
-    if item['angle'] == 90:
-        startX = item['startX']
-        startY = item['startY']
-        dis,heading = util.get_distance_angle(global_cur_rtk_lat,global_cur_rtk_lon,item['startLat'],item['startLon'])
-        length = dis + startX + startY
-    elif item['angle'] == 180 and next_item['angle'] == 270:
-        endX = item['endX']
-        endY = item['endY']
-        length = item['length'] + endX + endY
-    elif item['angle'] == 180 and next_item['angle'] == 90:
-        startX = item['startX']
-        startY = item['startY']
-        length = startX + startY
-    elif item['angle'] == 270:
-        dis, heading = util.get_distance_angle(global_cur_rtk_lat, global_cur_rtk_lon, item['endLat'], item['endLon'])
-        startX = item['startX']
-        startY = item['startY']
-        length = dis + startX + startY
-    # 获取电量值
-    voltage = int(redis_cli.get("voltage"))
-    length = int(length)
-    # 假设1个电量可以跑1m
-    # 剩余电量可以跑
-    voltage_dis = voltage * 50
-    logger.info("电量距离：{},到充电桩距离:{}".format(voltage_dis,length))
-    # 如果返回距离大于等于电池剩余电量距离，则需要返回充电桩
-    if length >= voltage_dis:
-        return True
-    return False
+    return True
 
 
 def listenerVoltage():
@@ -6495,8 +6880,8 @@ def listenerVoltage():
 
     while True:
         # 如果voltageLisener为1表示开启电池监听
-        if redis_cli.get('voltageListener') == '1':
-            voltage = int(redis_cli.get("voltage"))
+        if redis_cli.get('voltageListener') != '0':
+            voltage = redis_cli.get("voltage")
             logger.info("status={},voltage={}".format(global_status,voltage))
             # 当小车状态不是返回充电桩时并且需要返回充电桩充电时,就立即停止小车，并返回充电桩充电
             if global_status != 'goCharging' and isNeedReturnCharging() and redis_cli.llen('taskList') != 0:
@@ -6509,7 +6894,7 @@ def listenerVoltage():
                     thread.start()
 
             # 当电量大于93时并且有未完成的任务，则继续清扫未完成的任务
-            if voltage >= 90 and redis_cli.llen('taskList') != 0:
+            if _coerce_int(voltage, 0) >= 90 and redis_cli.llen('taskList') != 0:
                 # 状态等于工作状态或者不等于从充电桩后退的状态，就可以启动
                 if global_status != 'working':
                     if drive_thread is None or not drive_thread.is_alive():
@@ -6531,8 +6916,8 @@ def listenerRTK():
 
         rtk_manager = RTKDataManager(rtk_port, baudrate=115200)
         # 注册多个观察者
-        rtk_manager.register_observer(observer_rtk_data)
         rtk_manager.register_observer(observer_go_correct)
+        rtk_manager.register_observer(observer_rtk_data)
         # 实时计算到充电桩位置
         # rtk_manager.register_observer(observer_to_chargingPile)
         # 启动
@@ -6655,8 +7040,11 @@ def updateCron():
 def main():
     # if not varifyGps():
     #     return
-    thread = threading.Thread(target=startOpencv)
-    thread.start()
+    if cap is not None and cap.isOpened():
+        thread = threading.Thread(target=startOpencv)
+        thread.start()
+    else:
+        logger.warning("camera unavailable; skip startOpencv thread")
 
     listener_thread = threading.Thread(target=listenerSlavePort)
     listener_thread.start()
@@ -6671,7 +7059,7 @@ def main():
 
     # 电池管理，监控电池电量，获取已经跑了的里程数
     listenerVoltageThread = threading.Thread(target=listenerVoltage)
-    # listenerVoltageThread.start()
+    listenerVoltageThread.start()
 
     # 调用Ntrip2Uart2主要方法
     # Ntrip2Uart2.main()
