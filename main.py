@@ -2202,7 +2202,7 @@ def _run_fixed_enter_garage(travel_length_cm, max_wait_seconds=ENTER_GARAGE_MAX_
     preBuildCommand()
     reSetStatus(ser)
     setBrushSpeed(0)
-    setStatus(1)
+    setStatus(2)
     setPowerOn(1)
     setHWstatus(0, 0, 0, 0, 0)
     setXSpeed(forward_speed)

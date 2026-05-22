@@ -14,10 +14,13 @@ def read_main():
 
 
 def function_body(source, name):
-    match = re.search(r"^def %s\(.*?\):\n" % re.escape(name), source, re.M)
+    match = re.search(r"^def %s\(" % re.escape(name), source, re.M)
     if not match:
         raise AssertionError("function %s not found" % name)
-    start = match.end()
+    signature_end = source.find(":\n", match.end())
+    if signature_end < 0:
+        raise AssertionError("function %s signature end not found" % name)
+    start = signature_end + 2
     next_match = re.search(r"^def [A-Za-z_][A-Za-z0-9_]*\(.*?\):\n", source[start:], re.M)
     end = start + next_match.start() if next_match else len(source)
     return source[start:end]
@@ -43,6 +46,12 @@ class FixedGarageMotionTest(unittest.TestCase):
 
         self.assertIn("_run_fixed_enter_garage(backLength)", body)
         self.assertNotIn("_run_visual_enter_garage", body)
+
+    def test_fixed_enter_uses_distance_mode(self):
+        body = function_body(read_main(), "_run_fixed_enter_garage")
+
+        self.assertIn("setStatus(2)", body)
+        self.assertNotIn("setStatus(1)", body)
 
     def test_auto_exit_uses_fixed_distance_helper(self):
         body = function_body(read_main(), "goOutGarage")
