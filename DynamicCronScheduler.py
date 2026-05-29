@@ -14,6 +14,13 @@ class DynamicCronScheduler(object):
         self.scheduler.start()
         self._lock = threading.Lock()
 
+    def _build_trigger(self, cron):
+        parts = str(cron).split()
+        if len(parts) == 6:
+            logging.warning("Cron has 6 fields, drop seconds field: %s", cron)
+            cron = " ".join(parts[1:])
+        return CronTrigger.from_crontab(cron, timezone=self.timezone)
+
     def add_job(self, job_id, func, cron):
         """
         添加任务（Python 2 兼容）
@@ -21,7 +28,7 @@ class DynamicCronScheduler(object):
         :param func: callable
         :param cron: str, e.g., "*/5 * * * *"
         """
-        trigger = CronTrigger.from_crontab(cron, timezone=self.timezone)
+        trigger = self._build_trigger(cron)
         with self._lock:
             self.scheduler.add_job(
                 func=func,
@@ -33,7 +40,7 @@ class DynamicCronScheduler(object):
 
     def update_cron(self, job_id, new_cron):
         """动态更新 cron"""
-        trigger = CronTrigger.from_crontab(new_cron, timezone=self.timezone)
+        trigger = self._build_trigger(new_cron)
         with self._lock:
             self.scheduler.reschedule_job(job_id=job_id, trigger=trigger)
         logging.info("Updated job %s to cron: %s", job_id, new_cron)

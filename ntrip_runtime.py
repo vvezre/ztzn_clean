@@ -223,3 +223,16 @@ def get_shared_runtime(logger):
             _shared_runtime = NtripCorrectionRuntime(NtripConfig.from_sources(), logger)
         return _shared_runtime
 
+
+def reset_shared_runtime(logger=None):
+    """Close and clear the shared NTRIP runtime so updated config is reloaded."""
+    global _shared_runtime
+    with _shared_runtime_lock:
+        if _shared_runtime is not None:
+            try:
+                _shared_runtime.close()
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning('NTRIP runtime close failed: {}'.format(exc))
+            _shared_runtime = None
+

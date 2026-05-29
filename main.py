@@ -61,7 +61,7 @@ from garage_state import (
     normalize_garage_state,
 )
 from rtk_correction import compute_linear_steering
-from battery_return import should_return_to_charge
+from battery_return import LOW_BATTERY_RETURN_THRESHOLD, should_return_to_charge
 from edge_target_guard import (
     DEFAULT_EDGE_TARGET_TOLERANCE_M,
     should_accept_edge_stop,
@@ -73,7 +73,7 @@ from FixedPositiveChecker import FixedPositiveChecker
 from flask_cors import CORS
 
 from MqttClient import MqttClient
-from ntrip_runtime import get_shared_runtime
+from ntrip_runtime import get_shared_runtime, reset_shared_runtime
 from RTKDataManager import RTKDataManager
 # from pid import PID
 
@@ -97,6 +97,13 @@ PATH_PLANNING_KEY = "pathPlanning"
 LEFT_PATH_PLANNING = "left_path_planning"
 
 RIGHT_PATH_PLANNING = "right_path_planning"
+
+LOOP_AUTO_CLEAN_ENABLED_KEY = "loopAutoCleanEnabled"
+LOOP_AUTO_CLEAN_RUNNING_KEY = "loopAutoCleanRunning"
+LOOP_AUTO_CLEAN_CYCLE_KEY = "loopAutoCleanCycle"
+LOOP_AUTO_CLEAN_STOP_REASON_KEY = "loopAutoCleanStopReason"
+LOOP_AUTO_CLEAN_UPDATED_AT_KEY = "loopAutoCleanUpdatedAt"
+LOOP_AUTO_CLEAN_SLEEP_SECONDS = 2.0
 
 high_speed = 350
 
@@ -133,6 +140,11 @@ redis_cli.set('faultState', '')
 redis_cli.set('startCheckReady', 'false')
 redis_cli.set('startCheckReason', '')
 redis_cli.set('runtimeDetail', '{}')
+redis_cli.set(LOOP_AUTO_CLEAN_ENABLED_KEY, 'false')
+redis_cli.set(LOOP_AUTO_CLEAN_RUNNING_KEY, 'false')
+redis_cli.set(LOOP_AUTO_CLEAN_CYCLE_KEY, 0)
+redis_cli.set(LOOP_AUTO_CLEAN_STOP_REASON_KEY, '')
+redis_cli.set(LOOP_AUTO_CLEAN_UPDATED_AT_KEY, int(time.time()))
 redis_cli.delete('battery')
 redis_cli.delete('batteryPercent')
 redis_cli.delete('batteryRaw')
@@ -144,6 +156,7 @@ redis_cli.delete('packVoltageReportAt')
 redis_cli.set('bootSafeStopAt', int(time.time()))
 
 TASK_SWITCH_LOCK = threading.RLock()
+CONFIG_FILE_LOCK = threading.RLock()
 
 LOWER_MACHINE_OPEN_LOCK = threading.RLock()
 LOWER_MACHINE_READ_LOCK = threading.RLock()
@@ -232,6 +245,8 @@ vehicleId = '0001'
 vehicleType = 'tracklayer'
 # 自动清扫线程
 drive_thread = None
+loop_auto_clean_thread = None
+LOOP_AUTO_CLEAN_LOCK = threading.RLock()
 global_last_cte = 0.0
 START_POSITION_TOLERANCE_METERS = 2.0
 EDGE_TARGET_TOLERANCE_M = DEFAULT_EDGE_TARGET_TOLERANCE_M
@@ -347,6 +362,65 @@ def _update_json_file_field(file_name, field_name, field_value):
         return False
 
 
+def _load_json_config(file_name, default_value=None):
+    if default_value is None:
+        default_value = {}
+    if not os.path.exists(file_name):
+        return dict(default_value)
+    try:
+        with open(file_name, 'r') as fp:
+            data = json.load(fp)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        logger.warning("load json config failed: file={}, error={}".format(file_name, e))
+    return dict(default_value)
+
+
+def _write_json_config(file_name, data):
+    tmp_name = file_name + '.tmp'
+    with open(tmp_name, 'w') as fp:
+        fp.write(json.dumps(data, indent=2, sort_keys=True))
+    if os.path.exists(file_name):
+        backup_name = file_name + '.bak_' + time.strftime('%Y%m%d_%H%M%S')
+        try:
+            os.rename(file_name, backup_name)
+        except Exception as e:
+            logger.warning("backup json config failed: file={}, error={}".format(file_name, e))
+    os.rename(tmp_name, file_name)
+
+
+def _request_payload():
+    return request.get_json(silent=True) or request.form.to_dict() or request.args.to_dict()
+
+
+def _mask_secret(value):
+    if value in (None, ''):
+        return ''
+    return '******'
+
+
+def _masked_ntrip_config(data):
+    payload = dict(data or {})
+    payload['password'] = '******' if payload.get('password') else ''
+    return payload
+
+
+def _normalize_product_model(value):
+    value = str(value or '').strip()
+    if value and not value.startswith('-'):
+        value = '-' + value
+    return value
+
+
+def _normalize_product_id(value):
+    return str(value or '').strip()
+
+
+def _device_no(product_model, product_id):
+    return _normalize_product_model(product_model) + _normalize_product_id(product_id)
+
+
 def _coerce_bool(value, default=False):
     value = _decode_redis_value(value)
     if value is None:
@@ -362,6 +436,54 @@ def _coerce_bool(value, default=False):
         return int(text) != 0
     except Exception:
         return default
+
+
+def _set_loop_auto_clean_state(enabled=None, running=None, stop_reason=None, cycle=None):
+    try:
+        if enabled is not None:
+            redis_cli.set(LOOP_AUTO_CLEAN_ENABLED_KEY, 'true' if enabled else 'false')
+        if running is not None:
+            redis_cli.set(LOOP_AUTO_CLEAN_RUNNING_KEY, 'true' if running else 'false')
+        if stop_reason is not None:
+            redis_cli.set(LOOP_AUTO_CLEAN_STOP_REASON_KEY, stop_reason)
+        if cycle is not None:
+            redis_cli.set(LOOP_AUTO_CLEAN_CYCLE_KEY, cycle)
+        redis_cli.set(LOOP_AUTO_CLEAN_UPDATED_AT_KEY, int(time.time()))
+    except Exception as e:
+        logger.warning("设置循环清扫状态失败: {}".format(str(e)))
+
+
+def _is_loop_auto_clean_enabled():
+    return _coerce_bool(redis_cli.get(LOOP_AUTO_CLEAN_ENABLED_KEY), False)
+
+
+def _disable_loop_auto_clean(reason):
+    _set_loop_auto_clean_state(enabled=False, stop_reason=reason or 'stopped')
+
+
+def _is_loop_low_battery():
+    voltage = redis_cli.get("voltage")
+    need_return = should_return_to_charge(voltage)
+    if need_return:
+        logger.warning("循环清扫低电停止: voltage={}, threshold={}".format(
+            voltage,
+            LOW_BATTERY_RETURN_THRESHOLD
+        ))
+    return need_return
+
+
+def _get_loop_auto_clean_status():
+    voltage = redis_cli.get("voltage")
+    return {
+        'enabled': _is_loop_auto_clean_enabled(),
+        'running': _coerce_bool(redis_cli.get(LOOP_AUTO_CLEAN_RUNNING_KEY), False),
+        'cycle': _coerce_int(redis_cli.get(LOOP_AUTO_CLEAN_CYCLE_KEY), 0),
+        'stop_reason': _decode_redis_value(redis_cli.get(LOOP_AUTO_CLEAN_STOP_REASON_KEY)) or '',
+        'updated_at': _coerce_int(redis_cli.get(LOOP_AUTO_CLEAN_UPDATED_AT_KEY), 0),
+        'voltage': _coerce_float(voltage, None),
+        'threshold': LOW_BATTERY_RETURN_THRESHOLD,
+        'need_return': should_return_to_charge(voltage),
+    }
 
 
 def _set_redis_value(key, value):
@@ -1323,6 +1445,7 @@ def _build_vehicle_status_payload():
     garage_state = get_garage_state()
     battery_percent = _clamp_percent(redis_cli.get('batteryPercent'))
     battery_percent_raw = _clamp_percent(redis_cli.get('batteryPercentRaw'))
+    loop_auto_clean = _get_loop_auto_clean_status()
 
     detail = _build_runtime_detail({
         'lastCommandMessage': _decode_redis_value(redis_cli.get('lastCommandMessage')) or '',
@@ -1361,9 +1484,11 @@ def _build_vehicle_status_payload():
         'enter_garage': _coerce_bool(redis_cli.get('enterGarage'), False),
         'garage_state': garage_state,
         'garage_state_updated_at': _coerce_int(redis_cli.get(GARAGE_STATE_UPDATED_AT_KEY), 0),
+        'loop_auto_clean': loop_auto_clean,
+        'loopAutoClean': loop_auto_clean,
         'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'],
         'supported_params': ['taskName', 'speed', 'tracking', 'path'],
-        'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state', 'garage_state'],
+        'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state', 'garage_state', 'loop_auto_clean'],
         'detail': detail,
         'timestamp': int(time.time()),
     }
@@ -2143,6 +2268,104 @@ def getInfo():
     })
 
 
+@app.route("/vehicle/getNtripConfig", methods=['GET'])
+def getNtripConfig():
+    with CONFIG_FILE_LOCK:
+        config = _load_json_config('ntrip_config.json')
+    return jsonify({
+        'success': True,
+        'code': 200,
+        'data': _masked_ntrip_config(config),
+    })
+
+
+@app.route("/vehicle/updateNtripConfig", methods=['POST'])
+def updateNtripConfig():
+    payload = _request_payload()
+    allowed_fields = (
+        'enabled',
+        'host',
+        'port',
+        'mountpoint',
+        'username',
+        'password',
+        'gga_interval_seconds',
+        'connect_timeout_seconds',
+        'reconnect_interval_seconds',
+    )
+    with CONFIG_FILE_LOCK:
+        config = _load_json_config('ntrip_config.json')
+        for field in allowed_fields:
+            if field in payload:
+                if field == 'enabled':
+                    config[field] = _coerce_bool(payload.get(field), False)
+                elif field == 'port':
+                    config[field] = _coerce_int(payload.get(field), 0)
+                elif field in ('gga_interval_seconds', 'connect_timeout_seconds', 'reconnect_interval_seconds'):
+                    config[field] = _coerce_float(payload.get(field), 5.0)
+                else:
+                    config[field] = str(payload.get(field) or '').strip()
+        _write_json_config('ntrip_config.json', config)
+    reset_shared_runtime(logger)
+    return jsonify({
+        'success': True,
+        'code': 200,
+        'message': 'ntrip config updated',
+        'data': _masked_ntrip_config(config),
+    })
+
+
+@app.route("/vehicle/getDeviceConfig", methods=['GET'])
+def getDeviceConfig():
+    with CONFIG_FILE_LOCK:
+        config = _load_json_config('mqtt_config.json')
+    mqtt_config = config.get('mqtt', {})
+    topics = config.get('topics', {})
+    product_model = mqtt_config.get('product_model', '')
+    product_id = mqtt_config.get('product_id', '')
+    return jsonify({
+        'success': True,
+        'code': 200,
+        'data': {
+            'product_model': product_model,
+            'product_id': product_id,
+            'device_no': _device_no(product_model, product_id),
+            'subscribe': topics.get('subscribe', ''),
+            'publish': topics.get('publish', ''),
+        },
+    })
+
+
+@app.route("/vehicle/updateDeviceConfig", methods=['POST'])
+def updateDeviceConfig():
+    payload = _request_payload()
+    with CONFIG_FILE_LOCK:
+        config = _load_json_config('mqtt_config.json')
+        mqtt_config = config.setdefault('mqtt', {})
+        product_model = _normalize_product_model(payload.get('product_model', mqtt_config.get('product_model', '')))
+        product_id = _normalize_product_id(payload.get('product_id', mqtt_config.get('product_id', '')))
+        mqtt_config['product_model'] = product_model
+        mqtt_config['product_id'] = product_id
+        device_no = _device_no(product_model, product_id)
+        topics = config.setdefault('topics', {})
+        topics['subscribe'] = 'RAILCAR/S/' + device_no
+        topics['publish'] = 'RAILCAR/R/' + device_no
+        _write_json_config('mqtt_config.json', config)
+    return jsonify({
+        'success': True,
+        'code': 200,
+        'message': 'device config updated',
+        'restart_required': True,
+        'data': {
+            'product_model': product_model,
+            'product_id': product_id,
+            'device_no': device_no,
+            'subscribe': topics.get('subscribe', ''),
+            'publish': topics.get('publish', ''),
+        },
+    })
+
+
 @app.route("/vehicle/getTaskPath", methods=['GET'])
 def getTaskPath():
     payload = _build_task_path_payload()
@@ -2422,28 +2645,12 @@ def cameraSnapshot():
     return Response(payload, mimetype='image/jpeg')
 
 
-def _camera_stream_generator():
-    while True:
-        frame = _read_camera_frame_for_http()
-        if frame is None:
-            time.sleep(0.2)
-            continue
-        payload = _encode_camera_frame(frame)
-        if payload is not None:
-            yield '--frame\r\nContent-Type: image/jpeg\r\n\r\n' + payload + '\r\n'
-        time.sleep(0.1)
-
-
 @app.route("/vehicle/cameraStream", methods=['GET'])
 def cameraStream():
-    if _get_recent_camera_frame() is None:
-        with camera_http_lock:
-            if cap is None or not cap.isOpened():
-                stopThenStart()
-                if cap is None or not cap.isOpened():
-                    return jsonify({'success': False, 'message': 'camera frame unavailable'}), 503
-    return Response(_camera_stream_generator(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return jsonify({
+        'success': False,
+        'message': 'video stream disabled',
+    }), 410
 
 
 def _get_task_exit_back_length():
@@ -2523,6 +2730,14 @@ def getVehicleInfo():
 
     if voltage != None:
         metadata['voltage'] = voltage
+
+    loop_status = _get_loop_auto_clean_status()
+    metadata['loopAutoClean'] = loop_status
+    metadata['loop_auto_clean'] = loop_status
+    metadata['loopAutoCleanEnabled'] = loop_status.get('enabled')
+    metadata['loopAutoCleanRunning'] = loop_status.get('running')
+    metadata['loopAutoCleanCycle'] = loop_status.get('cycle')
+    metadata['loopAutoCleanStopReason'] = loop_status.get('stop_reason')
 
     return json.dumps(metadata)
 
@@ -3288,6 +3503,121 @@ def auto_driving():
     })
 
 
+def loopAutoDriveThread():
+    global loop_auto_clean_thread, global_doCleanThreadStop
+    logger.warn("循环自动清扫线程启动")
+    _set_loop_auto_clean_state(running=True, stop_reason='running')
+    set_current_action('loop_auto_drive')
+    try:
+        while _is_loop_auto_clean_enabled():
+            if _is_loop_low_battery() or isNeedReturnCharging():
+                _disable_loop_auto_clean('low_battery_return')
+                break
+
+            validation = _validate_auto_drive_request()
+            if not validation.get('success'):
+                _mark_runtime_blocked(
+                    validation.get('faultState', 'LOOP_AUTO_DRIVE_BLOCKED'),
+                    validation.get('message', '循环清扫启动条件未通过'),
+                    validation.get('data')
+                )
+                _disable_loop_auto_clean(validation.get('faultState', 'start_blocked'))
+                break
+
+            cycle = redis_cli.incr(LOOP_AUTO_CLEAN_CYCLE_KEY)
+            redis_cli.set(LOOP_AUTO_CLEAN_UPDATED_AT_KEY, int(time.time()))
+            logger.warn("循环自动清扫第{}轮开始".format(cycle))
+            global_doCleanThreadStop = 0
+            autoDriveByRTKThread()
+
+            if _is_loop_low_battery() or isNeedReturnCharging():
+                _disable_loop_auto_clean('low_battery_return')
+                break
+            if global_doCleanThreadStop != 0:
+                _disable_loop_auto_clean('task_interrupted')
+                break
+            if not _is_loop_auto_clean_enabled():
+                break
+
+            logger.warn("循环自动清扫第{}轮结束，等待下一轮".format(cycle))
+            slept = 0.0
+            while slept < LOOP_AUTO_CLEAN_SLEEP_SECONDS and _is_loop_auto_clean_enabled():
+                if _is_loop_low_battery():
+                    _disable_loop_auto_clean('low_battery_return')
+                    break
+                time.sleep(0.5)
+                slept += 0.5
+    except Exception as e:
+        logger.error("循环自动清扫异常: {}".format(str(e)))
+        logger.error(traceback.format_exc())
+        _mark_runtime_blocked('LOOP_AUTO_DRIVE_ERROR', '循环自动清扫异常: {}'.format(str(e)))
+        _disable_loop_auto_clean('error')
+    finally:
+        _set_loop_auto_clean_state(running=False)
+        with LOOP_AUTO_CLEAN_LOCK:
+            if loop_auto_clean_thread is threading.current_thread():
+                loop_auto_clean_thread = None
+        logger.warn("循环自动清扫线程结束: {}".format(
+            _decode_redis_value(redis_cli.get(LOOP_AUTO_CLEAN_STOP_REASON_KEY)) or ''
+        ))
+
+
+@app.route("/vehicle/startLoopAutoDrive", methods=['GET'])
+def start_loop_auto_drive():
+    global loop_auto_clean_thread, global_doCleanThreadStop
+    redis_cli.set("reverse", "false")
+    with LOOP_AUTO_CLEAN_LOCK:
+        if loop_auto_clean_thread is not None and loop_auto_clean_thread.is_alive():
+            return jsonify({
+                'success': True,
+                'message': '循环自动清扫已在运行',
+                'data': _get_loop_auto_clean_status(),
+            })
+
+        validation = _validate_auto_drive_request()
+        if not validation.get('success'):
+            _mark_runtime_blocked(
+                validation.get('faultState', 'LOOP_AUTO_DRIVE_BLOCKED'),
+                validation.get('message', '循环清扫启动条件未通过'),
+                validation.get('data')
+            )
+            return jsonify(validation)
+
+        global_doCleanThreadStop = 0
+        _set_loop_auto_clean_state(enabled=True, running=False, stop_reason='', cycle=0)
+        _mark_runtime_ready('循环自动清扫启动条件通过，正在创建循环线程', validation.get('data'))
+        loop_auto_clean_thread = threading.Thread(target=loopAutoDriveThread)
+        loop_auto_clean_thread.daemon = True
+        loop_auto_clean_thread.start()
+
+    return jsonify({
+        'success': True,
+        'message': '循环自动清扫已启动，将持续执行到低电回充',
+        'data': _get_loop_auto_clean_status(),
+    })
+
+
+@app.route("/vehicle/stopLoopAutoDrive", methods=['GET'])
+def stop_loop_auto_drive():
+    global global_status
+    _disable_loop_auto_clean('manual_stop')
+    doParking()
+    global_status = 'active'
+    return jsonify({
+        'success': True,
+        'message': '循环自动清扫已停止',
+        'data': _get_loop_auto_clean_status(),
+    })
+
+
+@app.route("/vehicle/getLoopAutoDriveStatus", methods=['GET'])
+def get_loop_auto_drive_status():
+    return jsonify({
+        'success': True,
+        'data': _get_loop_auto_clean_status(),
+    })
+
+
 # 根据RTK获取航向角偏差值
 def getAngleByRTK():
     heading = float(redis_cli.hget('taskParams','heading'))
@@ -3523,6 +3853,7 @@ def correctByRTK():
 @app.route("/vehicle/parking", methods=['GET'])
 def parking():
     global global_pointToPoint_flag,global_go,global_status
+    _disable_loop_auto_clean('manual_parking')
     set_current_action('parking')
     redis_cli.set("ultraSonic", "false")
     redis_cli.set("mission", "complete")
@@ -6670,7 +7001,7 @@ def startOpencv():
     upper2 = np.array([180, 255, 255])
     guidance_tracking = False
     guidance_band_tracker = GuidanceBandTracker(
-        max_abs_offset=60,
+        max_abs_offset=None,
         max_offset_jump=25,
         max_width_change=8,
         min_stable_frames=3,
@@ -6876,7 +7207,7 @@ def isNeedReturnCharging():
 
 
 def listenerVoltage():
-    global global_status,drive_thread
+    global global_status,drive_thread,global_doCleanThreadStop
 
     while True:
         # 如果voltageLisener为1表示开启电池监听
@@ -6886,6 +7217,8 @@ def listenerVoltage():
             # 当小车状态不是返回充电桩时并且需要返回充电桩充电时,就立即停止小车，并返回充电桩充电
             if global_status != 'goCharging' and isNeedReturnCharging() and redis_cli.llen('taskList') != 0:
                 # global_status = 'goCharging'
+                _disable_loop_auto_clean('low_battery_return')
+                global_doCleanThreadStop = 1
                 doParking()
                 # if global_status == 'goCharging':
                 if global_doCleanThreadStop == 1:

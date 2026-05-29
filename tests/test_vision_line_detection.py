@@ -91,6 +91,22 @@ class VisionLineDetectionTest(unittest.TestCase):
 
         self.assertIsNone(accepted)
 
+    def test_band_tracker_accepts_far_offset_when_center_limit_disabled(self):
+        tracker = GuidanceBandTracker(
+            max_abs_offset=None,
+            max_offset_jump=20,
+            max_width_change=8,
+            min_stable_frames=3,
+        )
+        line = {"mode": "bright_band", "offset": 120, "angle": 0, "width": 30}
+
+        self.assertIsNone(tracker.update(line))
+        self.assertIsNone(tracker.update(dict(line, offset=121, width=31)))
+        accepted = tracker.update(dict(line, offset=119, width=30))
+
+        self.assertIsNotNone(accepted)
+        self.assertEqual(accepted["offset"], 119)
+
     def test_band_tracker_rejects_large_offset_jump(self):
         tracker = GuidanceBandTracker(
             max_abs_offset=100,

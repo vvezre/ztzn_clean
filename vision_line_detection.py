@@ -58,12 +58,12 @@ def resolve_guidance_command(line_offset, line_angle, was_tracking=False):
 class GuidanceBandTracker(object):
     def __init__(
         self,
-        max_abs_offset=60,
+        max_abs_offset=None,
         max_offset_jump=25,
         max_width_change=8,
         min_stable_frames=3,
     ):
-        self.max_abs_offset = float(max_abs_offset)
+        self.max_abs_offset = None if max_abs_offset is None else float(max_abs_offset)
         self.max_offset_jump = float(max_offset_jump)
         self.max_width_change = float(max_width_change)
         self.min_stable_frames = int(min_stable_frames)
@@ -88,7 +88,7 @@ class GuidanceBandTracker(object):
             self.reset()
             return None
 
-        if abs(offset) > self.max_abs_offset:
+        if self.max_abs_offset is not None and abs(offset) > self.max_abs_offset:
             self.reset()
             return None
 
