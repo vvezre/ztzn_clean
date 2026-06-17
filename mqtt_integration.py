@@ -14,6 +14,8 @@ from AppLogger import logger
 from mqtt_client import MQTTClient, get_mqtt_client
 from mqtt_handler import MQTTCommandHandler
 
+DEFAULT_TASK_ORIGIN_TOLERANCE_METERS = 0.02
+
 
 class MQTTIntegration:
     """MQTT 集成类"""
@@ -89,18 +91,26 @@ class MQTTIntegration:
 
         try:
             current_location = self._get_redis_hash('currentLocation')
+            task_params = self._get_redis_hash('taskParams')
             lat = self._coerce_value(current_location.get('lat'), float, None)
             lon = self._coerce_value(current_location.get('lon'), float, None)
+            heading = self._coerce_value(current_location.get('heading'), float, None)
             local_x, local_y = self._compute_local_xy_cm(lat, lon)
+            task_origin_fields = self._build_task_origin_status_fields(task_params, current_location)
             status = {
                 'speed': self._get_redis_value('forwardSpeed', int, 0),
                 'brush_speed': self._get_redis_value('brushSpeed', int, 0),
                 'voltage': self._get_redis_value('packVoltage', float, None),
                 'lat': lat,
                 'lon': lon,
-                'heading': self._coerce_value(current_location.get('heading'), float, None),
+                'heading': heading,
                 'local_x': local_x,
                 'local_y': local_y,
+                'taskOrigin': task_origin_fields.get('taskOrigin'),
+                'currentLocation': task_origin_fields.get('currentLocation'),
+                'distanceToTaskOriginM': task_origin_fields.get('distanceToTaskOriginM'),
+                'taskOriginToleranceM': task_origin_fields.get('taskOriginToleranceM'),
+                'isAtTaskOrigin': task_origin_fields.get('isAtTaskOrigin'),
                 'status': self._build_status(),
                 'action': self._build_action(),
                 'task_name': self._build_task_name(),
@@ -128,7 +138,7 @@ class MQTTIntegration:
                 'supported_status_fields': [
                     'control_state', 'health_state', 'fault_state', 'mission_state', 'detail'
                 ],
-                'detail': self._build_detail(),
+                'detail': self._build_detail(task_params=task_params, current_location=current_location),
                 'timestamp': int(time.time())
             }
 
@@ -210,6 +220,56 @@ class MQTTIntegration:
             return max(0, int(time.time()) - int(report_at))
         except Exception:
             return None
+
+    def _get_task_origin_tolerance_m(self, detail=None):
+        detail = detail or self._read_runtime_detail()
+        tolerance = detail.get('taskOriginToleranceM')
+        if tolerance is None:
+            tolerance = detail.get('startToleranceM')
+        return self._coerce_value(tolerance, float, DEFAULT_TASK_ORIGIN_TOLERANCE_METERS)
+
+    def _distance_to_task_origin(self, task_params=None, current_location=None):
+        task_params = task_params or self._get_redis_hash('taskParams')
+        current_location = current_location or self._get_redis_hash('currentLocation')
+        start_lat = self._coerce_value(task_params.get('startLat'), float, None)
+        start_lon = self._coerce_value(task_params.get('startLon'), float, None)
+        current_lat = self._coerce_value(current_location.get('lat'), float, None)
+        current_lon = self._coerce_value(current_location.get('lon'), float, None)
+        if start_lat is None or start_lon is None or current_lat is None or current_lon is None:
+            return None
+        try:
+            distance, _ = util.get_distance_angle(current_lat, current_lon, start_lat, start_lon)
+            return round(float(distance), 3)
+        except Exception:
+            return None
+
+    def _build_task_origin_status_fields(self, task_params=None, current_location=None, tolerance_m=None):
+        task_params = task_params or self._get_redis_hash('taskParams')
+        current_location = current_location or self._get_redis_hash('currentLocation')
+        start_lat = self._coerce_value(task_params.get('startLat'), float, None)
+        start_lon = self._coerce_value(task_params.get('startLon'), float, None)
+        current_lat = self._coerce_value(current_location.get('lat'), float, None)
+        current_lon = self._coerce_value(current_location.get('lon'), float, None)
+        current_heading = self._coerce_value(current_location.get('heading'), float, None)
+        tolerance = tolerance_m if tolerance_m is not None else self._get_task_origin_tolerance_m()
+        distance_to_start = self._distance_to_task_origin(task_params, current_location)
+        at_origin = None
+        if distance_to_start is not None:
+            at_origin = distance_to_start <= tolerance
+        return {
+            'taskOrigin': {
+                'lat': start_lat,
+                'lon': start_lon,
+            },
+            'currentLocation': {
+                'lat': current_lat,
+                'lon': current_lon,
+                'heading': current_heading,
+            },
+            'distanceToTaskOriginM': distance_to_start,
+            'taskOriginToleranceM': tolerance,
+            'isAtTaskOrigin': at_origin,
+        }
 
     def _bool_value(self, value):
         value = self._decode_value(value)
@@ -304,8 +364,15 @@ class MQTTIntegration:
             return health_state
         return 'OK'
 
-    def _build_detail(self):
+    def _build_detail(self, task_params=None, current_location=None):
         detail = self._read_runtime_detail()
+        task_params = task_params or self._get_redis_hash('taskParams')
+        current_location = current_location or self._get_redis_hash('currentLocation')
+        current_lat = self._coerce_value(current_location.get('lat'), float, None)
+        current_lon = self._coerce_value(current_location.get('lon'), float, None)
+        current_heading = self._coerce_value(current_location.get('heading'), float, None)
+        task_origin_tolerance = self._get_task_origin_tolerance_m(detail)
+        distance_to_start = self._distance_to_task_origin(task_params, current_location)
         battery_percent = self._get_redis_value('batteryPercent', float, None)
         detail['lastCommandMessage'] = self._get_redis_value('lastCommandMessage', str, '')
         detail['startCheckReady'] = self._get_redis_value('startCheckReady', self._bool_value, False)
@@ -318,6 +385,16 @@ class MQTTIntegration:
         detail['hardwareState'] = self._get_optional_int('hardwareState')
         detail['hardwareReportAt'] = self._get_optional_int('hardwareReportAt')
         detail['hardwareReportAgeSec'] = self._hardware_report_age_sec()
+        detail['distanceToStartM'] = distance_to_start
+        detail['distanceToTaskOriginM'] = distance_to_start
+        detail['startToleranceM'] = task_origin_tolerance
+        detail['taskOriginToleranceM'] = task_origin_tolerance
+        detail['currentLat'] = current_lat
+        detail['currentLon'] = current_lon
+        detail['currentHeading'] = current_heading
+        detail['taskStartLat'] = self._coerce_value(task_params.get('startLat'), float, None)
+        detail['taskStartLon'] = self._coerce_value(task_params.get('startLon'), float, None)
+        detail['originHeading'] = self._coerce_value(task_params.get('originHeading'), float, None)
         return detail
 
     def _build_task_name(self):
