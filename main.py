@@ -2725,6 +2725,7 @@ def getVehicleInfo():
     metadata['loopAutoCleanRunning'] = loop_status.get('running')
     metadata['loopAutoCleanCycle'] = loop_status.get('cycle')
     metadata['loopAutoCleanStopReason'] = loop_status.get('stop_reason')
+    metadata.update(_build_task_origin_status_fields())
 
     return json.dumps(metadata)
 
@@ -3106,6 +3107,14 @@ def converterXY(task):
 # 通过RTK自动清扫
 @app.route("/vehicle/autoDriveByRTK", methods=['GET'])
 def autoDriveByRTK():
+    validation = _validate_auto_drive_request()
+    if not validation.get('success'):
+        _mark_runtime_blocked(
+            validation.get('faultState', 'AUTO_DRIVE_BLOCKED'),
+            validation.get('message', '启动条件未通过'),
+            validation.get('data')
+        )
+        return jsonify(validation)
     thread = threading.Thread(target=autoDriveByRTKThread)
     thread.start()
     response = make_response("开启自动执行任务")
