@@ -252,7 +252,8 @@ drive_thread = None
 loop_auto_clean_thread = None
 LOOP_AUTO_CLEAN_LOCK = threading.RLock()
 global_last_cte = 0.0
-START_POSITION_TOLERANCE_METERS = 2.0
+TASK_ORIGIN_TOLERANCE_METERS = 0.02
+START_POSITION_TOLERANCE_METERS = TASK_ORIGIN_TOLERANCE_METERS
 EDGE_TARGET_TOLERANCE_M = DEFAULT_EDGE_TARGET_TOLERANCE_M
 EDGE_RECOVERY_BACK_CM = 5
 EDGE_RECOVERY_MAX_ATTEMPTS = 3
@@ -675,6 +676,93 @@ def _distance_to_task_start(task_params):
         return None
 
 
+def _is_at_task_origin(task_params, tolerance_m=TASK_ORIGIN_TOLERANCE_METERS):
+    distance_to_start = _distance_to_task_start(task_params)
+    if distance_to_start is None:
+        return None, None
+    return distance_to_start <= tolerance_m, distance_to_start
+
+
+def _build_task_origin_check_result(task_params, detail=None, tolerance_m=TASK_ORIGIN_TOLERANCE_METERS):
+    detail = dict(detail or {})
+    start_lat = _coerce_float(task_params.get('startLat'), None)
+    start_lon = _coerce_float(task_params.get('startLon'), None)
+    origin_heading = _coerce_float(task_params.get('originHeading'), None)
+
+    detail['taskStartLat'] = start_lat
+    detail['taskStartLon'] = start_lon
+    detail['taskOriginToleranceM'] = tolerance_m
+
+    if start_lat is None or start_lon is None or origin_heading is None:
+        return {
+            'success': False,
+            'faultState': 'TASK_PARAMS_MISSING',
+            'message': '任务原点或航向参数未配置完整，无法校验是否在任务原点',
+            'data': detail,
+        }
+
+    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
+        return {
+            'success': False,
+            'faultState': 'RTK_NOT_READY',
+            'message': 'RTK 定位未就绪，无法校验是否在任务原点',
+            'data': detail,
+        }
+
+    at_origin, distance_to_start = _is_at_task_origin(task_params, tolerance_m)
+    if distance_to_start is None:
+        return {
+            'success': False,
+            'faultState': 'TASK_ORIGIN_UNKNOWN',
+            'message': '无法计算当前位置与任务原点距离，拒绝启动自动清扫',
+            'data': detail,
+        }
+
+    detail['distanceToTaskOriginM'] = distance_to_start
+    detail['distanceToStartM'] = distance_to_start
+    detail['isAtTaskOrigin'] = bool(at_origin)
+    if not at_origin:
+        return {
+            'success': False,
+            'faultState': 'NOT_AT_TASK_ORIGIN',
+            'message': '当前位置距离任务原点 {:.3f} 米，超过允许范围 {:.3f} 米'.format(
+                distance_to_start, tolerance_m
+            ),
+            'data': detail,
+        }
+
+    return {
+        'success': True,
+        'message': '当前位置在任务原点允许范围内',
+        'data': detail,
+    }
+
+
+def _build_task_origin_status_fields(task_params=None, tolerance_m=TASK_ORIGIN_TOLERANCE_METERS):
+    task_params = task_params or _load_task_params_snapshot()
+    start_lat = _coerce_float(task_params.get('startLat'), None)
+    start_lon = _coerce_float(task_params.get('startLon'), None)
+    distance_to_start = _distance_to_task_start(task_params)
+    at_origin = None
+    if distance_to_start is not None:
+        at_origin = distance_to_start <= tolerance_m
+
+    return {
+        'taskOrigin': {
+            'lat': start_lat,
+            'lon': start_lon,
+        },
+        'currentLocation': {
+            'lat': global_cur_rtk_lat,
+            'lon': global_cur_rtk_lon,
+            'heading': global_cur_rtk_heading,
+        },
+        'distanceToTaskOriginM': distance_to_start,
+        'taskOriginToleranceM': tolerance_m,
+        'isAtTaskOrigin': at_origin,
+    }
+
+
 def _distance_to_current_task_target():
     if not global_cur_taskPoint:
         return None
@@ -761,7 +849,10 @@ def _build_runtime_detail(extra=None):
         'hardwareReportAt': _get_hardware_report_at(),
         'hardwareReportAgeSec': _get_hardware_report_age_sec(),
         'distanceToStartM': _distance_to_task_start(task_params),
-        'startToleranceM': START_POSITION_TOLERANCE_METERS,
+        'distanceToTaskOriginM': _distance_to_task_start(task_params),
+        'startToleranceM': TASK_ORIGIN_TOLERANCE_METERS,
+        'taskOriginToleranceM': TASK_ORIGIN_TOLERANCE_METERS,
+        'isAtTaskOrigin': _build_task_origin_status_fields(task_params).get('isAtTaskOrigin'),
         'currentLat': global_cur_rtk_lat,
         'currentLon': global_cur_rtk_lon,
         'currentHeading': global_cur_rtk_heading,
@@ -814,7 +905,10 @@ def _build_runtime_detail(extra=None):
         'hardwareReportAt': _get_hardware_report_at(),
         'hardwareReportAgeSec': _get_hardware_report_age_sec(),
         'distanceToStartM': _distance_to_task_start(task_params),
-        'startToleranceM': START_POSITION_TOLERANCE_METERS,
+        'distanceToTaskOriginM': _distance_to_task_start(task_params),
+        'startToleranceM': TASK_ORIGIN_TOLERANCE_METERS,
+        'taskOriginToleranceM': TASK_ORIGIN_TOLERANCE_METERS,
+        'isAtTaskOrigin': _build_task_origin_status_fields(task_params).get('isAtTaskOrigin'),
         'currentLat': global_cur_rtk_lat,
         'currentLon': global_cur_rtk_lon,
         'currentHeading': global_cur_rtk_heading,
@@ -1423,6 +1517,7 @@ def _derive_status(control_state, mission_state):
 
 def _build_vehicle_status_payload():
     task_params = _load_task_params_snapshot()
+    task_origin_status = _build_task_origin_status_fields(task_params)
     lat = global_cur_rtk_lat
     lon = global_cur_rtk_lon
     heading = global_cur_rtk_heading if global_cur_rtk_heading is not None else None
@@ -1443,7 +1538,7 @@ def _build_vehicle_status_payload():
         'garageStateReason': _decode_redis_value(redis_cli.get(GARAGE_STATE_REASON_KEY)) or '',
     })
 
-    return {
+    payload = {
         'status': _derive_status(control_state, mission_state),
         'battery': battery_percent,
         'battery_percent': battery_percent,
@@ -1481,13 +1576,12 @@ def _build_vehicle_status_payload():
         'detail': detail,
         'timestamp': int(time.time()),
     }
+    payload.update(task_origin_status)
+    return payload
 
 
 def _validate_auto_drive_request_legacy():
     task_params = _load_task_params_snapshot()
-    start_lat = _coerce_float(task_params.get('startLat'), None)
-    start_lon = _coerce_float(task_params.get('startLon'), None)
-    origin_heading = _coerce_float(task_params.get('originHeading'), None)
     detail = _build_runtime_detail()
 
     if _decode_redis_value(redis_cli.get('mission')) == 'working':
@@ -1498,64 +1592,12 @@ def _validate_auto_drive_request_legacy():
             'data': detail,
         }
 
-    if start_lat is None or start_lon is None or origin_heading is None:
-        return {
-            'success': False,
-            'faultState': 'TASK_PARAMS_MISSING',
-            'message': '任务起点或航向参数未配置完整，无法启动',
-            'data': detail,
-        }
-
-    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
-        return {
-            'success': False,
-            'faultState': 'RTK_NOT_READY',
-            'message': 'RTK 定位未就绪，无法校验任务起点',
-            'data': detail,
-        }
-
-    distance_to_start = _distance_to_task_start(task_params)
-    if distance_to_start is None:
-        return {
-            'success': False,
-            'faultState': 'START_POSITION_UNKNOWN',
-            'message': '无法计算当前位置与任务起点距离，拒绝启动',
-            'data': detail,
-        }
-
-    detail['distanceToStartM'] = distance_to_start
-    if distance_to_start > START_POSITION_TOLERANCE_METERS:
-        return {
-            'success': False,
-            'faultState': 'NOT_AT_TASK_START',
-            'message': '当前位置距离任务起点 {:.2f} 米，超过允许范围 {:.2f} 米'.format(
-                distance_to_start, START_POSITION_TOLERANCE_METERS
-            ),
-            'data': detail,
-        }
-
-    task_items = task_obj.get('taskList') if isinstance(task_obj, dict) else None
-    if not isinstance(task_items, list) or len(task_items) == 0:
-        return {
-            'success': False,
-            'faultState': 'TASK_PATH_EMPTY',
-            'message': '当前没有可执行任务路径，拒绝启动',
-            'data': detail,
-        }
-
-    return {
-        'success': True,
-        'message': '启动条件通过',
-        'data': detail,
-    }
+    return _build_task_origin_check_result(task_params, detail)
 
 
 
 def _validate_auto_drive_request():
     task_params = _load_task_params_snapshot()
-    start_lat = _coerce_float(task_params.get('startLat'), None)
-    start_lon = _coerce_float(task_params.get('startLon'), None)
-    origin_heading = _coerce_float(task_params.get('originHeading'), None)
     detail = _build_runtime_detail()
 
     if _decode_redis_value(redis_cli.get('mission')) == 'working':
@@ -1597,41 +1639,10 @@ def _validate_auto_drive_request():
             'data': detail,
         }
 
-    if start_lat is None or start_lon is None or origin_heading is None:
-        return {
-            'success': False,
-            'faultState': 'TASK_PARAMS_MISSING',
-            'message': '任务起点或航向参数未配置完整，无法启动',
-            'data': detail,
-        }
-
-    if global_cur_rtk_lat is None or global_cur_rtk_lon is None:
-        return {
-            'success': False,
-            'faultState': 'RTK_NOT_READY',
-            'message': 'RTK 定位未就绪，无法校验任务起点',
-            'data': detail,
-        }
-
-    distance_to_start = _distance_to_task_start(task_params)
-    if distance_to_start is None:
-        return {
-            'success': False,
-            'faultState': 'START_POSITION_UNKNOWN',
-            'message': '无法计算当前位置与任务起点距离，拒绝启动',
-            'data': detail,
-        }
-
-    detail['distanceToStartM'] = distance_to_start
-    if distance_to_start > START_POSITION_TOLERANCE_METERS:
-        return {
-            'success': False,
-            'faultState': 'NOT_AT_TASK_START',
-            'message': '当前位置距离任务起点 {:.2f} 米，超过允许范围 {:.2f} 米'.format(
-                distance_to_start, START_POSITION_TOLERANCE_METERS
-            ),
-            'data': detail,
-        }
+    origin_check = _build_task_origin_check_result(task_params, detail)
+    if not origin_check.get('success'):
+        return origin_check
+    detail = origin_check.get('data', detail)
 
     task_items = task_obj.get('taskList') if isinstance(task_obj, dict) else None
     if not isinstance(task_items, list) or len(task_items) == 0:
@@ -3642,6 +3653,13 @@ def getCurLocation():
     return jsonify(result)
 
 
+@app.route("/vehicle/isAtTaskOrigin", methods=['GET'])
+def isAtTaskOrigin():
+    task_params = _load_task_params_snapshot()
+    result = _build_task_origin_check_result(task_params, _build_runtime_detail())
+    return jsonify(result)
+
+
 @app.route("/vehicle/goToPoint", methods=['GET', 'POST'])
 def goToPoint():
     payload = _request_payload()
@@ -3692,12 +3710,11 @@ def goToPointThread(plan):
         redis_cli.set("correct", "true")
         redis_cli.set('action', 'true')
         reset_odometer(ser)
-        result = pointToPointByRTK(
+        result = pointToPointByRTKAutoHeading(
             data["startLat"],
             data["startLon"],
             data["targetLat"],
             data["targetLon"],
-            data["heading"],
             data["speed"],
         )
         if result == 0:
@@ -4299,6 +4316,13 @@ def moveByRTK(endLat, endLon,heading=0):
     sendBraking()
     global_go = 0
 # 通过RTK实现从一个点直线移动到另一个点，返回结果0：表示该任务未执行完成，1：表示执行完成
+def pointToPointByRTKAutoHeading(startLat, startLon, endLat, endLon, speed=200):
+    distance, heading = util.get_distance_angle(startLat, startLon, endLat, endLon)
+    heading = float(heading) % 360.0
+    logger.warn("点到点自动计算直线航向: distance={:.3f}m heading={:.3f}".format(float(distance), heading))
+    return pointToPointByRTK(startLat, startLon, endLat, endLon, heading, speed)
+
+
 def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
     global global_cur_taskPoint,global_interval
     global global_go
