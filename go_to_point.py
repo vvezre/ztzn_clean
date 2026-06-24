@@ -54,6 +54,9 @@ def build_go_to_point_plan(
     target_lon = _to_float(target_lon)
     speed = _to_int(speed, DEFAULT_GO_TO_POINT_SPEED)
 
+    if speed <= 0:
+        return _response(False, "INVALID_SPEED", "速度无效")
+
     if target_lat is None or target_lon is None:
         return _response(False, "INVALID_TARGET", "目标经纬度无效")
 

@@ -39,6 +39,18 @@ class GoToPointTest(unittest.TestCase):
         self.assertEqual(plan["code"], "TARGET_TOO_CLOSE")
         self.assertEqual(plan["data"]["distance"], 0.0)
 
+    def test_rejects_non_positive_speed(self):
+        plan = build_go_to_point_plan(
+            current_lat=31.1,
+            current_lon=121.1,
+            target_lat=31.1001,
+            target_lon=121.1001,
+            speed=0,
+        )
+
+        self.assertFalse(plan["success"])
+        self.assertEqual(plan["code"], "INVALID_SPEED")
+
     def test_builds_go_to_point_plan_with_heading_and_distance(self):
         plan = build_go_to_point_plan(
             current_lat=31.1,

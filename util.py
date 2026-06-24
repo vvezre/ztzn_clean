@@ -1289,6 +1289,26 @@ def cross_track_error(start_lat, start_lon, end_lat, end_lon, current_lat, curre
 
     return d_xt
 
+
+def signed_along_track_distance(start_lat, start_lon, end_lat, end_lon, current_lat, current_lon):
+    """Return signed remaining distance along the start-to-end path in meters."""
+    geod = Geodesic.WGS84
+    path = geod.Inverse(start_lat, start_lon, end_lat, end_lon)
+    current = geod.Inverse(start_lat, start_lon, current_lat, current_lon)
+    delta = math.radians(current['azi1'] - path['azi1'])
+    along_distance = current['s12'] * math.cos(delta)
+    return path['s12'] - along_distance
+
+
+def should_finish_point_to_point(distance_to_target, signed_remaining, cte,
+                                 target_tolerance_m=0.03, cte_tolerance_m=0.30):
+    if distance_to_target is not None and float(distance_to_target) <= target_tolerance_m:
+        return True
+    if signed_remaining is None or cte is None:
+        return False
+    return float(signed_remaining) <= 0 and abs(float(cte)) <= cte_tolerance_m
+
+
 def calculate_perpendicular_point(lat1, lon1, lat2, lon2, distance_meters, side='left'):
     """
     计算从线段 (P1-P2) 垂直偏移 distance_meters 的点
