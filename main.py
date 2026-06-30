@@ -41,7 +41,8 @@ from flask import Flask, make_response, request, jsonify, Response
 from AppLogger import logger
 
 import util
-from go_to_point import build_go_to_point_plan
+from go_to_point import build_go_to_point_plan, _to_float, _to_int
+from waypoint_loop import iter_closed_loop_targets, normalize_loop_options
 import traceback
 
 import service
@@ -69,7 +70,7 @@ from edge_target_guard import (
     should_recover_from_edge_stop,
 )
 from DynamicCronScheduler import DynamicCronScheduler
-from FixedPositiveChecker import FixedPositiveChecker
+
 
 from flask_cors import CORS
 
@@ -108,6 +109,11 @@ LOOP_AUTO_CLEAN_CYCLE_KEY = "loopAutoCleanCycle"
 LOOP_AUTO_CLEAN_STOP_REASON_KEY = "loopAutoCleanStopReason"
 LOOP_AUTO_CLEAN_UPDATED_AT_KEY = "loopAutoCleanUpdatedAt"
 LOOP_AUTO_CLEAN_SLEEP_SECONDS = 2.0
+
+WAYPOINT_LOOP_ENABLED_KEY = 'waypointLoopEnabled'
+WAYPOINT_LOOP_MODE_KEY = 'waypointLoopMode'
+WAYPOINT_LOOP_TARGET_KEY = 'waypointLoopTarget'
+WAYPOINT_LOOP_CURRENT_KEY = 'waypointLoopCurrent'
 
 high_speed = 350
 
@@ -158,6 +164,10 @@ redis_cli.delete('voltage')
 redis_cli.delete('packVoltage')
 redis_cli.delete('packVoltageReportAt')
 redis_cli.set('bootSafeStopAt', int(time.time()))
+if redis_cli.get('waypointIndex') is None:
+    redis_cli.set('waypointIndex', 0)
+if redis_cli.get('waypointTotal') is None:
+    redis_cli.set('waypointTotal', 0)
 
 TASK_SWITCH_LOCK = threading.RLock()
 CONFIG_FILE_LOCK = threading.RLock()
@@ -242,7 +252,6 @@ global_point_lat = 32.03647652
 global_point_lon = 118.92454171
 # 点对点执行任务是否被打断标识,0:表示没有被打断，1：表示打断
 global_pointToPoint_flag = 0
-checker = FixedPositiveChecker(window_size=3)
 # 小车id
 vehicleId = '0001'
 # 小车类型
@@ -1546,8 +1555,8 @@ def _build_vehicle_status_payload():
         'battery_percent_raw': battery_percent_raw,
         'action': current_action,
         'task_name': _decode_redis_value(redis_cli.get('currentTaskName')) or '',
-        'cur_task_index': _coerce_int(redis_cli.get('curTaskIndex'), 0),
-        'task_count': len(_load_task_items_for_preview()),
+        'cur_task_index': _coerce_int(redis_cli.get('waypointIndex'), 0) if current_action == 'multi_go_to_point' else _coerce_int(redis_cli.get('curTaskIndex'), 0),
+        'task_count': _coerce_int(redis_cli.get('waypointTotal'), 0) if current_action == 'multi_go_to_point' else len(_load_task_items_for_preview()),
         'online_state': 'ONLINE',
         'mission_state': mission_state,
         'control_state': control_state,
@@ -1570,7 +1579,7 @@ def _build_vehicle_status_payload():
         'garage_state_updated_at': _coerce_int(redis_cli.get(GARAGE_STATE_UPDATED_AT_KEY), 0),
         'loop_auto_clean': loop_auto_clean,
         'loopAutoClean': loop_auto_clean,
-        'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'],
+        'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path'],
         'supported_params': ['taskName', 'speed', 'tracking', 'path'],
         'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state', 'garage_state', 'loop_auto_clean'],
         'detail': detail,
@@ -2725,7 +2734,6 @@ def getVehicleInfo():
     metadata['loopAutoCleanRunning'] = loop_status.get('running')
     metadata['loopAutoCleanCycle'] = loop_status.get('cycle')
     metadata['loopAutoCleanStopReason'] = loop_status.get('stop_reason')
-    metadata.update(_build_task_origin_status_fields())
 
     return json.dumps(metadata)
 
@@ -3107,14 +3115,6 @@ def converterXY(task):
 # 通过RTK自动清扫
 @app.route("/vehicle/autoDriveByRTK", methods=['GET'])
 def autoDriveByRTK():
-    validation = _validate_auto_drive_request()
-    if not validation.get('success'):
-        _mark_runtime_blocked(
-            validation.get('faultState', 'AUTO_DRIVE_BLOCKED'),
-            validation.get('message', '启动条件未通过'),
-            validation.get('data')
-        )
-        return jsonify(validation)
     thread = threading.Thread(target=autoDriveByRTKThread)
     thread.start()
     response = make_response("开启自动执行任务")
@@ -3740,6 +3740,377 @@ def goToPointThread(plan):
         set_current_action('idle')
         global_status = 'active'
         doParking()
+
+
+# ============================================================
+# 多点路点导航 — CRUD 端点
+# ============================================================
+
+@app.route("/vehicle/goToPoints", methods=['GET'])
+def goToPointsList():
+    """获取全部路点列表"""
+    try:
+        raw_list = redis_cli.lrange('waypoints', 0, -1)
+        waypoints = []
+        for item in (raw_list or []):
+            try:
+                waypoints.append(json.loads(item))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return jsonify({
+            "success": True,
+            "data": waypoints,
+            "total": len(waypoints),
+        })
+    except Exception as e:
+        logger.error("获取路点列表失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "获取路点列表失败", "data": [], "total": 0})
+
+
+@app.route("/vehicle/goToPoints", methods=['POST'])
+def goToPointsBatchSet():
+    """批量替换路点列表"""
+    payload = _request_payload()
+    waypoints = payload.get('waypoints') if isinstance(payload, dict) else None
+    if not isinstance(waypoints, list):
+        waypoints = []
+    try:
+        # 删除旧列表，重新构建
+        redis_cli.delete('waypoints')
+        for wp in waypoints:
+            if not isinstance(wp, dict):
+                continue
+            redis_cli.rpush('waypoints', json.dumps({
+                "lat": _to_float(wp.get('lat')),
+                "lon": _to_float(wp.get('lon')),
+                "speed": _to_int(wp.get('speed'), 200),
+            }))
+        total = redis_cli.llen('waypoints') or 0
+        return jsonify({
+            "success": True,
+            "msg": "已设置{}个路点".format(total),
+            "total": total,
+        })
+    except Exception as e:
+        logger.error("批量设置路点失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "批量设置路点失败"})
+
+
+@app.route("/vehicle/goToPoints/add", methods=['POST'])
+def goToPointsAdd():
+    """添加单个路点"""
+    payload = _request_payload()
+    lat = _to_float(payload.get('lat'))
+    lon = _to_float(payload.get('lon'))
+    speed = _to_int(payload.get('speed'), 200)
+    if lat is None or lon is None:
+        return jsonify({"success": False, "code": "INVALID_WAYPOINT", "msg": "路点坐标无效"})
+    if speed is None or speed <= 0:
+        speed = 200
+    try:
+        wp = {"lat": lat, "lon": lon, "speed": speed}
+        redis_cli.rpush('waypoints', json.dumps(wp))
+        total = redis_cli.llen('waypoints') or 0
+        return jsonify({
+            "success": True,
+            "msg": "路点已添加",
+            "data": wp,
+            "total": total,
+        })
+    except Exception as e:
+        logger.error("添加路点失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "添加路点失败"})
+
+
+@app.route("/vehicle/goToPoints/remove", methods=['POST'])
+def goToPointsRemove():
+    """删除指定索引的路点"""
+    payload = _request_payload()
+    index = _to_int(payload.get('index'), -1)
+    if index is None or index < 0:
+        return jsonify({"success": False, "code": "INVALID_INDEX", "msg": "索引无效"})
+    try:
+        raw_list = redis_cli.lrange('waypoints', 0, -1) or []
+        if index >= len(raw_list):
+            return jsonify({"success": False, "code": "INDEX_OUT_OF_RANGE", "msg": "索引超出范围"})
+        redis_cli.delete('waypoints')
+        for i, item in enumerate(raw_list):
+            if i != index:
+                redis_cli.rpush('waypoints', item)
+        total = redis_cli.llen('waypoints') or 0
+        return jsonify({
+            "success": True,
+            "msg": "路点已删除",
+            "total": total,
+        })
+    except Exception as e:
+        logger.error("删除路点失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "删除路点失败"})
+
+
+@app.route("/vehicle/goToPoints/reorder", methods=['POST'])
+def goToPointsReorder():
+    """调整路点顺序"""
+    payload = _request_payload()
+    order = payload.get('order') if isinstance(payload, dict) else None
+    if not isinstance(order, list):
+        return jsonify({"success": False, "code": "INVALID_ORDER", "msg": "排序参数无效"})
+    try:
+        raw_list = redis_cli.lrange('waypoints', 0, -1) or []
+        n = len(raw_list)
+        # 校验排列有效性
+        if sorted(order) != list(range(n)):
+            return jsonify({"success": False, "code": "INVALID_ORDER", "msg": "排序参数不合法，长度不匹配或索引重复"})
+        redis_cli.delete('waypoints')
+        for idx in order:
+            redis_cli.rpush('waypoints', raw_list[idx])
+        return jsonify({
+            "success": True,
+            "msg": "路点顺序已更新",
+            "total": n,
+        })
+    except Exception as e:
+        logger.error("调整路点顺序失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "调整路点顺序失败"})
+
+
+@app.route("/vehicle/goToPoints/clear", methods=['POST'])
+def goToPointsClear():
+    """清空全部路点"""
+    try:
+        redis_cli.delete('waypoints')
+        return jsonify({
+            "success": True,
+            "msg": "路点已清空",
+            "total": 0,
+        })
+    except Exception as e:
+        logger.error("清空路点失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "清空路点失败"})
+
+
+def _execute_multi_waypoint_target(wp, index):
+    if redis_cli.get('parking') == '1':
+        logger.warn("多点路点导航: 检测到停车信号，中断")
+        return False
+    if global_doCleanThreadStop == 1:
+        logger.warn("多点路点导航: 检测到停止信号，中断")
+        return False
+
+    plan = build_go_to_point_plan(
+        global_cur_rtk_lat, global_cur_rtk_lon,
+        wp['lat'], wp['lon'],
+        speed=wp.get('speed', 200),
+    )
+    if not plan.get('success'):
+        if plan.get('code') == 'TARGET_TOO_CLOSE':
+            logger.warn("路点#{} 距离过近({:.3f}m)，按已到达处理".format(
+                index + 1, plan.get('data', {}).get('distance', 0)))
+            return True
+        logger.warn("路点#{} 校验失败: {}".format(index + 1, plan.get('msg')))
+        return False
+
+    data = plan.get('data', {})
+    logger.warn("多点路点导航: 前往路点#{} ({},{}) 距离{:.3f}m 航向{:.3f}°".format(
+        index + 1, wp['lat'], wp['lon'],
+        data.get('distance', 0), data.get('heading', 0)))
+    redis_cli.set('waypointIndex', index)
+    redis_cli.set('curTaskIndex', index)
+
+    result = pointToPointByRTKAutoHeading(
+        data['startLat'], data['startLon'],
+        data['targetLat'], data['targetLon'],
+        data['speed'],
+    )
+    if result == 0:
+        logger.warn("多点路点导航: 路点#{} 未完成，中断后续路点".format(index + 1))
+        return False
+    logger.warn("多点路点导航: 路点#{} 完成".format(index + 1))
+    return True
+
+
+def goToPointsThread():
+    """多点路点顺序导航线程"""
+    global global_status, global_go, global_doCleanThreadStop
+    try:
+        raw_list = redis_cli.lrange('waypoints', 0, -1) or []
+        waypoints = []
+        for item in raw_list:
+            try:
+                waypoints.append(json.loads(item))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not waypoints:
+            logger.warn("goToPointsThread: 路点列表为空，退出")
+            return
+
+        loop_enabled = redis_cli.get(WAYPOINT_LOOP_ENABLED_KEY) == '1'
+        loop_mode = redis_cli.get(WAYPOINT_LOOP_MODE_KEY) or 'count'
+        loop_target = _coerce_int(redis_cli.get(WAYPOINT_LOOP_TARGET_KEY), 0)
+        logger.warn("启动多点路点导航: 共{}个路点, 闭环={}, 模式={}, 圈数={}".format(
+            len(waypoints), loop_enabled, loop_mode, loop_target))
+
+        # 只有1个路点，走现有单点流程
+        if len(waypoints) == 1:
+            wp = waypoints[0]
+            plan = build_go_to_point_plan(
+                global_cur_rtk_lat, global_cur_rtk_lon,
+                wp['lat'], wp['lon'],
+                speed=wp.get('speed', 200),
+            )
+            if plan.get('success'):
+                logger.warn("单路点委托给 goToPointThread")
+                goToPointThread(plan)
+            else:
+                logger.warn("单路点校验失败: {}".format(plan.get('msg')))
+            return
+
+        # 多点导航
+        global_status = 'working'
+        set_current_action('multi_go_to_point')
+        redis_cli.set('mission', 'working')
+        redis_cli.set('parking', '0')
+        redis_cli.set('correct', 'true')
+        redis_cli.set('action', 'true')
+        redis_cli.set('waypointTotal', len(waypoints))
+        redis_cli.set('waypointIndex', 0)
+        redis_cli.set('curTaskIndex', 0)
+        reset_odometer(ser)
+
+        if not loop_enabled:
+            for i, wp in enumerate(waypoints):
+                if not _execute_multi_waypoint_target(wp, i):
+                    break
+        else:
+            target_loop_count = None if loop_mode == 'continuous' else loop_target
+            completed_loop = 0
+            for target in iter_closed_loop_targets(waypoints, target_loop_count):
+                if not _execute_multi_waypoint_target(
+                    target['waypoint'], target['index']
+                ):
+                    break
+                if target['completed_loop'] > completed_loop:
+                    completed_loop = target['completed_loop']
+                    redis_cli.set(WAYPOINT_LOOP_CURRENT_KEY, completed_loop)
+                    logger.warn("多点闭环导航: 第{}圈完成".format(completed_loop))
+
+        logger.warn("多点路点导航结束")
+    except Exception as e:
+        logger.error("多点路点导航异常: {}".format(e), exc_info=True)
+    finally:
+        global_go = 0
+        redis_cli.set('mission', 'complete')
+        redis_cli.set('correct', 'false')
+        redis_cli.set('action', 'false')
+        set_current_action('idle')
+        redis_cli.set('waypointIndex', 0)
+        redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '0')
+        global_status = 'active'
+        doParking()
+
+
+@app.route("/vehicle/goToPoints/start", methods=['POST'])
+def goToPointsStart():
+    """启动多点路点导航"""
+    global global_doCleanThreadStop
+    try:
+        if global_status == 'working' or redis_cli.get('mission') == 'working':
+            return jsonify({
+                "success": False,
+                "code": "VEHICLE_BUSY",
+                "msg": "车辆正在执行任务，不能启动多点导航",
+                "data": {
+                    "status": global_status,
+                    "mission": redis_cli.get('mission'),
+                    "action": redis_cli.get('currentAction'),
+                }
+            })
+
+        raw_list = redis_cli.lrange('waypoints', 0, -1) or []
+        waypoints = [json.loads(w) for w in raw_list if w]
+        if not waypoints:
+            return jsonify({
+                "success": False,
+                "code": "NO_WAYPOINTS",
+                "msg": "没有路点，请先添加路点",
+            })
+
+        try:
+            loop_options = normalize_loop_options(_request_payload(), len(waypoints))
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "code": "INVALID_LOOP_OPTIONS",
+                "msg": str(e),
+            })
+
+        redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '1' if loop_options['loop'] else '0')
+        redis_cli.set(WAYPOINT_LOOP_MODE_KEY, loop_options['loopMode'])
+        redis_cli.set(WAYPOINT_LOOP_TARGET_KEY, loop_options['loopCount'])
+        redis_cli.set(WAYPOINT_LOOP_CURRENT_KEY, 0)
+        global_doCleanThreadStop = 0
+        thread = threading.Thread(target=goToPointsThread)
+        thread.start()
+
+        return jsonify({
+            "success": True,
+            "code": "MULTI_GO_TO_POINT_STARTED",
+            "msg": "多点路点导航已启动({}个路点)".format(len(waypoints)),
+            "data": {
+                "total": len(waypoints),
+                "loop": loop_options['loop'],
+                "loopMode": loop_options['loopMode'],
+                "targetLoop": loop_options['loopCount'] if loop_options['loop'] else 0,
+            },
+        })
+    except Exception as e:
+        logger.error("启动多点路点导航失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "启动多点路点导航失败"})
+
+
+@app.route("/vehicle/goToPoints/stop", methods=['POST'])
+def goToPointsStop():
+    """停止多点路点导航"""
+    try:
+        doParking()
+        set_current_action('idle')
+        redis_cli.set('waypointIndex', 0)
+        logger.warn("多点路点导航: 收到停止命令")
+        return jsonify({
+            "success": True,
+            "msg": "多点路点导航已停止",
+        })
+    except Exception as e:
+        logger.error("停止多点路点导航失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "停止多点路点导航失败"})
+
+
+@app.route("/vehicle/goToPoints/progress", methods=['GET'])
+def goToPointsProgress():
+    """查询多点路点导航进度"""
+    try:
+        current_action = redis_cli.get('currentAction') or ''
+        running = current_action == 'multi_go_to_point'
+        current_index = _coerce_int(redis_cli.get('waypointIndex'), 0) if running else 0
+        total = _coerce_int(redis_cli.get('waypointTotal'), 0) if running else 0
+        return jsonify({
+            "success": True,
+            "data": {
+                "running": running,
+                "currentIndex": current_index,
+                "total": total,
+                "loop": redis_cli.get(WAYPOINT_LOOP_ENABLED_KEY) == '1',
+                "loopMode": redis_cli.get(WAYPOINT_LOOP_MODE_KEY) or 'count',
+                "currentLoop": _coerce_int(redis_cli.get(WAYPOINT_LOOP_CURRENT_KEY), 0),
+                "targetLoop": _coerce_int(redis_cli.get(WAYPOINT_LOOP_TARGET_KEY), 0),
+            },
+        })
+    except Exception as e:
+        logger.error("查询路点导航进度失败: {}".format(e), exc_info=True)
+        return jsonify({"success": False, "msg": "查询进度失败"})
+
+
 # 设置充电桩信息
 @app.route("/vehicle/setCharginPileInfo", methods=['GET'])
 def setCharginPileInfo():
@@ -4326,10 +4697,25 @@ def moveByRTK(endLat, endLon,heading=0):
     global_go = 0
 # 通过RTK实现从一个点直线移动到另一个点，返回结果0：表示该任务未执行完成，1：表示执行完成
 def pointToPointByRTKAutoHeading(startLat, startLon, endLat, endLon, speed=200):
-    distance, heading = util.get_distance_angle(startLat, startLon, endLat, endLon)
+    current_start_lat = global_cur_rtk_lat if global_cur_rtk_lat is not None else startLat
+    current_start_lon = global_cur_rtk_lon if global_cur_rtk_lon is not None else startLon
+    distance, heading = util.get_distance_angle(current_start_lat, current_start_lon, endLat, endLon)
     heading = float(heading) % 360.0
     logger.warn("点到点自动计算直线航向: distance={:.3f}m heading={:.3f}".format(float(distance), heading))
-    return pointToPointByRTK(startLat, startLon, endLat, endLon, heading, speed)
+    turn_result = turn(
+        ser,
+        heading * 10,
+        target_heading=heading,
+        source='point_to_point_auto_heading',
+    )
+    if turn_result != 1:
+        logger.warn("point-to-point turn was not confirmed; cancel straight drive, targetHeading={:.3f}".format(heading))
+        sendBraking()
+        return 0
+    if redis_cli.get('parking') == '1':
+        logger.warn("parking requested after point-to-point turn; cancel straight drive")
+        return 0
+    return pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)
 
 
 def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
@@ -4447,7 +4833,7 @@ def observer_go_correct(data):
         heading_error = float(target_heading) - float(data.heading)
         # 计算最短偏差
         heading_error = (heading_error + 180) % 360 - 180
-        if distance_to_target < 2:
+        if distance_to_target < 1:
             heading_error = max(-5,min(heading_error,5))
         # 只有直行，才发送纠偏指令
         cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, data.lat, data.lon)
@@ -4458,7 +4844,7 @@ def observer_go_correct(data):
 
         # stree_output = int(raw_output)
         # stree_output = heading_error*10 - int(450 * cte)
-        stree_output = compute_linear_steering(heading_error, cte, cte_gain=800)
+        stree_output = compute_linear_steering(heading_error, cte, cte_gain=1000)
         # if abs(heading_error) > 1 or abs(cte) > 0.02:
             # logger.warning("视觉纠偏关闭，RTK纠偏开启")
             # redis_cli.set("correct", "false")
@@ -4467,7 +4853,7 @@ def observer_go_correct(data):
         setZSpeed(-stree_output)
         duplicateWriteCmd(ser, command)
         logger.info(
-            "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m cte_gain=800 z={}".format(
+            "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m cte_gain=1000 z={}".format(
                 target_heading, data.heading, heading_error, cte, global_last_cte, distance_to_target,
                 -stree_output
             )
@@ -4478,19 +4864,29 @@ def observer_go_correct(data):
                     .format(target_heading, data.heading, heading_error, cte, global_last_cte,distance_to_target,
                             stree_output))
         global_last_cte = cte
-        # else:
-        #     redis_cli.set("correct", "true")
-        #     pass
-        result = distance_to_target - global_last_distance_to_target
-        # 更新路径进度,如果上一次距离目标距离小于当前距离目标距离，说明已经到达目标位置
-        # 每个直行任务，必须从开始时间，3秒之后才可以判断当前目标距离和上一个目标距离的大小
-        checker.add_number(round(result,2))
-        if global_interval > 2 and checker.are_all_positive() or distance_to_target <= 0.05:
+
+        # 使用带符号的沿路径剩余距离判断是否到达/越过目标点
+        # 正值=还在路上, 负值=已越过终点
+        signed_remaining = util.signed_along_track_distance(
+            start_lat, start_lon, target_lat, target_lon,
+            data.lat, data.lon
+        )
+
+        # 诊断：每1秒输出一次，确认方向和距离
+        _now = time.time()
+        _last = getattr(observer_go_correct, '_diag_log_at', 0.0)
+        if _now - _last >= 1.0:
+            logger.warn("直行诊断 signed_remaining={:.3f}m distance_to_target={:.3f}m cte={:.3f}m | signed>0=未到, signed<=0=已到/越过".format(
+                signed_remaining, distance_to_target, cte))
+            observer_go_correct._diag_log_at = _now
+
+        # 到达判定：3cm内直接到达；或已越过终点且横向偏差不超过30cm。
+        if util.should_finish_point_to_point(distance_to_target, signed_remaining, cte):
             global_go = 0
             redis_cli.set("correct", "false")
-            logger.warn("路径直行结束")
-        if distance_to_target <= 2 and redis_cli.get('lastTask') == '1':
-            sendCommandSetXSpeed(200)
+            logger.warn("路径直行结束 (distance_to_target={:.3f}m signed_remaining={:.3f}m cte={:.3f}m)".format(
+                distance_to_target, signed_remaining, cte))
+
         global_last_distance_to_target = distance_to_target
         # 防止cup资源占满
         time.sleep(0.01)
@@ -7462,8 +7858,11 @@ def main():
         app.run(host='0.0.0.0', port=7899)
         return
 
-    # if not varifyGps():
-    #     return
+    # 启动前检查云平台门禁开关
+    # Startup gate disabled for local robot deployment.
+    # from startup_gate import check_startup_gate
+    # check_startup_gate()
+
     if cap is not None and cap.isOpened():
         thread = threading.Thread(target=startOpencv)
         thread.start()

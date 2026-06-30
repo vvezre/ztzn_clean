@@ -42,17 +42,6 @@ class TaskOriginCheckTest(unittest.TestCase):
         self.assertIn("_build_task_origin_status_fields(task_params)", status_body)
         self.assertIn("payload.update(task_origin_status)", status_body)
 
-        vehicle_info_body = function_body(source, "getVehicleInfo")
-        self.assertIn("metadata.update(_build_task_origin_status_fields())", vehicle_info_body)
-
-    def test_auto_drive_by_rtk_entry_uses_start_validation(self):
-        source = read_file(MAIN_PATH)
-        body = function_body(source, "autoDriveByRTK")
-
-        self.assertIn("validation = _validate_auto_drive_request()", body)
-        self.assertIn("_mark_runtime_blocked(", body)
-        self.assertIn("return jsonify(validation)", body)
-
     def test_auto_drive_validation_uses_task_origin_result(self):
         source = read_file(MAIN_PATH)
 

@@ -114,8 +114,8 @@ class MQTTIntegration:
                 'status': self._build_status(),
                 'action': self._build_action(),
                 'task_name': self._build_task_name(),
-                'cur_task_index': self._get_redis_value('curTaskIndex', int, 0),
-                'task_count': self._build_task_count(),
+                'cur_task_index': self._get_redis_value('waypointIndex', int, 0) if self._get_redis_value('currentAction', str, '') == 'multi_go_to_point' else self._get_redis_value('curTaskIndex', int, 0),
+                'task_count': self._get_redis_value('waypointTotal', int, 0) if self._get_redis_value('currentAction', str, '') == 'multi_go_to_point' else self._build_task_count(),
                 'battery': self._get_redis_value('batteryPercent', float, None),
                 'battery_percent': self._get_redis_value('batteryPercent', float, None),
                 'battery_raw': self._get_redis_value('batteryPercentRaw', float, None),
@@ -132,7 +132,7 @@ class MQTTIntegration:
                 'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
                 'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
                 'supported_actions': [
-                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'
+                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path'
                 ],
                 'supported_params': ['taskName', 'speed', 'tracking', 'path'],
                 'supported_status_fields': [
