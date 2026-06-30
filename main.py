@@ -4361,7 +4361,7 @@ def observer_go_correct(data):
         heading_error = float(target_heading) - float(data.heading)
         # 计算最短偏差
         heading_error = (heading_error + 180) % 360 - 180
-        if distance_to_target < 2:
+        if distance_to_target < 1:
             heading_error = max(-5,min(heading_error,5))
         # 只有直行，才发送纠偏指令
         cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, data.lat, data.lon)
@@ -4372,7 +4372,7 @@ def observer_go_correct(data):
 
         # stree_output = int(raw_output)
         # stree_output = heading_error*10 - int(450 * cte)
-        stree_output = compute_linear_steering(heading_error, cte, cte_gain=800)
+        stree_output = compute_linear_steering(heading_error, cte, cte_gain=1000)
         # if abs(heading_error) > 1 or abs(cte) > 0.02:
             # logger.warning("视觉纠偏关闭，RTK纠偏开启")
             # redis_cli.set("correct", "false")
@@ -4381,7 +4381,7 @@ def observer_go_correct(data):
         setZSpeed(-stree_output)
         duplicateWriteCmd(ser, command)
         logger.info(
-            "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m cte_gain=800 z={}".format(
+            "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m cte_gain=1000 z={}".format(
                 target_heading, data.heading, heading_error, cte, global_last_cte, distance_to_target,
                 -stree_output
             )
