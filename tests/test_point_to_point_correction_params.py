@@ -19,6 +19,14 @@ class PointToPointCorrectionParamsTest(unittest.TestCase):
         self.assertIn("compute_linear_steering(heading_error, cte, cte_gain=1000)", source)
         self.assertIn("cte_gain=1000 z={}", source)
 
+    def test_runtime_correction_debug_is_published_for_dev_console(self):
+        source = read_main()
+
+        self.assertIn("correctionDebug", source)
+        self.assertIn("'headingError'", source)
+        self.assertIn("'zSpeed'", source)
+        self.assertIn("redis_cli.set('globalGo'", source)
+
 
 if __name__ == "__main__":
     unittest.main()

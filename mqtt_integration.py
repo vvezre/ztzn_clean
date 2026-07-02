@@ -13,6 +13,35 @@ import util
 from AppLogger import logger
 from mqtt_client import MQTTClient, get_mqtt_client
 from mqtt_handler import MQTTCommandHandler
+try:
+    from ntrip_runtime import get_shared_runtime
+except Exception:
+    get_shared_runtime = None
+
+DEFAULT_TASK_ORIGIN_TOLERANCE_METERS = 0.02
+RTK_FIXED_QUALITY = '4'
+RTK_FIXED_GGA_MAX_AGE_SECONDS = 2.0
+RTK_FIX_RECOVERY_TIMEOUT_SECONDS = 300.0
+RTK_STATUS_FIELDS = (
+    'rtkQuality',
+    'rtkFixAvailable',
+    'rtkFixState',
+    'rtkRecovering',
+    'rtkLostSeconds',
+    'rtkRecoveryTimeoutSec',
+    'rtkGgaAgeSec',
+    'rtkLastGgaAt',
+    'rtkLastFixedAt',
+    'rtkFixedAgeSec',
+    'rtcmAgeSec',
+    'rtcmTimeoutSec',
+    'rtcmTimedOut',
+    'rtcmLastReceivedAt',
+    'ntripEnabled',
+    'ntripConfigured',
+    'ntripConnected',
+    'ntripLastDisconnectReason',
+)
 
 
 class MQTTIntegration:
@@ -89,23 +118,31 @@ class MQTTIntegration:
 
         try:
             current_location = self._get_redis_hash('currentLocation')
+            task_params = self._get_redis_hash('taskParams')
             lat = self._coerce_value(current_location.get('lat'), float, None)
             lon = self._coerce_value(current_location.get('lon'), float, None)
+            heading = self._coerce_value(current_location.get('heading'), float, None)
             local_x, local_y = self._compute_local_xy_cm(lat, lon)
+            task_origin_fields = self._build_task_origin_status_fields(task_params, current_location)
             status = {
                 'speed': self._get_redis_value('forwardSpeed', int, 0),
                 'brush_speed': self._get_redis_value('brushSpeed', int, 0),
                 'voltage': self._get_redis_value('packVoltage', float, None),
                 'lat': lat,
                 'lon': lon,
-                'heading': self._coerce_value(current_location.get('heading'), float, None),
+                'heading': heading,
                 'local_x': local_x,
                 'local_y': local_y,
+                'taskOrigin': task_origin_fields.get('taskOrigin'),
+                'currentLocation': task_origin_fields.get('currentLocation'),
+                'distanceToTaskOriginM': task_origin_fields.get('distanceToTaskOriginM'),
+                'taskOriginToleranceM': task_origin_fields.get('taskOriginToleranceM'),
+                'isAtTaskOrigin': task_origin_fields.get('isAtTaskOrigin'),
                 'status': self._build_status(),
                 'action': self._build_action(),
                 'task_name': self._build_task_name(),
-                'cur_task_index': self._get_redis_value('curTaskIndex', int, 0),
-                'task_count': self._build_task_count(),
+                'cur_task_index': self._get_redis_value('waypointIndex', int, 0) if self._get_redis_value('currentAction', str, '') == 'multi_go_to_point' else self._get_redis_value('curTaskIndex', int, 0),
+                'task_count': self._get_redis_value('waypointTotal', int, 0) if self._get_redis_value('currentAction', str, '') == 'multi_go_to_point' else self._build_task_count(),
                 'battery': self._get_redis_value('batteryPercent', float, None),
                 'battery_percent': self._get_redis_value('batteryPercent', float, None),
                 'battery_raw': self._get_redis_value('batteryPercentRaw', float, None),
@@ -122,15 +159,16 @@ class MQTTIntegration:
                 'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
                 'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
                 'supported_actions': [
-                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'get_status', 'get_task_path'
+                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path'
                 ],
                 'supported_params': ['taskName', 'speed', 'tracking', 'path'],
                 'supported_status_fields': [
-                    'control_state', 'health_state', 'fault_state', 'mission_state', 'detail'
+                    'control_state', 'health_state', 'fault_state', 'mission_state', 'detail', 'rtk'
                 ],
-                'detail': self._build_detail(),
+                'detail': self._build_detail(task_params=task_params, current_location=current_location),
                 'timestamp': int(time.time())
             }
+            status.update(self._build_rtk_status_fields(status.get('detail')))
 
             return status
         except Exception as e:
@@ -211,6 +249,56 @@ class MQTTIntegration:
         except Exception:
             return None
 
+    def _get_task_origin_tolerance_m(self, detail=None):
+        detail = detail or self._read_runtime_detail()
+        tolerance = detail.get('taskOriginToleranceM')
+        if tolerance is None:
+            tolerance = detail.get('startToleranceM')
+        return self._coerce_value(tolerance, float, DEFAULT_TASK_ORIGIN_TOLERANCE_METERS)
+
+    def _distance_to_task_origin(self, task_params=None, current_location=None):
+        task_params = task_params or self._get_redis_hash('taskParams')
+        current_location = current_location or self._get_redis_hash('currentLocation')
+        start_lat = self._coerce_value(task_params.get('startLat'), float, None)
+        start_lon = self._coerce_value(task_params.get('startLon'), float, None)
+        current_lat = self._coerce_value(current_location.get('lat'), float, None)
+        current_lon = self._coerce_value(current_location.get('lon'), float, None)
+        if start_lat is None or start_lon is None or current_lat is None or current_lon is None:
+            return None
+        try:
+            distance, _ = util.get_distance_angle(current_lat, current_lon, start_lat, start_lon)
+            return round(float(distance), 3)
+        except Exception:
+            return None
+
+    def _build_task_origin_status_fields(self, task_params=None, current_location=None, tolerance_m=None):
+        task_params = task_params or self._get_redis_hash('taskParams')
+        current_location = current_location or self._get_redis_hash('currentLocation')
+        start_lat = self._coerce_value(task_params.get('startLat'), float, None)
+        start_lon = self._coerce_value(task_params.get('startLon'), float, None)
+        current_lat = self._coerce_value(current_location.get('lat'), float, None)
+        current_lon = self._coerce_value(current_location.get('lon'), float, None)
+        current_heading = self._coerce_value(current_location.get('heading'), float, None)
+        tolerance = tolerance_m if tolerance_m is not None else self._get_task_origin_tolerance_m()
+        distance_to_start = self._distance_to_task_origin(task_params, current_location)
+        at_origin = None
+        if distance_to_start is not None:
+            at_origin = distance_to_start <= tolerance
+        return {
+            'taskOrigin': {
+                'lat': start_lat,
+                'lon': start_lon,
+            },
+            'currentLocation': {
+                'lat': current_lat,
+                'lon': current_lon,
+                'heading': current_heading,
+            },
+            'distanceToTaskOriginM': distance_to_start,
+            'taskOriginToleranceM': tolerance,
+            'isAtTaskOrigin': at_origin,
+        }
+
     def _bool_value(self, value):
         value = self._decode_value(value)
         if isinstance(value, bool):
@@ -232,21 +320,69 @@ class MQTTIntegration:
         if not raw:
             return {}
         try:
-            return json.loads(raw)
+            detail = json.loads(raw)
+            return detail if isinstance(detail, dict) else {}
         except Exception:
             return {}
+
+    def _build_rtk_status_fields(self, detail=None):
+        detail = detail or self._read_runtime_detail()
+        return dict((key, detail.get(key)) for key in RTK_STATUS_FIELDS if key in detail)
+
+    def _build_live_rtk_runtime_detail(self, detail=None):
+        detail = dict(detail or {})
+        status = {}
+        try:
+            if get_shared_runtime is not None:
+                runtime = get_shared_runtime(logger)
+                if runtime is not None and hasattr(runtime, 'get_status'):
+                    status = runtime.get_status()
+        except Exception as e:
+            logger.debug("get live RTK runtime status failed: {}".format(str(e)))
+
+        if not status:
+            return {}
+
+        quality = status.get('rtkQuality')
+        try:
+            gga_age = float(status.get('rtkGgaAgeSec'))
+        except (TypeError, ValueError):
+            gga_age = None
+
+        fixed_available = (
+            quality is not None
+            and str(quality) == RTK_FIXED_QUALITY
+            and gga_age is not None
+            and gga_age <= RTK_FIXED_GGA_MAX_AGE_SECONDS
+        )
+        if gga_age is None:
+            fix_state = 'NO_RTK_GGA'
+        elif gga_age > RTK_FIXED_GGA_MAX_AGE_SECONDS:
+            fix_state = 'RTK_GGA_TIMEOUT'
+        elif quality is None or str(quality) != RTK_FIXED_QUALITY:
+            fix_state = 'RTK_NOT_FIXED'
+        else:
+            fix_state = 'FIXED'
+
+        if detail.get('rtkRecovering') or detail.get('rtkFixState') == 'RTK_FIX_TIMEOUT':
+            fix_state = detail.get('rtkFixState') or fix_state
+
+        status.update({
+            'rtkFixAvailable': fixed_available,
+            'rtkFixState': fix_state,
+            'rtkFixedQuality': RTK_FIXED_QUALITY,
+            'rtkGgaMaxAgeSec': RTK_FIXED_GGA_MAX_AGE_SECONDS,
+            'rtkRecovering': bool(detail.get('rtkRecovering', False)),
+            'rtkLostAt': detail.get('rtkLostAt'),
+            'rtkLostSeconds': detail.get('rtkLostSeconds'),
+            'rtkRecoveryTimeoutSec': detail.get('rtkRecoveryTimeoutSec', RTK_FIX_RECOVERY_TIMEOUT_SECONDS),
+        })
+        return status
 
     def _build_status(self):
         mission = self._get_redis_value('mission', str, '')
         parking = self._get_redis_value('parking', str, '0')
         current_action = self._get_redis_value('currentAction', str, '')
-        control_state = self._build_control_state()
-        power_on_state = self._get_optional_int('powerOnState')
-
-        if control_state == 'UNKNOWN':
-            return 'unknown'
-        if control_state in ('BLOCKED', 'DISABLED') or power_on_state == 0:
-            return 'disabled'
         if current_action == 'return_to_point':
             return 'returning'
         if mission == 'working':
@@ -268,10 +404,6 @@ class MQTTIntegration:
         return 'idle'
 
     def _build_mission_state(self):
-        control_state = self._build_control_state()
-        if control_state in ('BLOCKED', 'DISABLED', 'UNKNOWN'):
-            return control_state
-
         current_action = self._get_redis_value('currentAction', str, '')
         if current_action == 'return_to_point':
             return 'RETURNING'
@@ -286,42 +418,44 @@ class MQTTIntegration:
         return 'IDLE'
 
     def _build_control_state(self):
-        power_on_state = self._get_optional_int('powerOnState')
-        if power_on_state == 0:
-            return 'DISABLED'
         control_state = self._get_redis_value('controlState', str, '')
-        if control_state:
+        if control_state and control_state not in ('DISABLED', 'UNKNOWN'):
             return control_state
-        if power_on_state is None:
-            return 'UNKNOWN'
         if self._get_redis_value('mission', str, '') == 'working':
             return 'RUNNING'
         if self._get_redis_value('parking', str, '0') == '1':
             return 'STOPPED'
         return 'IDLE'
 
+    def _is_ignored_enable_fault_state(self, fault_state):
+        return fault_state in ('LOWER_MACHINE_DISABLED', 'LOWER_MACHINE_STATUS_UNKNOWN')
+
     def _build_fault_state(self):
-        power_on_state = self._get_optional_int('powerOnState')
-        if power_on_state == 0:
-            return 'LOWER_MACHINE_DISABLED'
         fault_state = self._get_redis_value('faultState', str, '')
-        if fault_state:
+        if fault_state and not self._is_ignored_enable_fault_state(fault_state):
             return fault_state
-        if power_on_state is None:
-            return 'LOWER_MACHINE_STATUS_UNKNOWN'
         return ''
 
     def _build_health_state(self):
+        raw_fault_state = self._get_redis_value('faultState', str, '')
         if self._build_fault_state():
             return 'WARN'
         health_state = self._get_redis_value('healthState', str, '')
+        if self._is_ignored_enable_fault_state(raw_fault_state):
+            return 'OK'
         if health_state:
             return health_state
         return 'OK'
 
-    def _build_detail(self):
+    def _build_detail(self, task_params=None, current_location=None):
         detail = self._read_runtime_detail()
-        power_on_state = self._get_optional_int('powerOnState')
+        task_params = task_params or self._get_redis_hash('taskParams')
+        current_location = current_location or self._get_redis_hash('currentLocation')
+        current_lat = self._coerce_value(current_location.get('lat'), float, None)
+        current_lon = self._coerce_value(current_location.get('lon'), float, None)
+        current_heading = self._coerce_value(current_location.get('heading'), float, None)
+        task_origin_tolerance = self._get_task_origin_tolerance_m(detail)
+        distance_to_start = self._distance_to_task_origin(task_params, current_location)
         battery_percent = self._get_redis_value('batteryPercent', float, None)
         detail['lastCommandMessage'] = self._get_redis_value('lastCommandMessage', str, '')
         detail['startCheckReady'] = self._get_redis_value('startCheckReady', self._bool_value, False)
@@ -331,11 +465,20 @@ class MQTTIntegration:
         detail['batteryReportAt'] = self._get_optional_int('batteryReportAt')
         detail['packVoltage'] = self._get_redis_value('packVoltage', float, None)
         detail['packVoltageReportAt'] = self._get_optional_int('packVoltageReportAt')
-        detail['powerOnState'] = power_on_state
-        detail['powerOnEnabled'] = power_on_state == 1
         detail['hardwareState'] = self._get_optional_int('hardwareState')
         detail['hardwareReportAt'] = self._get_optional_int('hardwareReportAt')
         detail['hardwareReportAgeSec'] = self._hardware_report_age_sec()
+        detail['distanceToStartM'] = distance_to_start
+        detail['distanceToTaskOriginM'] = distance_to_start
+        detail['startToleranceM'] = task_origin_tolerance
+        detail['taskOriginToleranceM'] = task_origin_tolerance
+        detail['currentLat'] = current_lat
+        detail['currentLon'] = current_lon
+        detail['currentHeading'] = current_heading
+        detail['taskStartLat'] = self._coerce_value(task_params.get('startLat'), float, None)
+        detail['taskStartLon'] = self._coerce_value(task_params.get('startLon'), float, None)
+        detail['originHeading'] = self._coerce_value(task_params.get('originHeading'), float, None)
+        detail.update(self._build_live_rtk_runtime_detail(detail))
         return detail
 
     def _build_task_name(self):

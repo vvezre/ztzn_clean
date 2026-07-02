@@ -1,4 +1,4 @@
-DEFAULT_EDGE_TARGET_TOLERANCE_M = 0.5
+DEFAULT_EDGE_TARGET_TOLERANCE_M = 0.10
 
 
 def should_accept_edge_stop(distance_to_target_m, tolerance_m=DEFAULT_EDGE_TARGET_TOLERANCE_M):

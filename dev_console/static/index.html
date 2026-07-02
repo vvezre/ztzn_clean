@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>光伏清扫机器人开发者工具</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #d9e0e6;
+      --text: #17202a;
+      --muted: #667683;
+      --blue: #1f6feb;
+      --green: #248a3d;
+      --red: #c4322b;
+      --amber: #a66f16;
+      --ink: #1f2933;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    header {
+      background: #fff;
+      border-bottom: 1px solid var(--line);
+      padding: 12px 16px 0;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 9px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafb;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .pill.ok { border-color: rgba(36, 138, 61, 0.35); color: var(--green); }
+    .pill.warn { border-color: rgba(166, 111, 22, 0.35); color: var(--amber); }
+    .pill.bad { border-color: rgba(196, 50, 43, 0.35); color: var(--red); }
+
+    nav {
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+    }
+
+    .tab {
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 10px 12px;
+      font: inherit;
+      font-weight: 700;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .tab.active {
+      color: var(--blue);
+      border-bottom-color: var(--blue);
+    }
+
+    main {
+      padding: 14px;
+      min-width: 0;
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .overview-grid {
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+    }
+
+    .correction-grid {
+      grid-template-columns: minmax(420px, 1fr) 370px;
+    }
+
+    .panel {
+      min-width: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 42px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .panel-body {
+      padding: 12px;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 9px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+    }
+
+    .metric.full {
+      grid-column: 1 / -1;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .metric-code {
+      display: block;
+      margin-top: 3px;
+      color: #8a98a5;
+      font-size: 10px;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+
+    .value {
+      margin-top: 5px;
+      color: var(--text);
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.15;
+      overflow-wrap: anywhere;
+    }
+
+    .mono {
+      font-family: Consolas, "Courier New", monospace;
+    }
+
+    .canvas-wrap {
+      height: 560px;
+      min-height: 420px;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #fbfcfd;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .key {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .swatch {
+      width: 18px;
+      height: 3px;
+      border-radius: 2px;
+      background: var(--line);
+    }
+
+    .swatch.plan { background: #7c8a96; }
+    .swatch.current { background: var(--blue); }
+    .swatch.trace { background: #d69e2e; }
+    .swatch.cte { background: #8b949e; }
+    .swatch.vehicle { background: var(--ink); }
+    .swatch.target { background: var(--red); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th,
+    td {
+      padding: 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      white-space: nowrap;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 700;
+      background: #f8fafb;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      max-height: calc(100vh - 190px);
+    }
+
+    .current-row {
+      background: #edf5ff;
+    }
+
+    .redis-grid {
+      grid-template-columns: repeat(2, minmax(280px, 1fr));
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input,
+    select,
+    button {
+      font: inherit;
+    }
+
+    input,
+    select {
+      height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 9px;
+    }
+
+    .cmd {
+      height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 12px;
+      cursor: pointer;
+    }
+
+    .cmd:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .log-view {
+      min-height: 420px;
+      max-height: calc(100vh - 230px);
+      overflow: auto;
+      background: #101820;
+      color: #d6e2ee;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 20px;
+    }
+
+    @media (max-width: 980px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip {
+        justify-content: flex-start;
+      }
+
+      .overview-grid,
+      .correction-grid,
+      .redis-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .canvas-wrap {
+        height: 460px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="shell">
+    <header>
+      <div class="topbar">
+        <h1>光伏清扫机器人开发者工具</h1>
+        <div class="status-strip">
+          <span class="pill" :class="missionClass">任务 {{ overview.mission || '-' }}</span>
+          <span class="pill" :class="parkingClass">停车 {{ overview.parking ? '是' : '否' }}</span>
+          <span class="pill" :class="rtkClass">RTK {{ rtkText }}</span>
+          <span class="pill">轨迹 {{ correction.trace.length }}</span>
+        </div>
+      </div>
+      <nav>
+        <button class="tab" :class="{active: activeTab === 'overview'}" @click="activeTab = 'overview'">运行总览</button>
+        <button class="tab" :class="{active: activeTab === 'correction'}" @click="activeTab = 'correction'">路径纠偏实时面板</button>
+        <button class="tab" :class="{active: activeTab === 'task'}" @click="activeTab = 'task'">任务路径查看器</button>
+        <button class="tab" :class="{active: activeTab === 'redis'}" @click="activeTab = 'redis'">Redis 状态查看</button>
+        <button class="tab" :class="{active: activeTab === 'logs'}" @click="activeTab = 'logs'">日志过滤查看</button>
+      </nav>
+    </header>
+
+    <main>
+      <section v-show="activeTab === 'overview'" class="grid overview-grid">
+        <article class="panel" v-for="item in overviewItems" :key="item.label">
+          <div class="panel-body">
+            <div class="label">{{ item.label }}</div>
+            <div class="value mono">{{ item.value }}</div>
+          </div>
+        </article>
+      </section>
+
+      <section v-show="activeTab === 'correction'" class="grid correction-grid">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>RTK 路径实时预览</h2>
+            <span class="pill">{{ textOrNone(correction.status.segmentSource) }}</span>
+          </div>
+          <div class="canvas-wrap">
+            <canvas ref="canvas"></canvas>
+          </div>
+          <div class="legend">
+            <span class="key"><span class="swatch plan"></span>规划路径</span>
+            <span class="key"><span class="swatch current"></span>当前段</span>
+            <span class="key"><span class="swatch trace"></span>实际轨迹</span>
+            <span class="key"><span class="swatch cte"></span>横向偏差</span>
+            <span class="key"><span class="swatch vehicle"></span>当前位置</span>
+            <span class="key"><span class="swatch target"></span>终点</span>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>纠偏实时数据</h2>
+            <span class="pill" :class="globalGoClass">global_go {{ globalGoText(correction.correction.globalGo) }}</span>
+          </div>
+          <div class="panel-body">
+            <div class="metric-grid">
+              <div class="metric" title="目标路径方向减当前车头方向后的角度差，单位为度。">
+                <div class="label">航向误差<span class="metric-code mono">heading_error / deg</span></div>
+                <div class="value mono">{{ fmt(correction.correction.headingError, 3) }}</div>
+              </div>
+              <div class="metric" title="当前位置到当前规划线段的横向偏离距离，单位为米。">
+                <div class="label">横向偏差距离<span class="metric-code mono">cte / m</span></div>
+                <div class="value mono">{{ fmt(correction.correction.cte, 3) }}</div>
+              </div>
+              <div class="metric" title="纠偏公式计算后实际下发给转向控制的 Z 轴速度输出。">
+                <div class="label">纠偏转速<span class="metric-code mono">z_speed</span></div>
+                <div class="value mono">{{ fmt(correction.correction.zSpeed, 0) }}</div>
+              </div>
+              <div class="metric" title="当前 RTK 位置到当前任务段终点的直线距离，单位为米。">
+                <div class="label">到目标点距离<span class="metric-code mono">distance / m</span></div>
+                <div class="value mono">{{ fmt(correction.correction.distanceToTarget, 3) }}</div>
+              </div>
+              <div class="metric" title="按当前路径方向投影后的剩余距离，正数表示还未到终点。">
+                <div class="label">沿路径剩余距离<span class="metric-code mono">signed / m</span></div>
+                <div class="value mono">{{ fmt(correction.correction.signedRemaining, 3) }}</div>
+              </div>
+              <div class="metric" title="边缘检测点到任务目标点的距离；未上报时显示 -。">
+                <div class="label">边缘到目标距离<span class="metric-code mono">edge / m</span></div>
+                <div class="value mono">{{ fmt(correction.status.edgeDistanceToTargetM, 3) }}</div>
+              </div>
+              <div class="metric" title="RTK 上报的车辆当前航向角，单位为度。">
+                <div class="label">当前车头方向<span class="metric-code mono">vehicle heading</span></div>
+                <div class="value mono">{{ fmt(correction.vehicle.heading, 2) }}</div>
+              </div>
+              <div class="metric" title="当前任务段的目标路径航向角，单位为度。">
+                <div class="label">目标路径方向<span class="metric-code mono">target heading</span></div>
+                <div class="value mono">{{ fmt(correction.segment && correction.segment.targetHeading, 2) }}</div>
+              </div>
+              <div class="metric" title="当前纠偏参数是否来自主程序实时上报；未上报时显示无。">
+                <div class="label">参数来源<span class="metric-code mono">parameter source</span></div>
+                <div class="value mono">{{ textOrNone(correction.parameters && correction.parameters.source) }}</div>
+              </div>
+              <div class="metric" title="当前纠偏数据是否来自主程序实时上报；开发工具不再自行推算。">
+                <div class="label">纠偏数据来源<span class="metric-code mono">correction source</span></div>
+                <div class="value mono">{{ textOrNone(correction.correction.source) }}</div>
+              </div>
+              <div class="metric" title="航向误差参与纠偏公式时使用的放大系数。">
+                <div class="label">航向误差增益<span class="metric-code mono">headingGain</span></div>
+                <div class="value mono">{{ fmt(correction.parameters && correction.parameters.headingGain, 1) }}</div>
+              </div>
+              <div class="metric" title="横向偏差参与纠偏公式时使用的放大系数。">
+                <div class="label">横向偏差增益<span class="metric-code mono">cteGain</span></div>
+                <div class="value mono">{{ fmt(correction.parameters && correction.parameters.cteGain, 1) }}</div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section v-show="activeTab === 'task'" class="panel">
+        <div class="panel-head">
+          <h2>任务路径查看器</h2>
+          <div class="toolbar">
+            <span class="pill">任务 {{ textOrNone(taskPath.taskName) }}</span>
+            <span class="pill">来源 {{ textOrNone(taskPath.source) }}</span>
+            <span class="pill">段数 {{ taskPath.count || 0 }}</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th><th>ID</th><th>当前</th><th>mode</th><th>angle</th><th>heading</th><th>length</th>
+                <th>startX</th><th>startY</th><th>endX</th><th>endY</th>
+                <th>startLat</th><th>startLon</th><th>endLat</th><th>endLon</th>
+                <th>back_len</th><th>turn_back_len</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="item in taskPath.tasks" :key="item.index" :class="{'current-row': item.current}">
+                <td>{{ item.index }}</td><td>{{ item.id }}</td><td>{{ item.current ? '是' : '' }}</td>
+                <td>{{ item.mode }}</td><td>{{ item.angle }}</td><td>{{ item.heading }}</td><td>{{ item.length }}</td>
+                <td>{{ item.startX }}</td><td>{{ item.startY }}</td><td>{{ item.endX }}</td><td>{{ item.endY }}</td>
+                <td class="mono">{{ fmt(item.startLat, 8) }}</td><td class="mono">{{ fmt(item.startLon, 8) }}</td>
+                <td class="mono">{{ fmt(item.endLat, 8) }}</td><td class="mono">{{ fmt(item.endLon, 8) }}</td>
+                <td>{{ item.back_len }}</td><td>{{ item.turn_back_len }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="!taskPath.tasks.length" class="empty">暂无任务路径数据</div>
+        </div>
+      </section>
+
+      <section v-show="activeTab === 'redis'" class="grid redis-grid">
+        <article class="panel" v-for="(group, name) in redisState.groups" :key="name">
+          <div class="panel-head">
+            <h2>{{ redisGroupName(name) }}</h2>
+          </div>
+          <div class="panel-body">
+            <pre class="mono">{{ pretty(group) }}</pre>
+          </div>
+        </article>
+      </section>
+
+      <section v-show="activeTab === 'logs'" class="panel">
+        <div class="panel-head">
+          <h2>日志过滤查看</h2>
+          <div class="toolbar">
+            <input v-model="logQuery" @keyup.enter="fetchLogs" placeholder="关键字，例如 RTK / edge / linear">
+            <select v-model="logLimit">
+              <option value="100">100 行</option>
+              <option value="200">200 行</option>
+              <option value="500">500 行</option>
+            </select>
+            <button class="cmd" @click="fetchLogs">刷新</button>
+          </div>
+        </div>
+        <pre class="log-view mono">{{ logs.lines.length ? logs.lines.join('\n') : '暂无匹配日志' }}</pre>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const { createApp, nextTick } = Vue;
+
+    createApp({
+      data() {
+        return {
+          activeTab: 'overview',
+          overview: {},
+          correction: { segment: null, vehicle: {}, correction: {}, parameters: {}, status: {}, trace: [] },
+          taskPath: { tasks: [] },
+          redisState: { groups: {} },
+          logs: { lines: [] },
+          logQuery: '',
+          logLimit: '200',
+          pollTimer: null
+        };
+      },
+      computed: {
+        overviewItems() {
+          const runtimeState = this.overview.runtimeState || {};
+          return [
+            { label: '生命周期状态', value: this.stateText(runtimeState) },
+            { label: '运行影响', value: this.effectsText(runtimeState.effects) },
+            { label: '任务状态', value: this.overview.mission || '-' },
+            { label: '当前动作', value: this.overview.currentAction || '-' },
+            { label: '控制状态', value: this.overview.controlState || '-' },
+            { label: '健康状态', value: this.overview.healthState || '-' },
+            { label: '故障状态', value: this.overview.faultState || '-' },
+            { label: '电量百分比', value: this.fmt(this.overview.batteryPercent, 1) },
+            { label: '电池电压', value: this.fmt(this.overview.packVoltage, 2) },
+            { label: '舱位状态', value: this.overview.garageState || '-' },
+            { label: '前进速度', value: this.overview.forwardSpeed ?? '-' },
+            { label: '滚刷速度', value: this.overview.brushSpeed ?? '-' },
+            { label: '当前任务', value: this.overview.currentTaskName || '-' },
+            { label: '任务段序号', value: this.overview.curTaskIndex ?? '-' }
+          ];
+        },
+        rtkText() {
+          const fixed = this.overview.rtkFixed;
+          if (fixed === true) return '固定解';
+          if (fixed === false) return '丢失';
+          return '未知';
+        },
+        rtkClass() {
+          if (this.overview.rtkFixed === true) return 'ok';
+          if (this.overview.rtkFixed === false) return 'bad';
+          return 'warn';
+        },
+        missionClass() {
+          return this.overview.mission === 'working' ? 'ok' : '';
+        },
+        parkingClass() {
+          return this.overview.parking ? 'warn' : 'ok';
+        },
+        globalGoClass() {
+          const value = this.correction.correction && this.correction.correction.globalGo;
+          if (value === true) return 'ok';
+          if (value === false) return 'bad';
+          return 'warn';
+        }
+      },
+      watch: {
+        activeTab() {
+          nextTick(() => this.draw());
+        }
+      },
+      mounted() {
+        this.resizeCanvas();
+        window.addEventListener('resize', this.resizeCanvas);
+        this.refreshAll();
+        this.pollTimer = setInterval(this.refreshRealtime, 500);
+      },
+      beforeUnmount() {
+        clearInterval(this.pollTimer);
+        window.removeEventListener('resize', this.resizeCanvas);
+      },
+      methods: {
+        async refreshAll() {
+          await Promise.all([
+            this.fetchOverview(),
+            this.fetchCorrection(),
+            this.fetchTaskPath(),
+            this.fetchRedisState(),
+            this.fetchLogs()
+          ]);
+          this.draw();
+        },
+        async refreshRealtime() {
+          await Promise.all([this.fetchOverview(), this.fetchCorrection(), this.fetchTaskPath()]);
+          if (this.activeTab === 'correction') this.draw();
+        },
+        async fetchJson(url) {
+          const response = await fetch(url, { cache: 'no-store' });
+          return await response.json();
+        },
+        async fetchOverview() {
+          this.overview = await this.fetchJson('/dev/overview/state');
+        },
+        async fetchCorrection() {
+          this.correction = await this.fetchJson('/dev/correction/state');
+        },
+        async fetchTaskPath() {
+          this.taskPath = await this.fetchJson('/dev/task-path');
+        },
+        async fetchRedisState() {
+          this.redisState = await this.fetchJson('/dev/redis/state');
+        },
+        async fetchLogs() {
+          const params = new URLSearchParams({ query: this.logQuery, limit: this.logLimit });
+          this.logs = await this.fetchJson('/dev/logs?' + params.toString());
+        },
+        fmt(value, digits) {
+          if (value === null || value === undefined || value === '' || Number.isNaN(Number(value))) return '无';
+          return Number(value).toFixed(digits);
+        },
+        textOrNone(value) {
+          if (value === null || value === undefined || value === '') return '无';
+          if (value === 'none' || value === 'unreported' || value === 'not_reported') return '无';
+          return value;
+        },
+        stateText(runtimeState) {
+          if (!runtimeState) return '无';
+          if (runtimeState.stateLabel && runtimeState.state) {
+            return `${runtimeState.stateLabel} (${runtimeState.state})`;
+          }
+          return this.textOrNone(runtimeState.stateLabel || runtimeState.state);
+        },
+        effectsText(effects) {
+          const runtimeState = this.overview.runtimeState || {};
+          if (Array.isArray(runtimeState.effectLabels) && runtimeState.effectLabels.length) {
+            return runtimeState.effectLabels.join(' / ');
+          }
+          if (!effects) return '无';
+          const parts = [];
+          if (effects.motionAllowed) parts.push('允许运动');
+          if (effects.taskActive) parts.push('任务执行中');
+          if (effects.startAllowed) parts.push('允许启动');
+          if (effects.requiresAttention) parts.push('需要人工处理');
+          return parts.length ? parts.join(' / ') : '无';
+        },
+        globalGoText(value) {
+          if (value === true) return '1';
+          if (value === false) return '0';
+          return '无';
+        },
+        pretty(value) {
+          return JSON.stringify(value || {}, null, 2);
+        },
+        redisGroupName(name) {
+          return {
+            vehicle: '车辆状态',
+            task: '任务状态',
+            rtk: 'RTK 状态',
+            loop: '循环清扫'
+          }[name] || name;
+        },
+        resizeCanvas() {
+          const canvas = this.$refs.canvas;
+          if (!canvas) return;
+          const rect = canvas.getBoundingClientRect();
+          const ratio = window.devicePixelRatio || 1;
+          canvas.width = Math.max(320, Math.floor(rect.width * ratio));
+          canvas.height = Math.max(320, Math.floor(rect.height * ratio));
+          canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
+          this.draw();
+        },
+        project(lat, lon, origin) {
+          const metersPerDegLat = 111320;
+          const metersPerDegLon = 111320 * Math.cos((origin.lat || 0) * Math.PI / 180);
+          return { x: (lon - origin.lon) * metersPerDegLon, y: -(lat - origin.lat) * metersPerDegLat };
+        },
+        isFiniteCoord(value) {
+          return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+        },
+        hasLatLon(lat, lon) {
+          return this.isFiniteCoord(lat) && this.isFiniteCoord(lon);
+        },
+        normalizeSegment(item) {
+          if (!item || !this.hasLatLon(item.startLat, item.startLon) || !this.hasLatLon(item.endLat, item.endLon)) return null;
+          const heading = this.isFiniteCoord(item.targetHeading) ? item.targetHeading : item.heading;
+          return {
+            index: item.index,
+            id: item.id,
+            current: Boolean(item.current),
+            startLat: Number(item.startLat),
+            startLon: Number(item.startLon),
+            endLat: Number(item.endLat),
+            endLon: Number(item.endLon),
+            targetHeading: this.isFiniteCoord(heading) ? Number(heading) : 0
+          };
+        },
+        plannedSegments() {
+          return (this.taskPath.tasks || [])
+            .map(item => this.normalizeSegment(item))
+            .filter(Boolean);
+        },
+        currentPreviewSegment(planSegments) {
+          return this.normalizeSegment(this.correction.segment) || planSegments.find(item => item.current) || null;
+        },
+        tracePoints() {
+          return (this.correction.trace || [])
+            .filter(item => this.hasLatLon(item.lat, item.lon))
+            .map(item => ({ lat: Number(item.lat), lon: Number(item.lon) }));
+        },
+        boundsFrom(points) {
+          if (!points.length) return null;
+          const bounds = points.reduce((acc, item) => ({
+            minX: Math.min(acc.minX, item.x),
+            maxX: Math.max(acc.maxX, item.x),
+            minY: Math.min(acc.minY, item.y),
+            maxY: Math.max(acc.maxY, item.y)
+          }), { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity });
+          if (bounds.minX === bounds.maxX) { bounds.minX -= 1; bounds.maxX += 1; }
+          if (bounds.minY === bounds.maxY) { bounds.minY -= 1; bounds.maxY += 1; }
+          const margin = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 1) * 0.08;
+          bounds.minX -= margin;
+          bounds.maxX += margin;
+          bounds.minY -= margin;
+          bounds.maxY += margin;
+          return bounds;
+        },
+        toCanvas(point, bounds, width, height) {
+          const pad = 42;
+          const spanX = Math.max(1, bounds.maxX - bounds.minX);
+          const spanY = Math.max(1, bounds.maxY - bounds.minY);
+          const scale = Math.min((width - pad * 2) / spanX, (height - pad * 2) / spanY);
+          return { x: pad + (point.x - bounds.minX) * scale, y: pad + (point.y - bounds.minY) * scale };
+        },
+        closestPoint(start, end, point) {
+          const dx = end.x - start.x;
+          const dy = end.y - start.y;
+          const lenSq = dx * dx + dy * dy || 1;
+          const t = ((point.x - start.x) * dx + (point.y - start.y) * dy) / lenSq;
+          return { x: start.x + Math.max(0, Math.min(1, t)) * dx, y: start.y + Math.max(0, Math.min(1, t)) * dy };
+        },
+        drawArrow(ctx, from, angleDeg, length, color) {
+          const angle = (angleDeg - 90) * Math.PI / 180;
+          const to = { x: from.x + Math.cos(angle) * length, y: from.y + Math.sin(angle) * length };
+          ctx.strokeStyle = color;
+          ctx.fillStyle = color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(from.x, from.y);
+          ctx.lineTo(to.x, to.y);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(to.x, to.y);
+          ctx.lineTo(to.x - Math.cos(angle - 0.55) * 9, to.y - Math.sin(angle - 0.55) * 9);
+          ctx.lineTo(to.x - Math.cos(angle + 0.55) * 9, to.y - Math.sin(angle + 0.55) * 9);
+          ctx.closePath();
+          ctx.fill();
+        },
+        drawSegmentLine(ctx, segment, origin, bounds, width, height, color, lineWidth, dash) {
+          const start = this.toCanvas(this.project(segment.startLat, segment.startLon, origin), bounds, width, height);
+          const end = this.toCanvas(this.project(segment.endLat, segment.endLon, origin), bounds, width, height);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = lineWidth;
+          ctx.setLineDash(dash || []);
+          ctx.beginPath();
+          ctx.moveTo(start.x, start.y);
+          ctx.lineTo(end.x, end.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          return { start, end };
+        },
+        draw() {
+          const canvas = this.$refs.canvas;
+          if (!canvas) return;
+          const rect = canvas.getBoundingClientRect();
+          const width = rect.width;
+          const height = rect.height;
+          if (!width || !height) return;
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, width, height);
+          ctx.fillStyle = '#fbfcfd';
+          ctx.fillRect(0, 0, width, height);
+          ctx.strokeStyle = '#e6ebef';
+          ctx.lineWidth = 1;
+          for (let x = 0; x < width; x += 32) {
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+          }
+          for (let y = 0; y < height; y += 32) {
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+          }
+
+          const planSegments = this.plannedSegments();
+          const segment = this.currentPreviewSegment(planSegments);
+          const vehicleData = this.correction.vehicle || {};
+          const hasVehicle = this.hasLatLon(vehicleData.lat, vehicleData.lon);
+          const trace = this.tracePoints();
+          if (!segment && !planSegments.length && !hasVehicle) {
+            ctx.fillStyle = '#667683';
+            ctx.font = '14px Arial';
+            ctx.fillText('无实际 RTK 任务段数据', 24, 34);
+            return;
+          }
+
+          const originSource = segment || planSegments[0] || { startLat: Number(vehicleData.lat), startLon: Number(vehicleData.lon) };
+          const origin = { lat: originSource.startLat, lon: originSource.startLon };
+          const points = [];
+          planSegments.forEach(item => {
+            points.push(this.project(item.startLat, item.startLon, origin));
+            points.push(this.project(item.endLat, item.endLon, origin));
+          });
+          if (segment) {
+            points.push(this.project(segment.startLat, segment.startLon, origin));
+            points.push(this.project(segment.endLat, segment.endLon, origin));
+          }
+          if (hasVehicle) points.push(this.project(vehicleData.lat, vehicleData.lon, origin));
+          trace.forEach(item => points.push(this.project(item.lat, item.lon, origin)));
+          const bounds = this.boundsFrom(points);
+          if (!bounds) return;
+
+          planSegments.forEach(item => {
+            const line = this.drawSegmentLine(ctx, item, origin, bounds, width, height, '#7c8a96', 1.5, [5, 5]);
+            ctx.fillStyle = item.current ? '#1f6feb' : '#7c8a96';
+            ctx.beginPath(); ctx.arc(line.start.x, line.start.y, item.current ? 4 : 3, 0, Math.PI * 2); ctx.fill();
+          });
+
+          ctx.strokeStyle = '#d69e2e';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          trace.forEach((item, index) => {
+            const point = this.toCanvas(this.project(item.lat, item.lon, origin), bounds, width, height);
+            if (index === 0) ctx.moveTo(point.x, point.y);
+            else ctx.lineTo(point.x, point.y);
+          });
+          ctx.stroke();
+
+          let routeStart = null;
+          let routeEnd = null;
+          let vehicle = null;
+          let closest = null;
+          let segmentStart = null;
+          let segmentEnd = null;
+          let vehiclePoint = null;
+          if (segment) {
+            const route = this.drawSegmentLine(ctx, segment, origin, bounds, width, height, '#1f6feb', 4);
+            routeStart = route.start;
+            routeEnd = route.end;
+            segmentStart = this.project(segment.startLat, segment.startLon, origin);
+            segmentEnd = this.project(segment.endLat, segment.endLon, origin);
+          }
+          if (hasVehicle) {
+            vehiclePoint = this.project(vehicleData.lat, vehicleData.lon, origin);
+            vehicle = this.toCanvas(vehiclePoint, bounds, width, height);
+          }
+          if (segment && hasVehicle) {
+            closest = this.toCanvas(this.closestPoint(segmentStart, segmentEnd, vehiclePoint), bounds, width, height);
+          }
+
+          if (closest && vehicle) {
+            ctx.strokeStyle = '#8b949e';
+            ctx.setLineDash([6, 5]);
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(vehicle.x, vehicle.y);
+            ctx.lineTo(closest.x, closest.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+
+          if (routeStart && routeEnd) {
+            ctx.fillStyle = '#248a3d';
+            ctx.beginPath(); ctx.arc(routeStart.x, routeStart.y, 6, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#c4322b';
+            ctx.beginPath(); ctx.arc(routeEnd.x, routeEnd.y, 7, 0, Math.PI * 2); ctx.fill();
+          }
+          if (vehicle) {
+            ctx.fillStyle = '#1f2933';
+            ctx.beginPath(); ctx.arc(vehicle.x, vehicle.y, 7, 0, Math.PI * 2); ctx.fill();
+          }
+
+          if (vehicle) this.drawArrow(ctx, vehicle, vehicleData.heading || 0, 34, '#1f2933');
+          if (routeStart && segment) this.drawArrow(ctx, routeStart, segment.targetHeading || 0, 30, '#c4322b');
+
+          const z = Number((this.correction.correction || {}).zSpeed || 0);
+          if (vehicle && z !== 0) {
+            this.drawArrow(ctx, { x: vehicle.x, y: vehicle.y + 20 }, (vehicleData.heading || 0) + (z > 0 ? 42 : -42), 24, '#a66f16');
+          }
+
+          ctx.fillStyle = '#17202a';
+          ctx.font = '12px Arial';
+          if (routeStart && segment) {
+            const title = segment.index !== undefined && segment.index !== null ? '当前段 #' + segment.index : '当前段';
+            ctx.fillText(title, routeStart.x + 8, routeStart.y - 10);
+          }
+          if (vehicle) ctx.fillText('当前位置', vehicle.x + 10, vehicle.y + 18);
+          if (closest) ctx.fillText('cte ' + this.fmt((this.correction.correction || {}).cte, 3) + 'm', closest.x + 8, closest.y - 8);
+        }
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

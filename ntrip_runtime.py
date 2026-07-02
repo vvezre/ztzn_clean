@@ -1,4 +1,4 @@
-﻿# coding=utf-8
+# coding=utf-8
 
 import base64
 import json
@@ -18,7 +18,7 @@ def _to_bool(value, default=False):
 class NtripConfig(object):
     def __init__(self, enabled=False, host='', port=0, mountpoint='', username='',
                  password='', gga_interval_seconds=5.0, connect_timeout_seconds=5.0,
-                 reconnect_interval_seconds=5.0):
+                 reconnect_interval_seconds=5.0, rtcm_timeout_seconds=15.0):
         self.enabled = enabled
         self.host = host
         self.port = int(port or 0)
@@ -28,6 +28,7 @@ class NtripConfig(object):
         self.gga_interval_seconds = float(gga_interval_seconds)
         self.connect_timeout_seconds = float(connect_timeout_seconds)
         self.reconnect_interval_seconds = float(reconnect_interval_seconds)
+        self.rtcm_timeout_seconds = float(rtcm_timeout_seconds)
 
     def is_complete(self):
         return bool(
@@ -60,6 +61,7 @@ class NtripConfig(object):
             gga_interval_seconds=pick('gga_interval_seconds', 5.0) or 5.0,
             connect_timeout_seconds=pick('connect_timeout_seconds', 5.0) or 5.0,
             reconnect_interval_seconds=pick('reconnect_interval_seconds', 5.0) or 5.0,
+            rtcm_timeout_seconds=pick('rtcm_timeout_seconds', 15.0) or 15.0,
         )
 
 
@@ -89,9 +91,22 @@ class NtripCorrectionRuntime(object):
         self._last_gga_sent_at = 0.0
         self._last_connect_attempt_at = 0.0
         self._connected_once = False
+        self.latest_quality = None
+        self._last_gga_at = 0.0
+        self._last_fixed_at = 0.0
+        self._last_rtcm_recv_at = 0.0
+        self._connected_at = 0.0
+        self._last_disconnect_reason = ''
+        self._last_rtcm_timeout_at = 0.0
 
     def observe_gga(self, nmea_sentence):
         quality = extract_gga_quality(nmea_sentence)
+        if quality is not None:
+            now = time.time()
+            self.latest_quality = quality
+            self._last_gga_at = now
+            if quality == '4':
+                self._last_fixed_at = now
         if quality is None or quality == '0':
             return
         self._latest_gga = normalize_gga_sentence(nmea_sentence)
@@ -115,16 +130,76 @@ class NtripCorrectionRuntime(object):
         self._ensure_connected()
         if self._sock is None:
             return
+
+        now = time.time()
+        if self._is_rtcm_timed_out(now):
+            self._last_rtcm_timeout_at = now
+            self.logger.warning(
+                'RTCM receive timeout: age={:.1f}s timeout={:.1f}s; reconnecting NTRIP'.format(
+                    self._rtcm_age_seconds(now) or 0.0,
+                    self.config.rtcm_timeout_seconds
+                )
+            )
+            self.close('rtcm_timeout')
+            return
+
         self._maybe_send_gga()
         self._forward_rtcm(serial_port)
 
-    def close(self):
+    def close(self, reason=None):
         if self._sock is not None:
             try:
                 self._sock.close()
             except Exception:
                 pass
             self._sock = None
+        if reason:
+            self._last_disconnect_reason = reason
+        self._connected_at = 0.0
+
+    def is_connected(self):
+        return self._sock is not None
+
+    def _rtcm_age_seconds(self, now=None):
+        now = time.time() if now is None else now
+        baseline = self._last_rtcm_recv_at or self._connected_at
+        if baseline <= 0:
+            return None
+        return max(0.0, now - baseline)
+
+    def _is_rtcm_timed_out(self, now=None):
+        if self._sock is None or self.config.rtcm_timeout_seconds <= 0:
+            return False
+        age = self._rtcm_age_seconds(now)
+        return age is not None and age > self.config.rtcm_timeout_seconds
+
+    def get_status(self, now=None):
+        now = time.time() if now is None else now
+
+        def age_or_none(timestamp):
+            if not timestamp:
+                return None
+            return round(max(0.0, now - timestamp), 3)
+
+        rtcm_age = self._rtcm_age_seconds(now)
+        return {
+            'ntripEnabled': bool(self.config.enabled),
+            'ntripConfigured': bool(self.config.is_complete()),
+            'ntripConnected': self.is_connected(),
+            'ntripLastDisconnectReason': self._last_disconnect_reason,
+            'ntripConnectedAt': int(self._connected_at) if self._connected_at else None,
+            'rtcmLastReceivedAt': int(self._last_rtcm_recv_at) if self._last_rtcm_recv_at else None,
+            'rtcmAgeSec': round(rtcm_age, 3) if rtcm_age is not None else None,
+            'rtcmTimeoutSec': self.config.rtcm_timeout_seconds,
+            'rtcmTimedOut': self._is_rtcm_timed_out(now),
+            'rtcmLastTimeoutAt': int(self._last_rtcm_timeout_at) if self._last_rtcm_timeout_at else None,
+            'rtkQuality': self.latest_quality,
+            'rtkLastGgaAt': int(self._last_gga_at) if self._last_gga_at else None,
+            'rtkGgaAgeSec': age_or_none(self._last_gga_at),
+            'rtkLastFixedAt': int(self._last_fixed_at) if self._last_fixed_at else None,
+            'rtkFixedAgeSec': age_or_none(self._last_fixed_at),
+            'rtkHasFixed': self.latest_quality == '4',
+        }
 
     def _ensure_connected(self):
         if self._sock is not None:
@@ -150,6 +225,9 @@ class NtripCorrectionRuntime(object):
                 raise RuntimeError('NTRIP响应异常: %s' % first_line_text)
             sock.setblocking(False)
             self._sock = sock
+            self._connected_at = time.time()
+            self._last_disconnect_reason = ''
+            self._last_rtcm_recv_at = 0.0
             if not self._connected_once:
                 self.logger.warning(
                     'NTRIP connected: %s:%s/%s' % (
@@ -160,7 +238,7 @@ class NtripCorrectionRuntime(object):
                 )
                 self._connected_once = True
         except Exception as exc:
-            self.close()
+            self.close('connect_failed')
             self.logger.error('NTRIP connect failed: {}'.format(exc))
 
     def _build_request_header(self):
@@ -186,7 +264,7 @@ class NtripCorrectionRuntime(object):
             self._last_gga_sent_at = now
         except Exception as exc:
             self.logger.error('发送GGA到NTRIP失败: %s', exc)
-            self.close()
+            self.close('send_gga_failed')
 
     def _forward_rtcm(self, serial_port):
         if self._sock is None:
@@ -195,7 +273,7 @@ class NtripCorrectionRuntime(object):
             readable, _, _ = select.select([self._sock], [], [], 0)
         except Exception as exc:
             self.logger.error('检查NTRIP套接字状态失败: %s', exc)
-            self.close()
+            self.close('select_failed')
             return
         if not readable:
             return
@@ -203,12 +281,13 @@ class NtripCorrectionRuntime(object):
             data = self._sock.recv(4096)
             if not data:
                 self.logger.warning('NTRIP差分链路已断开')
-                self.close()
+                self.close('remote_closed')
                 return
+            self._last_rtcm_recv_at = time.time()
             serial_port.write(data)
         except Exception as exc:
             self.logger.error('转发RTCM到RTK串口失败: %s', exc)
-            self.close()
+            self.close('forward_rtcm_failed')
 
 
 _shared_runtime = None

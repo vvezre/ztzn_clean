@@ -22,7 +22,7 @@ RTK_OUTPUT_CONFIG_COMMANDS = (
     'unlog\r\n',
     'gngga 0.1\r\n',
     'gphpr 0.1\r\n',
-    'savaconfig\r\n',
+    'saveconfig\r\n',
 )
 RTK_NMEA_MAX_AGE_SECONDS = 2.0
 RTK_DRAIN_MAX_LINES = 300
@@ -1288,6 +1288,59 @@ def cross_track_error(start_lat, start_lon, end_lat, end_lon, current_lat, curre
     d_xt = math.asin(math.sin(distance_start_to_current / R) * math.sin(delta_bearing)) * R
 
     return d_xt
+
+
+def signed_along_track_distance(start_lat, start_lon, end_lat, end_lon, current_lat, current_lon):
+    """
+    计算当前点在起点->终点路径上的带符号沿路径剩余距离（米）。
+
+    正值 = 还未到达终点（沿路径方向剩余 N 米）
+    负值 = 已越过终点（超过 N 米）
+
+    用法示例:
+        remaining = signed_along_track_distance(start_lat, start_lon, end_lat, end_lon, cur_lat, cur_lon)
+        if remaining <= 0.03:
+            # 已到达或略微超过目标点
+            stop()
+
+    参数:
+        start_lat, start_lon: 起点经纬度
+        end_lat, end_lon: 终点经纬度
+        current_lat, current_lon: 当前位置经纬度
+
+    返回:
+        带符号的沿路径剩余距离（米）
+    """
+    geod = Geodesic.WGS84
+
+    path = geod.Inverse(start_lat, start_lon, end_lat, end_lon)
+    current = geod.Inverse(start_lat, start_lon, current_lat, current_lon)
+
+    total_distance = path['s12']
+    path_bearing = path['azi1']
+    current_bearing = current['azi1']
+    current_distance = current['s12']
+
+    delta = math.radians(current_bearing - path_bearing)
+
+    # 当前点投影到起点->终点方向上的距离
+    along_distance = current_distance * math.cos(delta)
+
+    # 距离终点的带符号剩余距离
+    remaining = total_distance - along_distance
+
+    return remaining
+
+
+def should_finish_point_to_point(distance_to_target, signed_remaining, cte,
+                                 target_tolerance_m=0.03, cte_tolerance_m=0.30):
+    if distance_to_target is not None and float(distance_to_target) <= target_tolerance_m:
+        return True
+
+    if signed_remaining is None or cte is None:
+        return False
+
+    return float(signed_remaining) <= 0 and abs(float(cte)) <= cte_tolerance_m
 
 def calculate_perpendicular_point(lat1, lon1, lat2, lon2, distance_meters, side='left'):
     """

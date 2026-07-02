@@ -1,13 +1,20 @@
 # coding=utf-8
 import json
 import math
+import os
 
 from layout_planner import create_return_to_origin_tasks, create_task_by_panel_layout, expand_panel_cells, panel_point_xy
 import util
-import redis
 from AppLogger import logger
+from local_redis import create_redis_client
 
-redis_cli = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+redis_cli = create_redis_client(
+    host='localhost',
+    port=6379,
+    db=0,
+    decode_responses=True,
+    local_mode=os.getenv("CLEAN_LOCAL_MODE") == "1",
+)
 # startLat = 32.03647704
 # startLon = 118.92448868
 # startHeading = 4
