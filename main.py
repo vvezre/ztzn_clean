@@ -89,6 +89,7 @@ from robot_fsm import (
     RobotLifecycleFSM,
     runtime_event_type_for_control_state,
 )
+from modeling_routes import register_modeling_routes
 
 app = Flask(__name__)
 CORS(app)
@@ -2426,6 +2427,10 @@ def encrypt_password(password):
     md5 = hashlib.md5()
     md5.update(password.encode('utf-8'))
     return md5.hexdigest()
+
+
+MODELING_STORE_DIR = os.environ.get("MODELING_STORE_DIR", os.path.join(os.getcwd(), "modeling_models"))
+register_modeling_routes(app, storage_dir=MODELING_STORE_DIR)
 
 
 @app.route("/vehicle/login", methods=['POST'])
