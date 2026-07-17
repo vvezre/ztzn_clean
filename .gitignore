@@ -1,3 +1,6 @@
 ntrip_config.json
 __pycache__/
 app.log
+modeling_models/
+run-local.*.log
+*.tgz

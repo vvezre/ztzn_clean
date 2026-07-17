@@ -61,9 +61,15 @@ from garage_state import (
     normalize_garage_state,
 )
 from rtk_correction import compute_linear_steering
+from rtk_path_tracking import (
+    RTKKalmanFilter2D,
+    StraightLinePController,
+    build_tracking_command,
+)
 from battery_return import LOW_BATTERY_RETURN_THRESHOLD, should_return_to_charge
 from edge_target_guard import (
     DEFAULT_EDGE_TARGET_TOLERANCE_M,
+    EdgeTriggerLatch,
     should_accept_edge_stop,
     should_recover_from_edge_stop,
 )
@@ -81,20 +87,45 @@ from mqtt_integration import MQTTIntegration
 from mqtt_vehicle_adapter import VehicleControllerAdapter
 from vision_line_detection import GuidanceBandTracker, find_vertical_bright_band, resolve_guidance_command
 from go_to_point import build_go_to_point_plan
+from turn_heading_control import (
+    TURN_LEFT_PROTOCOL_VALUE,
+    TURN_RIGHT_PROTOCOL_VALUE,
+    choose_turn_direction,
+)
 from waypoint_loop import iter_closed_loop_targets, normalize_loop_options
 from runtime_state import RUNTIME_STATE_KEY, build_runtime_state_snapshot
+from status_values import (
+    live_heading_from_location,
+    live_value_from_report,
+    visible_task_field,
+)
 from robot_fsm import (
     RUNTIME_EVENT_LOG_KEY,
     RobotEventBus,
     RobotLifecycleFSM,
+    legacy_fields_for_state,
     runtime_event_type_for_control_state,
 )
+from dev_console.correction_state import build_correction_state
+from dev_console.state_readers import (
+    build_overview_state,
+    build_redis_state,
+    build_task_path_state,
+    read_log_lines,
+)
 from modeling_routes import register_modeling_routes
+from modeling_sampler import sample_current_point
+from modeling_execution import (
+    ModelingExecutionError,
+    build_execution_plan,
+    execute_modeling_plan,
+)
 
 app = Flask(__name__)
 CORS(app)
 robot_event_bus = RobotEventBus(max_events=200)
 robot_lifecycle_fsm = RobotLifecycleFSM()
+dev_console_trace = []
 
 canStart = 1
 
@@ -116,6 +147,7 @@ LOOP_AUTO_CLEAN_CYCLE_KEY = "loopAutoCleanCycle"
 LOOP_AUTO_CLEAN_STOP_REASON_KEY = "loopAutoCleanStopReason"
 LOOP_AUTO_CLEAN_UPDATED_AT_KEY = "loopAutoCleanUpdatedAt"
 LOOP_AUTO_CLEAN_SLEEP_SECONDS = 2.0
+AUTO_RESUME_ALLOWED_KEY = "autoResumeAllowed"
 
 WAYPOINT_LOOP_ENABLED_KEY = 'waypointLoopEnabled'
 WAYPOINT_LOOP_MODE_KEY = 'waypointLoopMode'
@@ -166,6 +198,7 @@ redis_cli.set(LOOP_AUTO_CLEAN_RUNNING_KEY, 'false')
 redis_cli.set(LOOP_AUTO_CLEAN_CYCLE_KEY, 0)
 redis_cli.set(LOOP_AUTO_CLEAN_STOP_REASON_KEY, '')
 redis_cli.set(LOOP_AUTO_CLEAN_UPDATED_AT_KEY, int(time.time()))
+redis_cli.set(AUTO_RESUME_ALLOWED_KEY, 'false')
 redis_cli.delete('battery')
 redis_cli.delete('batteryPercent')
 redis_cli.delete('batteryRaw')
@@ -238,8 +271,24 @@ global_go = 0
 # 当前任务的开始点经纬度和结束点经纬度
 global_cur_taskPoint = {}
 global_cur_taskPointTest = {}
+# RTK 固定解可信度较高时，适当提高过程噪声、降低测量噪声：
+# - process_noise 变大：少依赖“车辆按上一帧速度连续运动”的预测；
+# - measurement_noise 变小：更多采纳当前 RTK 测量坐标。
+global_rtk_tracking_filter = RTKKalmanFilter2D(process_noise=0.2, measurement_noise=1.0)
+global_straight_line_controller = StraightLinePController(
+    heading_gain=10.0,
+    cte_gain=1000.0,
+    short_range_heading_limit_deg=5.0,
+    max_z_speed=15000,
+)
 # 自动清扫线程是否结束，0：未结束，1：结束
 global_doCleanThreadStop = 0
+global_auto_clean_stop = 0
+global_waypoint_nav_stop = 0
+global_loop_auto_clean_stop = 0
+active_runtime_task_token = ''
+active_runtime_task_action = ''
+global_runtime_task_sequence = 0
 # 当前任务下标标记
 global_cur_task_index = 0
 # 是否偏差过大，如果视觉纠偏过大，则启用RTK纠偏,0:表示不需要RTK纠偏，1：表示需要
@@ -292,6 +341,7 @@ EDGE_RECOVERY_MAX_ATTEMPTS = 3
 EDGE_STOP_ACTION_TARGET = 'target'
 EDGE_STOP_ACTION_RECOVER = 'recover'
 EDGE_STOP_ACTION_ABORT = 'abort'
+global_edge_trigger_latch = EdgeTriggerLatch()
 global_power_on_guard_sent = False
 BATTERY_SMOOTH_ALPHA = 0.18
 BATTERY_MAX_DROP_PER_SAMPLE = 0.3
@@ -302,17 +352,10 @@ TURN_RTK_FALLBACK_STABLE_COUNT = 1
 TURN_RTK_FALLBACK_MIN_WAIT_SEC = 1.0
 TURN_RTK_HEADING_MAX_AGE_SEC = 2.0
 TURN_RTK_CROSSING_WINDOW_DEG = 3.0
+TURN_RTK_MAX_DURATION_SEC = 30.0
 RTK_FIXED_QUALITY = '4'
 RTK_FIXED_GGA_MAX_AGE_SECONDS = 2.0
 RTK_FIX_RECOVERY_TIMEOUT_SECONDS = 300.0
-
-
-def set_current_action(action_name):
-    try:
-        redis_cli.set('currentAction', action_name)
-    except Exception as e:
-        logger.warning("设置currentAction失败: {}".format(str(e)))
-
 
 def set_garage_state(state, reason):
     state = normalize_garage_state(state)
@@ -358,7 +401,8 @@ def _publish_global_go(value):
 
 
 def _publish_correction_debug(heading_error, cte, z_speed, distance_to_target,
-                              signed_remaining, target_heading, current_heading):
+                              signed_remaining, target_heading, current_heading,
+                              extra=None):
     try:
         redis_cli.hset('correctionDebug', 'headingError', round(float(heading_error), 6))
         redis_cli.hset('correctionDebug', 'cte', round(float(cte), 6))
@@ -370,6 +414,13 @@ def _publish_correction_debug(heading_error, cte, z_speed, distance_to_target,
         redis_cli.hset('correctionDebug', 'headingGain', 10.0)
         redis_cli.hset('correctionDebug', 'cteGain', 1000.0)
         redis_cli.hset('correctionDebug', 'cteDotGain', 0.0)
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                if isinstance(value, float):
+                    value = round(value, 8)
+                redis_cli.hset('correctionDebug', key, value)
         redis_cli.hset('correctionDebug', 'updatedAt', time.time())
     except Exception as e:
         logger.warning("同步correctionDebug失败: {}".format(str(e)))
@@ -526,6 +577,19 @@ def _disable_loop_auto_clean(reason):
     _set_loop_auto_clean_state(enabled=False, stop_reason=reason or 'stopped')
 
 
+def _set_auto_resume_allowed(allowed, reason=''):
+    try:
+        redis_cli.set(AUTO_RESUME_ALLOWED_KEY, 'true' if allowed else 'false')
+        redis_cli.set('autoResumeReason', reason or '')
+        redis_cli.set('autoResumeUpdatedAt', int(time.time()))
+    except Exception as e:
+        logger.warning("set auto resume flag failed: {}".format(str(e)))
+
+
+def _is_auto_resume_allowed():
+    return _coerce_bool(redis_cli.get(AUTO_RESUME_ALLOWED_KEY), False)
+
+
 def _is_loop_low_battery():
     voltage = redis_cli.get("voltage")
     need_return = should_return_to_charge(voltage)
@@ -551,16 +615,108 @@ def _get_loop_auto_clean_status():
     }
 
 
-def _is_runtime_task_active():
-    control_state = (_decode_redis_value(redis_cli.get('controlState')) or '').upper()
-    if control_state in ('READY', 'RUNNING', 'PAUSED', 'STOPPING'):
+def _begin_runtime_task(action):
+    global active_runtime_task_token, active_runtime_task_action
+    global global_runtime_task_sequence
+    global global_auto_clean_stop, global_waypoint_nav_stop, global_loop_auto_clean_stop
+    global global_doCleanThreadStop
+
+    global_runtime_task_sequence += 1
+    action_name = str(action or 'task')
+    active_runtime_task_token = '{}:{}:{}'.format(action_name, int(time.time() * 1000), global_runtime_task_sequence)
+    active_runtime_task_action = action_name
+
+    if action_name == 'auto_drive':
+        global_auto_clean_stop = 0
+        global_doCleanThreadStop = 0
+    elif action_name == 'multi_go_to_point':
+        global_waypoint_nav_stop = 0
+        global_doCleanThreadStop = 0
+    elif action_name == 'loop_auto_drive':
+        global_loop_auto_clean_stop = 0
+        global_auto_clean_stop = 0
+        global_doCleanThreadStop = 0
+    return active_runtime_task_token
+
+
+def _is_current_runtime_task(task_token):
+    if not task_token:
+        return not active_runtime_task_token
+    return str(task_token) == str(active_runtime_task_token)
+
+
+def _runtime_task_should_stop(task_token, task_type=None):
+    if not _is_current_runtime_task(task_token):
         return True
-    mission = _decode_redis_value(redis_cli.get('mission'))
-    return mission == 'working' and not _coerce_bool(redis_cli.get('parking'), False)
+    if task_type == 'auto_drive' and global_auto_clean_stop:
+        return True
+    if task_type == 'multi_go_to_point' and global_waypoint_nav_stop:
+        return True
+    if task_type == 'loop_auto_drive' and global_loop_auto_clean_stop:
+        return True
+    return _is_runtime_stop_requested()
+
+
+def _is_runtime_task_active():
+    fsm_state = robot_lifecycle_fsm.get_state()
+    control_state = str(fsm_state.get('controlState') or '').upper()
+    return control_state in ('RUNNING', 'PAUSED', 'STOPPING')
+
+
+def _is_runtime_stop_requested():
+    fsm_state = robot_lifecycle_fsm.get_state()
+    control_state = str(fsm_state.get('controlState') or '').upper()
+    return control_state in ('STOPPED', 'COMPLETE', 'BLOCKED', 'FAULT', 'DISABLED', 'UNKNOWN')
+
+
+def _can_start_runtime_task():
+    fsm_state = robot_lifecycle_fsm.get_state()
+    control_state = str(fsm_state.get('controlState') or '').upper()
+    return control_state in ('STOPPED', 'COMPLETE')
+
+
+def _runtime_not_startable_payload():
+    fsm_state = robot_lifecycle_fsm.get_state()
+    control_state = str(fsm_state.get('controlState') or '').upper()
+    return {
+        'success': False,
+        'code': 'RUNTIME_NOT_STARTABLE',
+        'msg': '当前状态不允许启动任务',
+        'data': {
+            'controlState': control_state,
+            'action': fsm_state.get('action') or '',
+            'faultState': fsm_state.get('faultState') or '',
+            'message': fsm_state.get('message') or '',
+        },
+    }
+
+
+def _start_runtime_thread(action, target, args=(), ready_message='正在创建任务线程', detail=None):
+    with TASK_SWITCH_LOCK:
+        if not _can_start_runtime_task():
+            return None, _runtime_not_startable_payload()
+
+        task_token = _begin_runtime_task(action)
+        ready_detail = dict(detail or {})
+        if action:
+            ready_detail['action'] = action
+        ready_detail['taskToken'] = task_token
+        ready_detail['starting'] = True
+        _mark_runtime_ready(ready_message, ready_detail)
+
+        thread = threading.Thread(target=target, args=(task_token,) + tuple(args or ()))
+        thread.daemon = True
+        thread.start()
+        return thread, None
+
+
+def _runtime_action():
+    fsm_state = robot_lifecycle_fsm.get_state()
+    return str(fsm_state.get('action') or '')
 
 
 def _is_runtime_returning_to_charge():
-    current_action = _decode_redis_value(redis_cli.get('currentAction'))
+    current_action = _runtime_action()
     if current_action in ('return_to_point', 'charging', 'into_garage'):
         return True
     garage_state = get_garage_state()
@@ -584,11 +740,11 @@ def _set_redis_value(key, value):
     redis_cli.set(key, value)
 
 
-def _publish_runtime_event(event_type, message='', payload=None, source='runtime_state'):
+def _publish_runtime_event(event_type, message='', payload=None, source='runtime_state', fsm_state=None):
     if not event_type:
         return None
     payload = dict(payload or {})
-    payload['fsm'] = robot_lifecycle_fsm.apply_event(event_type, message, payload)
+    payload['fsm'] = fsm_state if isinstance(fsm_state, dict) else robot_lifecycle_fsm.get_state()
     event = robot_event_bus.publish(
         event_type,
         source=source,
@@ -604,6 +760,97 @@ def _publish_runtime_event(event_type, message='', payload=None, source='runtime
     except Exception as e:
         logger.warning("同步runtime event失败: {}".format(str(e)))
     return event
+
+
+def _mirror_runtime_state_to_redis(fsm_state, legacy_fields):
+    fsm_state = fsm_state if isinstance(fsm_state, dict) else {}
+    legacy_fields = legacy_fields if isinstance(legacy_fields, dict) else {}
+    _set_redis_value('controlState', fsm_state.get('controlState'))
+    _set_redis_value('healthState', fsm_state.get('healthState'))
+    _set_redis_value('faultState', fsm_state.get('faultState'))
+    _set_redis_value('startCheckReady', fsm_state.get('startReady'))
+    _set_redis_value('startCheckReason', fsm_state.get('message') or '')
+    _set_redis_value('mission', legacy_fields.get('mission'))
+    _set_redis_value('parking', legacy_fields.get('parking'))
+    _set_redis_value('currentAction', legacy_fields.get('currentAction'))
+
+
+def dispatch_runtime_event(event_type, message='', payload=None, detail=None):
+    fsm_payload = dict(payload or {})
+    if isinstance(detail, dict):
+        fsm_payload.update(detail)
+    elif detail is not None:
+        fsm_payload['detail'] = detail
+
+    fsm_state = robot_lifecycle_fsm.apply_event(
+        event_type or 'STATE_UPDATED',
+        message or '',
+        fsm_payload,
+    )
+    if fsm_state.get("transitionAccepted") is False:
+        legacy_fields = legacy_fields_for_state(fsm_state)
+        runtime_detail = fsm_state.get('detail')
+        if not isinstance(runtime_detail, dict):
+            runtime_detail = {}
+        runtime_state = build_runtime_state_snapshot(
+            control_state=fsm_state.get('controlState'),
+            health_state=fsm_state.get('healthState'),
+            fault_state=fsm_state.get('faultState'),
+            mission=legacy_fields.get('mission'),
+            parking=legacy_fields.get('parking'),
+            action=legacy_fields.get('currentAction'),
+            task_name=_decode_redis_value(redis_cli.get('currentTaskName')),
+            task_index=_coerce_int(redis_cli.get('curTaskIndex'), None),
+            start_ready=fsm_state.get('startReady'),
+            message=fsm_state.get('message') or message or '',
+            detail=runtime_detail,
+            now=time.time(),
+        )
+        _publish_runtime_event(
+            'FSM_TRANSITION_REJECTED',
+            runtime_state.get('message') or 'FSM transition rejected',
+            {
+                'rejectedEvent': fsm_state.get('rejectedEvent'),
+                'requestedControlState': fsm_state.get('requestedControlState'),
+                'previousControlState': fsm_state.get('previousControlState'),
+                'runtimeState': runtime_state,
+            },
+            fsm_state=fsm_state,
+        )
+        return runtime_state
+
+    legacy_fields = legacy_fields_for_state(fsm_state)
+    _mirror_runtime_state_to_redis(fsm_state, legacy_fields)
+
+    runtime_detail = fsm_state.get('detail')
+    if not isinstance(runtime_detail, dict):
+        runtime_detail = {}
+    _set_redis_value('runtimeDetail', runtime_detail)
+    runtime_state = build_runtime_state_snapshot(
+        control_state=fsm_state.get('controlState'),
+        health_state=fsm_state.get('healthState'),
+        fault_state=fsm_state.get('faultState'),
+        mission=legacy_fields.get('mission'),
+        parking=legacy_fields.get('parking'),
+        action=legacy_fields.get('currentAction'),
+        task_name=_decode_redis_value(redis_cli.get('currentTaskName')),
+        task_index=_coerce_int(redis_cli.get('curTaskIndex'), None),
+        start_ready=fsm_state.get('startReady'),
+        message=fsm_state.get('message') or message or '',
+        detail=runtime_detail,
+        now=time.time(),
+    )
+    _set_redis_value(RUNTIME_STATE_KEY, runtime_state)
+
+    event_payload = dict(fsm_payload)
+    event_payload['runtimeState'] = runtime_state
+    _publish_runtime_event(
+        event_type or 'STATE_UPDATED',
+        runtime_state.get('message') or '',
+        event_payload,
+        fsm_state=fsm_state,
+    )
+    return runtime_state
 
 
 def _load_runtime_detail():
@@ -724,46 +971,24 @@ def _cache_battery_percent(raw_percent, report_at=None):
 def _set_runtime_state(control_state=None, health_state=None, fault_state=None,
                        start_ready=None, start_reason=None, detail=None,
                        event_type=None, event_payload=None):
-    if control_state is not None:
-        _set_redis_value('controlState', control_state)
-    if health_state is not None:
-        _set_redis_value('healthState', health_state)
+    payload = dict(event_payload or {})
     if fault_state is not None:
-        _set_redis_value('faultState', fault_state)
+        payload['faultState'] = fault_state
+    if health_state is not None:
+        payload['healthState'] = health_state
     if start_ready is not None:
-        _set_redis_value('startCheckReady', start_ready)
-    if start_reason is not None:
-        _set_redis_value('startCheckReason', start_reason)
-    if detail is not None:
-        _set_redis_value('runtimeDetail', detail)
-    runtime_state = build_runtime_state_snapshot(
-        control_state=_decode_redis_value(redis_cli.get('controlState')),
-        health_state=_decode_redis_value(redis_cli.get('healthState')),
-        fault_state=_decode_redis_value(redis_cli.get('faultState')),
-        mission=_decode_redis_value(redis_cli.get('mission')),
-        parking=redis_cli.get('parking'),
-        action=_decode_redis_value(redis_cli.get('currentAction')),
-        task_name=_decode_redis_value(redis_cli.get('currentTaskName')),
-        task_index=_coerce_int(redis_cli.get('curTaskIndex'), None),
-        start_ready=_coerce_bool(redis_cli.get('startCheckReady'), False),
-        message=_decode_redis_value(redis_cli.get('startCheckReason')) or '',
-        detail=_load_runtime_detail(),
-        now=time.time(),
-    )
-    _set_redis_value(RUNTIME_STATE_KEY, runtime_state)
+        payload['startReady'] = start_ready
     if event_type is None and control_state is not None:
         event_type = runtime_event_type_for_control_state(
             control_state,
-            runtime_state.get('fault'),
+            fault_state,
         )
-    if event_type:
-        payload = dict(event_payload or {})
-        payload['runtimeState'] = runtime_state
-        _publish_runtime_event(
-            event_type,
-            runtime_state.get('message') or '',
-            payload,
-        )
+    return dispatch_runtime_event(
+        event_type or 'STATE_UPDATED',
+        start_reason or '',
+        payload,
+        detail=detail,
+    )
 
 
 def _load_task_params_snapshot():
@@ -822,7 +1047,7 @@ def _build_task_origin_status_fields(task_params):
         'currentLocation': {
             'lat': global_cur_rtk_lat,
             'lon': global_cur_rtk_lon,
-            'heading': global_cur_rtk_heading,
+            'heading': live_heading_from_location(global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading),
         },
         'distanceToTaskOriginM': distance_to_task_origin,
         'taskOriginToleranceM': TASK_ORIGIN_TOLERANCE_METERS,
@@ -996,7 +1221,7 @@ def _build_runtime_detail(extra=None):
         'startToleranceM': START_POSITION_TOLERANCE_METERS,
         'currentLat': global_cur_rtk_lat,
         'currentLon': global_cur_rtk_lon,
-        'currentHeading': global_cur_rtk_heading,
+        'currentHeading': live_heading_from_location(global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading),
         'taskStartLat': _coerce_float(task_params.get('startLat'), None),
         'taskStartLon': _coerce_float(task_params.get('startLon'), None),
         'originHeading': _coerce_float(task_params.get('originHeading'), None),
@@ -1110,6 +1335,75 @@ def _mark_runtime_rtk_recovering(message, extra=None):
     )
 
 
+def _clear_runtime_task_state(reason, clear_auto_task=False, clear_waypoints=False,
+                              update_runtime=False, message=None):
+    if clear_auto_task:
+        redis_cli.delete('taskList')
+    if clear_waypoints:
+        redis_cli.delete('waypoints')
+
+    redis_cli.set('action', 'false')
+    redis_cli.set('correct', 'false')
+    redis_cli.set('moveJudge', 'false')
+    redis_cli.set('reverse', 'false')
+    redis_cli.set('enterGarage', 'false')
+    redis_cli.set('exitGarage', 'false')
+    redis_cli.set('waypointIndex', 0)
+    redis_cli.set('waypointTotal', 0)
+    redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '0')
+    redis_cli.set(WAYPOINT_LOOP_MODE_KEY, 'count')
+    redis_cli.set(WAYPOINT_LOOP_TARGET_KEY, 0)
+    redis_cli.set(WAYPOINT_LOOP_CURRENT_KEY, 0)
+    redis_cli.delete('waypointLoopProgress')
+    _set_redis_value('runtimeDetail', {})
+
+    detail = {
+        'runtimeTaskType': 'none',
+        'lastRuntimeClearReason': reason or '',
+    }
+    clear_message = message or 'runtime task state cleared'
+    if update_runtime:
+        _mark_runtime_idle(clear_message, detail)
+    else:
+        _set_runtime_state(
+            event_type='STATE_UPDATED',
+            start_reason=clear_message,
+            detail=_build_runtime_detail(detail)
+        )
+
+
+def _request_runtime_stop(reason, clear_auto_task=False, clear_waypoints=False,
+                          update_runtime=True, message=None):
+    global global_auto_clean_stop, global_waypoint_nav_stop, global_loop_auto_clean_stop
+    global global_doCleanThreadStop, global_pointToPoint_flag, global_go, global_status
+    global active_runtime_task_token, active_runtime_task_action
+
+    global_auto_clean_stop = 1
+    global_waypoint_nav_stop = 1
+    global_loop_auto_clean_stop = 1
+    global_doCleanThreadStop = 1
+    global_pointToPoint_flag = 1
+    global_go = 0
+    active_runtime_task_token = ''
+    active_runtime_task_action = ''
+    _disable_loop_auto_clean(reason or 'runtime_stop')
+    _set_auto_resume_allowed(False, reason or 'runtime_stop')
+    _publish_global_go(global_go)
+    try:
+        sendBraking()
+    except Exception as exc:
+        logger.error("runtime stop brake failed: {}".format(exc), exc_info=True)
+    global_status = 'active'
+    redis_cli.set('curTaskIndex', 0)
+    _clear_runtime_task_state(
+        reason,
+        clear_auto_task=clear_auto_task,
+        clear_waypoints=clear_waypoints,
+        update_runtime=update_runtime,
+        message=message or 'runtime task stopped'
+    )
+
+
 def _maybe_brake_on_power_enable(previous_power_on_state, current_power_on_state):
     global global_power_on_guard_sent
     if current_power_on_state != 1 or previous_power_on_state == 1:
@@ -1117,15 +1411,11 @@ def _maybe_brake_on_power_enable(previous_power_on_state, current_power_on_state
     if global_power_on_guard_sent:
         return
 
-    mission = _decode_redis_value(redis_cli.get('mission'))
-    current_action = _decode_redis_value(redis_cli.get('currentAction'))
-    if mission == 'working' and current_action in ('auto_drive', 'go_on', 'return_to_point'):
+    current_action = _runtime_action()
+    if _is_runtime_task_active() and current_action in ('auto_drive', 'go_on', 'return_to_point'):
         return
 
     global_power_on_guard_sent = True
-    redis_cli.set('parking', '1')
-    redis_cli.set('mission', 'complete')
-    set_current_action('parking')
     _mark_runtime_idle('下位机刚使能，已自动补发安全停车')
     try:
         logger.warning("下位机使能从 {} 切换为 1，当前非任务执行态，补发安全停车".format(previous_power_on_state))
@@ -1402,6 +1692,7 @@ def _apply_lower_machine_status_frame(data, source):
         x_speed = _frame_u16_to_int(data, 4)
         if x_speed is not None:
             global_get_XSpeed = x_speed
+            redis_cli.set("xSpeed", x_speed)
 
     if frame_len > 7:
         z_speed = _frame_u16_to_int(data, 6)
@@ -1411,6 +1702,7 @@ def _apply_lower_machine_status_frame(data, source):
     brush_speed = byte_at(8)
     if brush_speed is not None:
         global_get_brushSpeed = brush_speed
+        redis_cli.set("brushSpeedActual", brush_speed)
 
     edge_status = byte_at(9)
     if edge_status is not None:
@@ -1483,38 +1775,51 @@ def _drain_lower_machine_rx_buffer(source):
 
 
 def _read_lower_machine_status_frame(source, wait_seconds=0.25):
+    # 先消费已经缓存的串口数据；如果缓存里已经拼出完整状态帧，就不用再读串口。
     if _drain_lower_machine_rx_buffer(source):
         return True
 
+    # 本次读取最多等待 wait_seconds 秒，避免业务线程长时间阻塞。
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
+        # 获取下位机串口对象；串口未打开时直接返回失败，由外层循环下次再尝试。
         port = _get_lower_machine_serial()
         if port is None:
             time.sleep(0.05)
             return False
 
         try:
+            # 串口读取加锁，防止 listenerSlavePort/getEdge/getRotateArrive 等多个线程同时读串口导致帧被拆乱。
             with LOWER_MACHINE_READ_LOCK:
+                # 优先读取串口缓冲区里已有的全部字节；没有可读字节时至少读 1 个字节。
                 waiting = _serial_in_waiting(port)
                 read_len = waiting if waiting > 0 else 1
+                # 限制单次读取长度，避免异常数据把接收缓存撑得过大。
                 read_len = min(max(read_len, 1), LOWER_MACHINE_RX_BUFFER_LIMIT)
+                # 真正从下位机串口读取原始字节数据。
                 data = port.read(read_len)
         except serial.serialutil.SerialException as exc:
+            # 串口异常通常表示设备断开或句柄失效，重置串口后继续等待下一轮读取。
             _reset_lower_machine_serial(exc)
             time.sleep(0.05)
             continue
         except Exception as exc:
+            # 其他异常只记录日志，不让监听线程退出。
             logger.warning("{} read lower-machine serial failed: {}".format(source, exc), exc_info=True)
             time.sleep(0.02)
             continue
 
         if data:
+            # 串口可能一次只返回半帧数据，所以先追加到接收缓存。
             _append_lower_machine_rx_data(data)
+            # 追加后尝试从缓存中切出完整状态帧，并交给 _apply_lower_machine_status_frame() 解析。
             if _drain_lower_machine_rx_buffer(source):
                 return True
         else:
+            # 没读到数据时短暂休眠，避免空循环占满 CPU。
             time.sleep(0.02)
 
+    # 超过等待时间仍没有解析出有效下位机状态帧，返回失败。
     return False
 
 
@@ -1570,6 +1875,20 @@ def _load_task_items_for_preview():
     return []
 
 
+def _get_waypoint_count(prefer_runtime_total=False):
+    if prefer_runtime_total:
+        runtime_total = _coerce_int(redis_cli.get('waypointTotal'), 0)
+        if runtime_total > 0:
+            return runtime_total
+    try:
+        count = int(redis_cli.llen('waypoints'))
+        if count > 0:
+            return count
+    except Exception:
+        pass
+    return _coerce_int(redis_cli.get('waypointTotal'), 0)
+
+
 def _build_task_path_payload():
     task_params = _load_task_params_snapshot()
     task_items = _load_task_items_for_preview()
@@ -1601,14 +1920,8 @@ def _build_task_path_payload():
 
 
 def _derive_control_state():
-    control_state = _decode_redis_value(redis_cli.get('controlState'))
-    if control_state:
-        return control_state
-    if _decode_redis_value(redis_cli.get('mission')) == 'working':
-        return 'RUNNING'
-    if _coerce_bool(redis_cli.get('parking'), False):
-        return 'STOPPED'
-    return 'IDLE'
+    fsm_state = robot_lifecycle_fsm.get_state()
+    return str(fsm_state.get('controlState') or 'UNKNOWN').upper()
 
 
 def _is_ignored_enable_fault_state(fault_state):
@@ -1616,17 +1929,19 @@ def _is_ignored_enable_fault_state(fault_state):
 
 
 def _derive_health_state():
-    fault_state = _derive_fault_state()
-    if fault_state and not _is_ignored_enable_fault_state(fault_state):
-        return 'WARN'
-    health_state = _decode_redis_value(redis_cli.get('healthState'))
+    fsm_state = robot_lifecycle_fsm.get_state()
+    health_state = str(fsm_state.get('healthState') or '').upper()
+    fault_state = str(fsm_state.get('faultState') or '')
     if health_state:
         return health_state
+    if fault_state and not _is_ignored_enable_fault_state(fault_state):
+        return 'WARN'
     return 'OK'
 
 
 def _derive_fault_state():
-    fault_state = _decode_redis_value(redis_cli.get('faultState'))
+    fsm_state = robot_lifecycle_fsm.get_state()
+    fault_state = str(fsm_state.get('faultState') or '')
     if fault_state and not _is_ignored_enable_fault_state(fault_state):
         return fault_state
     return ''
@@ -1635,15 +1950,15 @@ def _derive_fault_state():
 def _derive_mission_state(control_state):
     if control_state in ('BLOCKED', 'DISABLED', 'UNKNOWN'):
         return control_state
-    current_action = _decode_redis_value(redis_cli.get('currentAction'))
+    fsm_state = robot_lifecycle_fsm.get_state()
+    current_action = str(fsm_state.get('action') or '')
     if current_action == 'return_to_point':
         return 'RETURNING'
-    mission = _decode_redis_value(redis_cli.get('mission'))
-    if mission == 'working':
+    if control_state in ('RUNNING', 'PAUSED', 'STOPPING'):
         return 'RUNNING'
-    if _coerce_bool(redis_cli.get('parking'), False):
+    if control_state == 'STOPPED':
         return 'STOPPED'
-    if mission == 'complete':
+    if control_state == 'COMPLETE':
         return 'COMPLETE'
     return 'IDLE'
 
@@ -1659,7 +1974,7 @@ def _derive_status(control_state, mission_state):
         return 'working'
     if mission_state == 'RETURNING':
         return 'returning'
-    if _coerce_bool(redis_cli.get('parking'), False):
+    if control_state in ('STOPPED', 'COMPLETE'):
         return 'idle'
     return 'active'
 
@@ -1668,23 +1983,41 @@ def _build_vehicle_status_payload():
     task_params = _load_task_params_snapshot()
     lat = global_cur_rtk_lat
     lon = global_cur_rtk_lon
-    heading = global_cur_rtk_heading if global_cur_rtk_heading is not None else None
+    heading = live_heading_from_location(lat, lon, global_cur_rtk_heading)
     local_x, local_y = _compute_local_xy_cm(lat, lon, task_params)
     control_state = _derive_control_state()
     mission_state = _derive_mission_state(control_state)
     fault_state = _derive_fault_state()
-    current_action = _decode_redis_value(redis_cli.get('currentAction')) or ('parking' if _coerce_bool(redis_cli.get('parking'), False) else 'idle')
+    current_action = _runtime_action() or 'idle'
     garage_state = get_garage_state()
+    hardware_report_at = _get_hardware_report_at()
     battery_percent = _clamp_percent(redis_cli.get('batteryPercent'))
     battery_percent_raw = _clamp_percent(redis_cli.get('batteryPercentRaw'))
     loop_auto_clean = _get_loop_auto_clean_status()
     task_origin_status = _build_task_origin_status_fields(task_params)
+    clean_task_count = len(_load_task_items_for_preview())
+    waypoint_count = _get_waypoint_count(current_action == 'multi_go_to_point')
+    configured_task_name = _decode_redis_value(redis_cli.get('currentTaskName')) or ''
+    active_task_name = visible_task_field(configured_task_name, current_action, control_state)
+    active_task_index = visible_task_field(_coerce_int(redis_cli.get('curTaskIndex'), None), current_action, control_state)
+    active_task_count = visible_task_field(clean_task_count if clean_task_count > 0 else None, current_action, control_state)
+    command_speed = _coerce_int(redis_cli.get('forwardSpeed'), None)
+    command_brush_speed = _coerce_int(redis_cli.get('brushSpeed'), None)
+    live_speed = live_value_from_report(_coerce_int(global_get_XSpeed, None), hardware_report_at)
+    live_brush_speed = live_value_from_report(_coerce_int(global_get_brushSpeed, None), hardware_report_at)
 
     detail = _build_runtime_detail({
         'lastCommandMessage': _decode_redis_value(redis_cli.get('lastCommandMessage')) or '',
         'startCheckReady': _coerce_bool(redis_cli.get('startCheckReady'), False),
         'startCheckReason': _decode_redis_value(redis_cli.get('startCheckReason')) or '',
         'garageStateReason': _decode_redis_value(redis_cli.get(GARAGE_STATE_REASON_KEY)) or '',
+        'cleanTaskCount': active_task_count,
+        'configuredTaskName': configured_task_name,
+        'configuredCleanTaskCount': clean_task_count if clean_task_count > 0 else None,
+        'commandSpeed': command_speed,
+        'commandBrushSpeed': command_brush_speed,
+        'waypointCount': waypoint_count,
+        'waypointIndex': _coerce_int(redis_cli.get('waypointIndex'), 0),
     })
 
     payload = {
@@ -1694,16 +2027,21 @@ def _build_vehicle_status_payload():
         'battery_raw': battery_percent_raw,
         'battery_percent_raw': battery_percent_raw,
         'action': current_action,
-        'task_name': _decode_redis_value(redis_cli.get('currentTaskName')) or '',
-        'cur_task_index': _coerce_int(redis_cli.get('curTaskIndex'), 0),
-        'task_count': len(_load_task_items_for_preview()),
+        'task_name': active_task_name,
+        'cur_task_index': active_task_index,
+        'task_count': active_task_count,
+        'clean_task_count': active_task_count,
+        'waypoint_index': _coerce_int(redis_cli.get('waypointIndex'), 0),
+        'waypoint_count': waypoint_count,
         'online_state': 'ONLINE',
         'mission_state': mission_state,
         'control_state': control_state,
         'health_state': _derive_health_state(),
         'fault_state': fault_state,
-        'speed': _coerce_int(redis_cli.get('forwardSpeed'), 0),
-        'brush_speed': _coerce_int(redis_cli.get('brushSpeed'), 0),
+        'speed': live_speed,
+        'brush_speed': live_brush_speed,
+        'command_speed': command_speed,
+        'command_brush_speed': command_brush_speed,
         'voltage': _coerce_float(redis_cli.get('packVoltage'), None),
         'lat': lat,
         'lon': lon,
@@ -1745,7 +2083,7 @@ def _validate_auto_drive_request_legacy():
     origin_heading = _coerce_float(task_params.get('originHeading'), None)
     detail = _build_runtime_detail()
 
-    if _decode_redis_value(redis_cli.get('mission')) == 'working':
+    if _is_runtime_task_active():
         return {
             'success': False,
             'faultState': 'ALREADY_RUNNING',
@@ -1817,7 +2155,7 @@ def _validate_auto_drive_request():
     origin_heading = _coerce_float(task_params.get('originHeading'), None)
     detail = _build_runtime_detail()
 
-    if _decode_redis_value(redis_cli.get('mission')) == 'working':
+    if _is_runtime_task_active():
         return {
             'success': False,
             'faultState': 'ALREADY_RUNNING',
@@ -1930,7 +2268,7 @@ def _can_access_serial_port(port):
 
 def _resolve_lower_machine_port(_rtk_port):
     env_port = os.getenv("CLEANER_LOWER_MACHINE_PORT")
-    preferred = env_port or "/dev/ttyTHS1"
+    preferred = env_port or "/dev/ttyACM0"
 
     if _can_access_serial_port(preferred):
         logger.warn("下位机串口已固定使用：{}".format(preferred))
@@ -1946,7 +2284,7 @@ def _resolve_lower_machine_port(_rtk_port):
 
 
 # 下位机端口（固定 ttyTHS1）
-xwj_port = "/dev/ttyTHS1"
+xwj_port = "/dev/ttyACM0"
 # rtk端口
 rtk_port = util.findPort("$GN")
 logger.warn(rtk_port)
@@ -1988,10 +2326,12 @@ def globalDataSet(data):
             redis_cli.set("hardwareState", global_get_HWstatus)
         elif i == 4:
             global_get_XSpeed = int(binascii.b2a_hex(data[i] + data[i + 1]), 16)
+            redis_cli.set("xSpeed", global_get_XSpeed)
         elif i == 6:
             global_get_ZSpeed = int(binascii.b2a_hex(data[i] + data[i + 1]), 16)
         elif i == 8:
             global_get_brushSpeed = int(binascii.b2a_hex(data[i]), 16)
+            redis_cli.set("brushSpeedActual", global_get_brushSpeed)
         elif i == 9:
             if binascii.b2a_hex(data[i]) == '00':
                 global_get_edge = 1
@@ -2223,7 +2563,7 @@ def getEdge():
     if ser.is_open:
 
         redis_cli.set('moveJudge', 'true')
-        while redis_cli.get("mission") == "working":
+        while _is_runtime_task_active():
             try:
                 data = ser.read(CMD_LEN * 2)
                 hex_data = binascii.b2a_hex(data).decode('utf-8')
@@ -2281,7 +2621,7 @@ def getDistanceArrive():
     # ser = serial.Serial('COM3', 115200, timeout=0.5)
     if ser.is_open:
         redis_cli.set('moveJudge', 'true')
-        while redis_cli.get("mission") == "working":
+        while _is_runtime_task_active():
             try:
                 data = ser.read(CMD_LEN * 2)
                 logger.info('位数：{}'.format(len(data)))
@@ -2334,7 +2674,7 @@ def getRotateArrive():
         logger.info("success open COM")
         # global_status = "success open COM"
         redis_cli.set('moveJudge', 'true')
-        while redis_cli.get("mission") == "working":
+        while _is_runtime_task_active():
             logger.info('goon rotate')
             try:
                 data = ser.read(CMD_LEN * 2)
@@ -2429,8 +2769,283 @@ def encrypt_password(password):
     return md5.hexdigest()
 
 
+@app.route("/dev/overview/state", methods=['GET'])
+def dev_overview_state():
+    return jsonify(build_overview_state(redis_cli))
+
+
+@app.route("/dev/correction/state", methods=['GET'])
+def dev_correction_state():
+    return jsonify(build_correction_state(
+        redis_cli,
+        config_path="config.json",
+        trace=dev_console_trace,
+    ))
+
+
+@app.route("/dev/task-path", methods=['GET'])
+def dev_task_path_state():
+    return jsonify(build_task_path_state(redis_cli, "config.json"))
+
+
+@app.route("/dev/redis/state", methods=['GET'])
+def dev_redis_state():
+    return jsonify(build_redis_state(redis_cli))
+
+
+@app.route("/dev/logs", methods=['GET'])
+def dev_logs_state():
+    query = request.args.get("query", "")
+    limit = request.args.get("limit", "200")
+    return jsonify(read_log_lines('app.log', query=query, limit=limit))
+
+
+def _read_modeling_rtk_snapshot():
+    rtk_detail = _build_rtk_runtime_detail()
+    fsm_state = robot_lifecycle_fsm.get_state()
+    hardware_report_at = _get_hardware_report_at()
+    live_speed = live_value_from_report(_coerce_int(global_get_XSpeed, None), hardware_report_at)
+    return {
+        "lat": global_cur_rtk_lat,
+        "lon": global_cur_rtk_lon,
+        "heading": live_heading_from_location(global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading),
+        "rtkQuality": rtk_detail.get("rtkQuality"),
+        "rtkGgaAgeSec": rtk_detail.get("rtkGgaAgeSec"),
+        "rtkFixAvailable": rtk_detail.get("rtkFixAvailable"),
+        "rtkFixState": rtk_detail.get("rtkFixState"),
+        "controlState": fsm_state.get("controlState"),
+        "action": fsm_state.get("action"),
+        "xSpeed": live_speed,
+        "moving": live_speed is not None and abs(live_speed) > 0.01,
+    }
+
+
+def _sample_modeling_current_point():
+    sample_count = _coerce_int(os.environ.get("MODELING_SAMPLE_COUNT"), 10)
+    max_radius_m = _coerce_float(os.environ.get("MODELING_SAMPLE_MAX_RADIUS_M"), 0.05)
+    sleep_seconds = _coerce_float(os.environ.get("MODELING_SAMPLE_INTERVAL_SEC"), 0.05)
+    return sample_current_point(
+        _read_modeling_rtk_snapshot,
+        sample_count=sample_count,
+        max_radius_m=max_radius_m,
+        sleep_seconds=sleep_seconds,
+    )
+
+
+def _set_modeling_task_progress(state):
+    state = dict(state or {})
+    _set_redis_value('modelingTaskProgress', state)
+    _set_redis_value('modelingTaskStatus', state.get('status'))
+    _set_redis_value('modelingTaskIndex', state.get('currentIndex'))
+    _set_redis_value('modelingTaskTotal', state.get('total'))
+    _set_redis_value('runtimeDetail', _build_runtime_detail({'modelingTaskProgress': state}))
+
+
+def _read_modeling_task_progress(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    model_id = payload.get('modelId')
+    raw = _decode_redis_value(redis_cli.get('modelingTaskProgress'))
+    progress = None
+    if raw:
+        try:
+            progress = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            progress = None
+    if not isinstance(progress, dict):
+        return {
+            'available': False,
+            'modelId': model_id,
+            'progress': None,
+        }
+    if model_id and str(progress.get('modelId') or '') != str(model_id):
+        return {
+            'available': False,
+            'modelId': model_id,
+            'progress': None,
+        }
+    return {
+        'available': True,
+        'modelId': progress.get('modelId'),
+        'progress': progress,
+    }
+
+
+def _validate_modeling_task_start(execution_plan):
+    if not _can_start_runtime_task():
+        fsm_state = robot_lifecycle_fsm.get_state()
+        raise ModelingExecutionError(
+            'runtime is not startable: {}'.format(fsm_state.get('controlState') or '')
+        )
+    rtk_detail = _build_rtk_runtime_detail()
+    if not rtk_detail.get('rtkFixAvailable'):
+        raise ModelingExecutionError(
+            'RTK fixed solution is required before starting modeling task: {}'.format(
+                rtk_detail.get('rtkFixState') or 'RTK_NOT_READY'
+            )
+        )
+    segments = execution_plan.get('segments') if isinstance(execution_plan, dict) else None
+    if not isinstance(segments, list) or not segments:
+        raise ModelingExecutionError('modeling execution plan has no segments')
+    return {
+        'rtkFixAvailable': True,
+        'rtkFixState': rtk_detail.get('rtkFixState'),
+        'rtkQuality': rtk_detail.get('rtkQuality'),
+        'rtkGgaAgeSec': rtk_detail.get('rtkGgaAgeSec'),
+    }
+
+
+def _modeling_execution_speed(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    speed = _coerce_int(payload.get('speed'), None)
+    if speed is None:
+        speed = _coerce_int(redis_cli.get("forwardSpeed"), None)
+    if speed is None or speed <= 0:
+        raise ModelingExecutionError("valid forwardSpeed is required before starting modeling task")
+    return speed
+
+
+def _start_modeling_task_runtime(model_id, draft, payload):
+    task_plan = draft.get('taskPlan') if isinstance(draft, dict) else None
+    speed = _modeling_execution_speed(payload)
+    execution_plan = build_execution_plan(model_id, task_plan, speed=speed, now=time.time())
+    preflight = _validate_modeling_task_start(execution_plan)
+    _set_modeling_task_progress({
+        'status': 'starting',
+        'action': 'modeling_task',
+        'modelId': execution_plan.get('modelId'),
+        'currentIndex': 0,
+        'total': execution_plan.get('taskCount'),
+        'message': 'modeling task thread starting',
+        'preflight': preflight,
+    })
+    thread, error_payload = _start_runtime_thread(
+        'modeling_task',
+        _modelingTaskThread,
+        args=(execution_plan,),
+        ready_message='正在创建建模任务执行线程',
+        detail={'modelingTask': execution_plan, 'modelingTaskPreflight': preflight},
+    )
+    if error_payload:
+        raise ModelingExecutionError(error_payload.get('msg') or error_payload.get('code') or 'runtime not startable')
+    return {
+        'status': 'starting',
+        'action': 'modeling_task',
+        'modelId': execution_plan.get('modelId'),
+        'taskCount': execution_plan.get('taskCount'),
+        'speed': execution_plan.get('speed'),
+        'preflight': preflight,
+    }
+
+
+def _stop_modeling_task_runtime(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    fsm_state = robot_lifecycle_fsm.get_state()
+    action = str(fsm_state.get('action') or '')
+    if action != 'modeling_task' or not _is_runtime_task_active():
+        raise ModelingExecutionError('modeling task is not running')
+    progress_state = _read_modeling_task_progress(payload).get('progress') or {}
+    stop_state = dict(progress_state)
+    stop_state.update({
+        'status': 'stopping',
+        'action': 'modeling_task',
+        'modelId': payload.get('modelId') or progress_state.get('modelId'),
+        'message': 'modeling task stop requested',
+        'requestedStopAt': int(time.time()),
+    })
+    _set_modeling_task_progress(stop_state)
+    doParking(update_runtime=True, message='已请求停止建模任务')
+    return stop_state
+
+
+def _run_modeling_task_segment(segment):
+    heading = float(segment.get('heading'))
+    speed = int(segment.get('speed'))
+    task_id = segment.get('id')
+    index = int(segment.get('index') or 0)
+    turn_result = turn(
+        ser,
+        heading * 10,
+        target_heading=heading,
+        source='modeling_task',
+        segment_index=index + 1,
+        task_id=task_id,
+    )
+    if turn_result != 1:
+        sendBraking()
+        return False
+
+    if int(segment.get('mode') or 0) == 1:
+        switch_on_clean_mode(ser)
+    else:
+        switch_off_clean_mode(ser)
+
+    result = pointToPointByRTK(
+        segment.get('startLat'),
+        segment.get('startLon'),
+        segment.get('endLat'),
+        segment.get('endLon'),
+        heading,
+        speed,
+    )
+    return result == 1
+
+
+def _modelingTaskThread(task_token=None, execution_plan=None):
+    if execution_plan is None and isinstance(task_token, dict):
+        execution_plan = task_token
+        task_token = None
+    global global_status, global_go, global_doCleanThreadStop, global_pointToPoint_flag
+    global_status = 'working'
+    global_auto_clean_stop = 0
+    global_doCleanThreadStop = 0
+    global_pointToPoint_flag = 0
+    redis_cli.set("correct", "true")
+    _mark_runtime_running('建模任务执行启动', {
+        'action': 'modeling_task',
+        'modelingTask': execution_plan,
+    })
+    try:
+        result = execute_modeling_plan(
+            execution_plan,
+            run_segment=_run_modeling_task_segment,
+            update_progress=_set_modeling_task_progress,
+            should_stop=_is_runtime_stop_requested,
+            now=time.time,
+        )
+        if result.get('status') == 'complete':
+            _mark_runtime_complete('建模任务执行完成', {
+                'action': 'modeling_task',
+                'modelingTaskProgress': result,
+            })
+        elif result.get('status') == 'stopped':
+            logger.warn('建模任务收到停止信号: {}'.format(result))
+        else:
+            _mark_runtime_blocked(
+                result.get('code') or 'MODELING_TASK_BLOCKED',
+                result.get('message') or '建模任务执行中断',
+                {'modelingTaskProgress': result}
+            )
+    except Exception as e:
+        logger.error("modeling task thread error: {}".format(traceback.format_exc()))
+        _mark_runtime_blocked('MODELING_TASK_ERROR', '建模任务执行异常: {}'.format(str(e)))
+    finally:
+        global_go = 0
+        global_doCleanThreadStop = 0
+        _publish_global_go(global_go)
+        redis_cli.set("correct", "false")
+        switch_off_clean_mode(ser)
+        doParking(update_runtime=False)
+        global_status = 'active'
+
+
 MODELING_STORE_DIR = os.environ.get("MODELING_STORE_DIR", os.path.join(os.getcwd(), "modeling_models"))
-register_modeling_routes(app, storage_dir=MODELING_STORE_DIR)
+register_modeling_routes(app,
+    storage_dir=MODELING_STORE_DIR,
+    sample_point_provider=_sample_modeling_current_point,
+    task_execution_starter=_start_modeling_task_runtime,
+    task_progress_reader=_read_modeling_task_progress,
+    task_stop_handler=_stop_modeling_task_runtime,
+)
 
 
 @app.route("/vehicle/login", methods=['POST'])
@@ -2640,9 +3255,13 @@ def isAtTaskOrigin():
 
 @app.route("/vehicle/enterGarage", methods=['GET'])
 def enterGarage():
-    task = threading.Thread(target=enter_garage_task)
-
-    task.start()
+    task, error_payload = _start_runtime_thread(
+        'enter_garage',
+        enter_garage_task,
+        ready_message='正在创建进舱线程',
+    )
+    if error_payload:
+        return jsonify(error_payload)
 
     response = make_response("1")
 
@@ -2771,11 +3390,15 @@ def _run_visual_enter_garage(max_wait_seconds=None, travel_length_cm=None, forwa
     return redis_cli.get("detectQrcode") == "true"
 
 
-def enter_garage_task():
-    redis_cli.set('mission', 'working')
+def enter_garage_task(task_token=None):
+    _mark_runtime_running('手动固定距离进舱启动', {'action': 'enter_garage'})
     travel_length_cm = _get_task_enter_garage_length()
     arrived = _run_fixed_enter_garage(travel_length_cm)
-    redis_cli.set('mission', 'complete')
+    _mark_runtime_complete('手动固定距离进舱结束', {
+        'action': 'enter_garage',
+        'travelLengthCm': travel_length_cm,
+        'arrived': arrived,
+    })
     logger.warn("手动固定距离进舱结束，distance={}cm, arrived={}".format(
         travel_length_cm,
         "true" if arrived else "false"
@@ -2933,7 +3556,6 @@ def _run_exit_garage_by_back_length(backLength, reason_prefix):
     redis_cli.set("correct", "false")
     redis_cli.set("enterGarage", "false")
     reset_odometer(ser)
-    redis_cli.set("mission", "working")
     moveBack(ser, backLength)
     if str(getDistanceArrive()) == "0":
         set_garage_state(GARAGE_STATE_UNKNOWN, reason_prefix + '_not_arrived')
@@ -2945,28 +3567,30 @@ def _run_exit_garage_by_back_length(backLength, reason_prefix):
 @app.route("/vehicle/exitGarage", methods=['GET'])
 def exitGarage():
     redis_cli.set("reverse", "false")
-    task = threading.Thread(target=exit_garage_task)
-
-    task.start()
+    task, error_payload = _start_runtime_thread(
+        'exit_garage',
+        exit_garage_task,
+        ready_message='正在创建出舱线程',
+    )
+    if error_payload:
+        return jsonify(error_payload)
 
     response = make_response("1")
 
     return response
 
 
-def exit_garage_task():
-    set_current_action('exit_garage')
+def exit_garage_task(task_token=None):
+    _mark_runtime_running('手动出舱启动', {'action': 'exit_garage'})
     redis_cli.set("reverse", "false")
     redis_cli.set("correct", "false")
     redis_cli.set('action', 'true')
-    redis_cli.set('mission', 'working')
     backLength = _get_task_exit_back_length()
     logger.warn("手动出库按任务距离后退: {}cm".format(backLength))
     _run_exit_garage_by_back_length(backLength, 'manual_exit_garage')
     redis_cli.set('action', 'false')
     redis_cli.set("correct", "false")
-    redis_cli.set('mission', 'complete')
-    set_current_action('idle')
+    _mark_runtime_complete('手动出舱结束', {'action': 'exit_garage'})
 
 
 @app.route("/vehicle/getVehicleInfo", methods=['GET'])
@@ -3164,7 +3788,7 @@ def justMoveByRTK(distance, head_target):
     # 如果global_go = 1，则说明直行未结束
     while global_go == 1:
         # 表示到边了
-        if getEdge() == "0":
+        if global_edge_trigger_latch.consume(getEdge()):
             edge_action = _handle_edge_stop_for_current_task('justMoveByRTK')
             if edge_action == EDGE_STOP_ACTION_TARGET:
                 global_go = 0
@@ -3193,13 +3817,18 @@ def autoToPointByRTK():
 @app.route("/vehicle/returnToPointByRTK", methods=['GET'])
 def returnToPointByRTK():
     sendBraking()
-    thread = threading.Thread(target=returnToPointByRTKThread)
-    thread.start()
+    thread, error_payload = _start_runtime_thread(
+        'return_to_point',
+        returnToPointByRTKThread,
+        ready_message='正在创建 RTK 返回充电桩线程',
+    )
+    if error_payload:
+        return jsonify(error_payload)
     response = make_response("开启自动执行任务")
     return response
-def returnToPointByRTKThread():
+def returnToPointByRTKThread(task_token=None):
     global global_go,global_status
-    set_current_action('return_to_point')
+    _mark_runtime_running('RTK返回充电桩启动', {'action': 'return_to_point'})
     redis_cli.set('curTaskIndex', 0)
     # 原点航向角，用于起始点转正
     originHeading = float(redis_cli.hget('taskParams','originHeading'))
@@ -3330,14 +3959,16 @@ def returnToPointByRTKThread():
                     redis_cli.lpop("taskList")
     logger.warn(routes)
     goByRoutes(routes)
-    doParking()
+    if _is_runtime_stop_requested():
+        doParking()
+        return
+    doParking(update_runtime=False)
     # 进充电桩
     intoGarage(backLength)
+    _mark_runtime_complete('RTK返回充电桩结束', {'action': 'return_to_point'})
 # 根据任务路线行走
 def goByRoutes(routes):
     global global_go
-    redis_cli.set("mission", "working")
-    redis_cli.set("parking", "0")
     # 执行任务
     for index, task in enumerate(routes):
 
@@ -3373,8 +4004,28 @@ def converterXY(task):
 # 通过RTK自动清扫
 @app.route("/vehicle/autoDriveByRTK", methods=['GET'])
 def autoDriveByRTK():
-    thread = threading.Thread(target=autoDriveByRTKThread)
-    thread.start()
+    global global_doCleanThreadStop
+    if not _can_start_runtime_task():
+        return jsonify(_runtime_not_startable_payload())
+
+    validation = _validate_auto_drive_request()
+    if not validation.get('success'):
+        _mark_runtime_blocked(
+            validation.get('faultState', 'AUTO_DRIVE_BLOCKED'),
+            validation.get('message', '启动条件未通过'),
+            validation.get('data')
+        )
+        return jsonify(validation)
+
+    global_doCleanThreadStop = 0
+    thread, error_payload = _start_runtime_thread(
+        'auto_drive',
+        autoDriveByRTKThread,
+        ready_message='启动条件通过，正在创建 RTK 自动清扫线程',
+        detail=validation.get('data'),
+    )
+    if error_payload:
+        return jsonify(error_payload)
     response = make_response("开启自动执行任务")
     return response
 
@@ -3456,12 +4107,26 @@ def log_task_turn_command(task, index, source):
         )
     )
 
-def autoDriveByRTKThread():
+def autoDriveByRTKThread(task_token=None):
     global global_status
     global taskList  # 申明使用全局变量
     global global_pointToPoint_flag,global_doCleanThreadStop,global_go,global_originLat,global_originLon
-    set_current_action('auto_drive')
+    global global_auto_clean_stop
+    # 任务线程可能由接口启动，也可能由循环自动清扫复用；没有 token 时先登记为新的自动清扫任务。
+    if task_token is None:
+        task_token = _begin_runtime_task('auto_drive')
+    # 如果当前线程已经不是最新任务，或已收到停止信号，直接退出，避免旧线程继续控车。
+    if _runtime_task_should_stop(task_token, 'auto_drive'):
+        logger.warn("auto clean task token is no longer active; exit")
+        return 0
+    # 防止重复启动：状态机认为已有任务运行时，不允许再启动新的自动清扫。
+    if _is_runtime_task_active():
+        logger.warn("小车已经在工作了，无法再开启工作")
+        _mark_runtime_blocked('ALREADY_WORKING', '小车当前已经在执行任务，请勿重复启动')
+        return 0
+    _mark_runtime_running('自动清扫准备中', {'action': 'auto_drive', 'phase': 'prepare_exit_garage'})
     redis_cli.set('curTaskIndex', 0)
+    # 读取任务基础参数：起点、充电桩、出舱距离、起始姿态等都保存在 taskParams。
     taskParams = redis_cli.hgetall("taskParams")
     # 获取当前坐标点，判断当前点位是否在充电桩中
     chargingPileLat = float(taskParams.get('chargingPileLat'))
@@ -3475,10 +4140,17 @@ def autoDriveByRTKThread():
     # initHeading = taskObj['heading']
     # 起始点航向角,用于位置转正
     originHeading = float(taskParams.get('originHeading'))
+
+    # 舱内/舱外状态判断：决定自动清扫前是否需要先执行出舱。
     exit_decision = decide_auto_exit_garage(get_garage_state(), backLength)
     logger.warn("自动清扫前出舱判定: {}".format(exit_decision))
+    if _runtime_task_should_stop(task_token, 'auto_drive'):
+        return 0
     if exit_decision.get('decision') == EXIT_DECISION_ALLOW:
+        # 车辆被判定在舱内且允许出舱，先后退出舱，再确认状态已经变为舱外。
         goOutGarage(backLength)
+        if _runtime_task_should_stop(task_token, 'auto_drive'):
+            return 0
         if get_garage_state() != GARAGE_STATE_OUTSIDE:
             _mark_runtime_blocked(
                 'GARAGE_EXIT_NOT_CONFIRMED',
@@ -3523,38 +4195,35 @@ def autoDriveByRTKThread():
         redis_cli.set('curTaskIndex', 0)
         # 将当前任务文件中的参数信息同步到redis中
         syncCurTaskFileToRedis()
-    # 如果小车已经在工作了，就没有办法再启动工作
-    if _is_runtime_task_active():
-        logger.warn("小车已经在工作了，无法再开启工作")
-        _mark_runtime_blocked('ALREADY_WORKING', '小车当前已经在执行任务，请勿重复启动')
-        return 0
+    # 自动清扫必须先选择当前任务，currentTaskName 用来和 config.json 中的 taskName 做一致性校验。
     current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
     if not current_task_name:
         _mark_runtime_blocked('CURRENT_TASK_NOT_SET', '未设置当前任务，请先设置当前任务后再启动')
         return
 
     try:
+        # config.json 是当前要执行的任务文件，里面包含 taskList 路径段。
         taskObj = util.readConfig("config.json")
     except Exception as e:
         logger.error("读取config.json失败: {}".format(str(e)))
         _mark_runtime_blocked('CURRENT_TASK_CONFIG_MISSING', '当前任务配置不存在或不可读')
         return
 
+    # 防止 Redis 里选中的任务和实际执行文件不一致。
     config_task_name = _normalize_task_name(taskObj.get('taskName'))
     if config_task_name != current_task_name:
         _mark_runtime_blocked('CURRENT_TASK_MISMATCH', '当前任务与执行配置不一致，请重新设置当前任务')
         return
 
+    # taskList 是自动清扫真正执行的分段路径，每段包含起点、终点、角度、模式等信息。
     taskList = taskObj.get('taskList')
     if not isinstance(taskList, list) or len(taskList) == 0:
         _mark_runtime_blocked('TASK_PATH_EMPTY', '当前任务没有可执行路径，请先生成并设置任务')
         return
 
     global_status = 'working'
-    redis_cli.set("mission", "working")
-    redis_cli.set("parking", "0")
     global_doCleanThreadStop = 0
-    _mark_runtime_running('自动清扫启动成功，任务执行中')
+    _mark_runtime_running('自动清扫启动成功，任务执行中', {'action': 'auto_drive'})
 
     # 根据缓存中是否存在任务，来构建新的任务
     resultTask = []
@@ -3564,10 +4233,10 @@ def autoDriveByRTKThread():
         taskList = taskObj['taskList']
     else:
         taskList = resultTask
-    # 清除当前航向角记录
+    # 清除下位机当前记录的清扫航向，为后续起始姿态校验和清扫模式重新建基准。
     reset_clean_mode(ser)
     time.sleep(0.02)
-    # 如果启动自动清扫任务，那redis中的任务列表就要被清除，然后再初始化
+    # 将当前任务段写入 Redis taskList，便于中断续扫、低电回充、前端进度展示。
     redis_cli.delete('taskList')
     logger.warn(taskList)
     for item in taskList:
@@ -3575,18 +4244,22 @@ def autoDriveByRTKThread():
         redis_cli.rpush('taskList', json.dumps(item))
 
 
-    # # 位置校验
+    # 起始姿态校验：确认车辆当前朝向和任务原点朝向一致，避免方向不对就开始直行。
     if turnCheckPoint(originHeading) == 0:
         _mark_runtime_blocked('START_HEADING_CHECK_FAILED', '起始姿态校验失败，自动清扫未启动')
-        doParking()
+        doParking(update_runtime=False)
         return
     time.sleep(0.02)
-    # 重置陀螺仪(记录当前航向角)
+    # 进入清扫模式，同时记录当前航向角，后续转向/直行以此为参考。
     switch_on_clean_mode(ser)
     # 点到点直线行走是否停止标识
     global_pointToPoint_flag = 0
     # 执行任务
     for index,task in enumerate(taskList):
+        # 每段开始前都检查一次停止信号，保证急停或任务切换能尽快生效。
+        if _runtime_task_should_stop(task_token, 'auto_drive'):
+            global_doCleanThreadStop = 1
+            break
         logger.warn("执行任务{}".format(index + 1))
         turn_back_len = task['turn_back_len']
         back_len = task['back_len']
@@ -3598,6 +4271,7 @@ def autoDriveByRTKThread():
         mode = task['mode']
 
         if index == 0:
+            # 第一段已经在起始姿态校验时对齐过，不重复发送转向命令。
             logger.warn(
                 u"[auto_drive] 第{}段为起始段，不发送转向命令: taskId={}, 目标角度={}°, 目标航向={}°".format(
                     index + 1,
@@ -3607,6 +4281,7 @@ def autoDriveByRTKThread():
                 )
             )
         else:
+            # 非第一段先执行转向，确认下位机完成后再进入该段点到点直行。
             log_task_turn_command(task, index, 'auto_drive')
             turn_result = turn(ser, angle * 10, target_heading=heading, source='auto_drive', segment_index=index + 1, task_id=task.get('id', index + 1))
             if turn_result != 1:
@@ -3614,19 +4289,20 @@ def autoDriveByRTKThread():
                 sendBraking()
                 global_doCleanThreadStop = 1
                 break
-            if redis_cli.get('parking') == '1':
+            if _runtime_task_should_stop(task_token, 'auto_drive'):
                 global_doCleanThreadStop = 1
                 break
             if mode == 1:
                 # moveBack(ser, turn_back_len)
-                if redis_cli.get('parking') == '1':
+                if _runtime_task_should_stop(task_token, 'auto_drive'):
                     global_doCleanThreadStop = 1
                     break
         speed = 350
         if angle == 180:
             speed = 200
+        # 执行当前路径段：内部会设置 global_cur_taskPoint、打开 global_go，并由 RTK 回调持续纠偏。
         result = pointToPointByRTK(startLat,startLon,endLat,endLon,heading,speed)
-        if redis_cli.get('parking') == '1':
+        if _runtime_task_should_stop(task_token, 'auto_drive'):
             global_go = 0
             # 表示自动清扫线程停止
             global_doCleanThreadStop = 1
@@ -3634,27 +4310,39 @@ def autoDriveByRTKThread():
         else:
             if mode == 1 and index != len(taskList)-1:
                 # moveBack(ser,back_len)
-                if redis_cli.get('parking') == '1':
+                if _runtime_task_should_stop(task_token, 'auto_drive'):
                     global_doCleanThreadStop = 1
                     break
             if mode == 1 and index == len(taskList)-1:
                 if lastTaskBackLength != 0:
                     moveBack(ser, lastTaskBackLength)
-            # 在redis中设置是否是最后一个任务，如果是则设置为1，不是则设置为0
+            # 倒数第二段完成后，下一段就是最后一段；RTK纠偏回调会据此在接近终点时降速。
             if index == len(taskList) - 2:
                 redis_cli.set("lastTask", 1)
             else:
                 redis_cli.set("lastTask",0)
+            # 当前段完成后从 Redis 缓存中弹出，剩余列表用于续扫和状态展示。
             logger.warn("删除任务{}".format(index + 1))
             redis_cli.lpop("taskList")
     logger.warn("自动行驶结束")
     redis_cli.incr("doTaskCounter")
-    doParking()
+    if not _is_current_runtime_task(task_token):
+        logger.warn("auto clean task token is stale; skip final runtime writes")
+        return 0
+    completed_normally = global_doCleanThreadStop == 0 and not _runtime_task_should_stop(task_token, 'auto_drive')
     # 如果自动清扫被停止，则不继续运行
-    if global_doCleanThreadStop == 0:
+    if completed_normally:
+        # 正常完成后停车、清空缓存任务，并按配置执行回舱。
+        doParking(update_runtime=False)
+        redis_cli.delete('taskList')
+        _set_auto_resume_allowed(False, 'auto_drive_completed')
         if backLength != 0:
             # intoGarage(chargingPileLat,chargingPileLon,originHeading)
             intoGarage(backLength)
+        _mark_runtime_complete('RTK自动清扫任务结束', {'action': 'auto_drive'})
+    else:
+        if _is_current_runtime_task(task_token):
+            doParking()
 
 
 
@@ -3704,12 +4392,12 @@ def intoGarage_api():
     # chargingPileLat = float(taskParams.get('chargingPileLat'))
     # chargingPileLon = float(taskParams.get('chargingPileLon'))
     # originHeading = int(taskParams.get('originHeading'))
-    # redis_cli.set("mission","working")
+    # legacy mission write removed; runtime state goes through FSM.
     # reset_odometer(ser)
     # moveByRTK(chargingPileLat, chargingPileLon, (originHeading + 180) % 360)
     # 开启视觉纠偏
     # redis_cli.set("correct","true")
-    # redis_cli.set("mission", "working")
+    # legacy mission write removed; runtime state goes through FSM.
     reset_odometer(ser)
     goByLength(ser,100,100)
     # 关闭视觉纠偏
@@ -3737,6 +4425,9 @@ def setStatus_api():
 def auto_driving():
     redis_cli.set("reverse", "false")
     global global_doCleanThreadStop
+    if not _can_start_runtime_task():
+        return jsonify(_runtime_not_startable_payload())
+
     validation = _validate_auto_drive_request()
     if not validation.get('success'):
         _mark_runtime_blocked(
@@ -3747,10 +4438,14 @@ def auto_driving():
         return jsonify(validation)
 
     global_doCleanThreadStop = 0
-    _mark_runtime_ready('启动条件通过，正在创建自动清扫线程', validation.get('data'))
-
-    thread = threading.Thread(target=autoDriveByRTKThread)
-    thread.start()
+    thread, error_payload = _start_runtime_thread(
+        'auto_drive',
+        autoDriveByRTKThread,
+        ready_message='启动条件通过，正在创建自动清扫线程',
+        detail=validation.get('data'),
+    )
+    if error_payload:
+        return jsonify(error_payload)
 
     return jsonify({
         'success': True,
@@ -3759,13 +4454,17 @@ def auto_driving():
     })
 
 
-def loopAutoDriveThread():
-    global loop_auto_clean_thread, global_doCleanThreadStop
+def loopAutoDriveThread(task_token=None):
+    global loop_auto_clean_thread, global_doCleanThreadStop, global_loop_auto_clean_stop
+    if task_token is None:
+        task_token = _begin_runtime_task('loop_auto_drive')
     logger.warn("循环自动清扫线程启动")
     _set_loop_auto_clean_state(running=True, stop_reason='running')
-    set_current_action('loop_auto_drive')
     try:
         while _is_loop_auto_clean_enabled():
+            if _runtime_task_should_stop(task_token, 'loop_auto_drive'):
+                _disable_loop_auto_clean('task_interrupted')
+                break
             if _is_loop_low_battery() or isNeedReturnCharging():
                 _disable_loop_auto_clean('low_battery_return')
                 break
@@ -3784,8 +4483,11 @@ def loopAutoDriveThread():
             redis_cli.set(LOOP_AUTO_CLEAN_UPDATED_AT_KEY, int(time.time()))
             logger.warn("循环自动清扫第{}轮开始".format(cycle))
             global_doCleanThreadStop = 0
-            autoDriveByRTKThread()
+            autoDriveByRTKThread(task_token)
 
+            if _runtime_task_should_stop(task_token, 'loop_auto_drive'):
+                _disable_loop_auto_clean('task_interrupted')
+                break
             if _is_loop_low_battery() or isNeedReturnCharging():
                 _disable_loop_auto_clean('low_battery_return')
                 break
@@ -3798,6 +4500,9 @@ def loopAutoDriveThread():
             logger.warn("循环自动清扫第{}轮结束，等待下一轮".format(cycle))
             slept = 0.0
             while slept < LOOP_AUTO_CLEAN_SLEEP_SECONDS and _is_loop_auto_clean_enabled():
+                if _runtime_task_should_stop(task_token, 'loop_auto_drive'):
+                    _disable_loop_auto_clean('task_interrupted')
+                    break
                 if _is_loop_low_battery():
                     _disable_loop_auto_clean('low_battery_return')
                     break
@@ -3820,7 +4525,7 @@ def loopAutoDriveThread():
 
 @app.route("/vehicle/startLoopAutoDrive", methods=['GET'])
 def start_loop_auto_drive():
-    global loop_auto_clean_thread, global_doCleanThreadStop
+    global loop_auto_clean_thread, global_doCleanThreadStop, global_loop_auto_clean_stop
     redis_cli.set("reverse", "false")
     with LOOP_AUTO_CLEAN_LOCK:
         if loop_auto_clean_thread is not None and loop_auto_clean_thread.is_alive():
@@ -3840,11 +4545,17 @@ def start_loop_auto_drive():
             return jsonify(validation)
 
         global_doCleanThreadStop = 0
+        global_loop_auto_clean_stop = 0
         _set_loop_auto_clean_state(enabled=True, running=False, stop_reason='', cycle=0)
-        _mark_runtime_ready('循环自动清扫启动条件通过，正在创建循环线程', validation.get('data'))
-        loop_auto_clean_thread = threading.Thread(target=loopAutoDriveThread)
-        loop_auto_clean_thread.daemon = True
-        loop_auto_clean_thread.start()
+        loop_auto_clean_thread, error_payload = _start_runtime_thread(
+            'loop_auto_drive',
+            loopAutoDriveThread,
+            ready_message='循环自动清扫启动条件通过，正在创建循环线程',
+            detail=validation.get('data'),
+        )
+        if error_payload:
+            _set_loop_auto_clean_state(enabled=False, running=False, stop_reason='start_rejected')
+            return jsonify(error_payload)
 
     return jsonify({
         'success': True,
@@ -3856,8 +4567,9 @@ def start_loop_auto_drive():
 @app.route("/vehicle/stopLoopAutoDrive", methods=['GET'])
 def stop_loop_auto_drive():
     global global_status
-    _disable_loop_auto_clean('manual_stop')
-    doParking()
+    _request_runtime_stop('manual_stop_loop_auto_drive', clear_auto_task=True,
+                          update_runtime=True,
+                          message='循环自动清扫已停止')
     global_status = 'active'
     return jsonify({
         'success': True,
@@ -3954,7 +4666,7 @@ def _set_current_task(task_name):
         syncCurTaskFileToRedis()
         taskList = []
 
-    return {"success": True, "msg": "淇濆瓨鏁版嵁鎴愬姛", "data": {"taskName": taskName}}
+    return {"success": True, "msg": "保存数据成功", "data": {"taskName": taskName}}
 # 设置入舱点，入舱点是小车进入充电桩前的入口位置，不等同于充电桩位置
 @app.route("/vehicle/setGarageEntryInfo", methods=['GET'])
 def setGarageEntryInfo():
@@ -4109,38 +4821,16 @@ def correctByRTK():
 # 急停
 @app.route("/vehicle/parking", methods=['GET'])
 def parking():
-    global global_pointToPoint_flag,global_go,global_status
-    _disable_loop_auto_clean('manual_parking')
-    set_current_action('parking')
-    redis_cli.set("ultraSonic", "false")
-    redis_cli.set("mission", "complete")
-    redis_cli.set('action', 'false')
-    redis_cli.set("correct", "false")
-    redis_cli.set('moveJudge', 'false')
-    redis_cli.set('reverse', 'false')
-    redis_cli.set('enterGarage', 'false')
-    redis_cli.set('exitGarage', 'false')
-    # 设置暂停
-    redis_cli.set('parking', 1)
-    # 停止清扫线程,打断点到点执行任务
-    global_pointToPoint_flag = 1
-    global_go = 0
-    sendBraking()
-    global_status = 'active'
-    redis_cli.set('curTaskIndex', 0)
-    _mark_runtime_idle('已执行停车指令')
+    _request_runtime_stop('manual_parking', clear_auto_task=True, update_runtime=True,
+                          message='已执行停车指令')
     response = make_response("1")
 
     return response
 
 
-def doParking():
+def doParking(update_runtime=True, message='任务已停止并进入停车状态'):
     global global_pointToPoint_flag, global_go
-    set_current_action('parking')
-    redis_cli.set('parking', 1)
-
     redis_cli.set("ultraSonic", "false")
-    redis_cli.set("mission", "complete")
     redis_cli.set('action', 'false')
     redis_cli.set("correct", "false")
     redis_cli.set('moveJudge', 'false')
@@ -4152,12 +4842,14 @@ def doParking():
     global_go = 0
     sendBraking()
     redis_cli.set('curTaskIndex', 0)
-    _mark_runtime_idle('任务已停止并进入停车状态')
+    if update_runtime:
+        _clear_runtime_task_state('doParking', update_runtime=True, message=message)
 
 # 删除缓存任务
 @app.route('/vehicle/delTaskList', methods=['GET'])
 def delTaskList():
-    redis_cli.delete('taskList')
+    _clear_runtime_task_state('delTaskList', clear_auto_task=True, update_runtime=True,
+                              message='cached task state cleared')
     result = {"success": True, "msg": "删除成功"}
     return jsonify(result)
 
@@ -4356,17 +5048,22 @@ def getVoltage():
 def returnToPoint():
     # if redis_cli.get("doCleanThreadStop") == '0':
     #     return make_response("请先点击急停,然后再点击返回原点")
-    thread = threading.Thread(target=returnToPointThread)
     logger.warn("启动返回固定点线程")
-    thread.start()
+    thread, error_payload = _start_runtime_thread(
+        'return_to_point',
+        returnToPointThread,
+        ready_message='正在创建返回固定点线程',
+    )
+    if error_payload:
+        return jsonify(error_payload)
     response = make_response("1")
     return response
 
 
-def returnToPointThread():
+def returnToPointThread(task_token=None):
     try:
         logger.warn("启动返回固定点")
-        set_current_action('return_to_point')
+        _mark_runtime_running('返回固定点启动', {'action': 'return_to_point'})
         redis_cli.set('curTaskIndex', 0)
         logger.warn("returnToPoint uses shared RTKDataManager observer stream")
         # 判断当前到那个任务了
@@ -4374,29 +5071,23 @@ def returnToPointThread():
         # 下一个任务
         json_next_item = redis_cli.lindex('taskList', 1)
 
-        redis_cli.set("mission", "working")
         redis_cli.set("correct", "true")
         redis_cli.set('action', 'true')
-        set_current_action('return_to_point')
-        # 使其每一次接口调用，都重新开始
-        redis_cli.set('parking', 0)
         reset_odometer(ser)
 
         if json_item:
             item = json.loads(json_item)
             next_item = json.loads(json_next_item)
             goByBackRoute(item, next_item)
-        # 关闭工作模式
-        redis_cli.set("mission", "complete")
         # 开启纠偏
         redis_cli.set("correct", "false")
-        set_current_action('idle')
         redis_cli.set('curTaskIndex', 0)
         # 初始化
         redis_cli.set("doCleanThreadStop", 0)
         logger.warn("返回固定点结束")
+        _mark_runtime_complete('返回固定点结束', {'action': 'return_to_point'})
         # 停止一切
-        doParking()
+        doParking(update_runtime=False)
     except Exception as e:
         doParking()
         redis_cli.set("doCleanThreadStop", 0)
@@ -4464,12 +5155,13 @@ def goByBackRoute(curItem, nextItem):
 def moveByRTK(endLat, endLon,heading=0):
     global global_cur_taskPoint
     global global_go,global_interval
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
     # 获取当前任务开始点和结束点的经纬度
     # dis,heading = util.get_distance_angle(global_cur_rtk_lat,global_cur_rtk_lon,endLat,endLon)
     global_cur_taskPoint = {"heading":heading,"startLat": global_cur_rtk_lat, "startLon": global_cur_rtk_lon,
                             "endLat": endLat,"endLon": endLon, "speed": 100}
+    global_rtk_tracking_filter.reset()
     # 开启RTK纠偏
     global_go = 1
     goCommand(100)
@@ -4481,7 +5173,7 @@ def moveByRTK(endLat, endLon,heading=0):
     # 如果global_go = 1，则说明直行未结束
     while global_go == 1:
         # 表示到边了
-        if getEdge() == "0":
+        if global_edge_trigger_latch.consume(getEdge()):
             edge_action = _handle_edge_stop_for_current_task('moveByRTK')
             if edge_action == EDGE_STOP_ACTION_TARGET:
                 global_go = 0
@@ -4511,6 +5203,7 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
     global_interval = 0
     global_cur_taskPoint = {"heading": heading, "startLat": startLat, "startLon": startLon,
                             "endLat": endLat, "endLon": endLon, "speed": speed}
+    global_rtk_tracking_filter.reset()
     # 开启RTK纠偏
     global_go = 1
     _publish_global_go(global_go)
@@ -4521,11 +5214,11 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
     startTime = time.time()
     # 如果global_go = 1，则说明直行未结束
     while global_go == 1:
-        if redis_cli.get('parking') == '1':
+        if _is_runtime_stop_requested():
             result = 0
             break
         # 表示到边了
-        if getEdge() == '0':
+        if global_edge_trigger_latch.consume(getEdge()):
             edge_action = _handle_edge_stop_for_current_task('pointToPointByRTK')
             if edge_action == EDGE_STOP_ACTION_TARGET:
                 global_go = 0
@@ -4562,13 +5255,13 @@ def pointToPointByRTKAutoHeading(current_start_lat, current_start_lon, endLat, e
     return pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)
 
 
-def goToPointThread(plan):
+def goToPointThread(task_token=None, plan=None):
+    if plan is None and isinstance(task_token, dict):
+        plan = task_token
+        task_token = None
     global global_pointToPoint_flag, global_go
-    set_current_action('go_to_point')
-    redis_cli.set("mission", "working")
-    redis_cli.set("parking", "0")
     redis_cli.set("correct", "true")
-    _mark_runtime_running('点对点导航启动', {'goToPointPlan': plan})
+    _mark_runtime_running('点对点导航启动', {'goToPointPlan': plan, 'action': 'go_to_point'})
     try:
         result = pointToPointByRTKAutoHeading(
             plan.get("startLat"),
@@ -4588,10 +5281,8 @@ def goToPointThread(plan):
         global_go = 0
         global_pointToPoint_flag = 0
         _publish_global_go(global_go)
-        redis_cli.set("mission", "complete")
         redis_cli.set("correct", "false")
-        set_current_action('idle')
-        doParking()
+        doParking(update_runtime=False)
 
 
 @app.route("/vehicle/goToPoint", methods=['POST', 'GET'])
@@ -4611,9 +5302,15 @@ def goToPoint():
         return jsonify(plan_result)
 
     plan = plan_result.get("data") or {}
-    thread = threading.Thread(target=goToPointThread, args=(plan,))
-    thread.daemon = True
-    thread.start()
+    thread, error_payload = _start_runtime_thread(
+        'go_to_point',
+        goToPointThread,
+        args=(plan,),
+        ready_message='正在创建点对点导航线程',
+        detail={'goToPointPlan': plan},
+    )
+    if error_payload:
+        return jsonify(error_payload)
     return jsonify({
         'success': True,
         'code': 200,
@@ -4648,23 +5345,37 @@ def _parse_waypoints_from_payload(payload):
 
 
 def _set_waypoint_loop_progress(loop_options, current_loop=0, waypoint_index=0):
-    redis_cli.set('waypointLoopEnabled', 'true' if loop_options.get('loop') else 'false')
+    redis_cli.set('waypointLoopEnabled', '1' if loop_options.get('loop') else '0')
     redis_cli.set('waypointLoopMode', loop_options.get('loopMode') or 'count')
     redis_cli.set('waypointLoopTarget', loop_options.get('loopCount', 1))
     redis_cli.set('waypointLoopCurrent', current_loop)
+    redis_cli.set('waypointIndex', waypoint_index)
     redis_cli.hset('waypointLoopProgress', 'waypointIndex', waypoint_index)
     redis_cli.hset('waypointLoopProgress', 'loopMode', loop_options.get('loopMode') or 'count')
     redis_cli.hset('waypointLoopProgress', 'currentLoop', current_loop)
     redis_cli.hset('waypointLoopProgress', 'targetLoop', loop_options.get('loopCount', 1))
 
 
-def multiGoToPointThread(waypoints, loop_options):
-    set_current_action('multi_go_to_point')
-    redis_cli.set("mission", "working")
-    redis_cli.set("parking", "0")
+def multiGoToPointThread(task_token=None, waypoints=None, loop_options=None):
+    # 兼容旧调用方式：以前可能直接把 waypoints 作为第一个参数传进来。
+    # 新流程里 task_token 由 _start_runtime_thread 管理，waypoints 和 loop_options 作为 args 传入。
+    if loop_options is None and isinstance(task_token, list):
+        loop_options = waypoints
+        waypoints = task_token
+        task_token = None
+    # 标记当前进入纠偏/导航流程；真正的 RTK 纠偏会在 pointToPointByRTK() 打开 global_go 后开始。
     redis_cli.set("correct", "true")
-    _mark_runtime_running('多路点导航启动', {'waypoints': waypoints, 'loopOptions': loop_options})
+    # 写入 FSM/运行态，告诉前端和云端当前动作是 multi_go_to_point。
+    _mark_runtime_running('多路点导航启动', {
+        'waypoints': waypoints,
+        'loopOptions': loop_options,
+        'action': 'multi_go_to_point',
+    })
     try:
+        # 根据闭环配置生成目标点迭代器：
+        # - loop=true 且 loopMode=continuous 时，loop_count=None 表示持续循环；
+        # - loop=true 且 loopMode=count 时，按 loopCount 圈数闭环；
+        # - loop=false 时，只按路点顺序执行一遍。
         if loop_options.get('loop'):
             loop_count = None if loop_options.get('loopMode') == 'continuous' else loop_options.get('loopCount')
             target_iter = iter_closed_loop_targets(waypoints, loop_count)
@@ -4674,10 +5385,12 @@ def multiGoToPointThread(waypoints, loop_options):
                 for index, waypoint in enumerate(waypoints)
             )
         for target in target_iter:
-            if redis_cli.get('parking') == '1':
+            # 每个路点开始前检查停止状态，收到停止/急停/任务切换后不再继续执行后续路点。
+            if _is_runtime_stop_requested():
                 break
             waypoint = target.get('waypoint') or {}
             current_loop = target.get('completed_loop', 0)
+            # 同步当前路点索引和闭环圈数，供状态接口/页面展示进度。
             _set_waypoint_loop_progress(loop_options, current_loop, target.get('index', 0))
             loop_progress = {
                 "loopMode": loop_options.get('loopMode'),
@@ -4685,6 +5398,7 @@ def multiGoToPointThread(waypoints, loop_options):
                 "targetLoop": loop_options.get('loopCount'),
             }
             _set_redis_value('runtimeDetail', _build_runtime_detail({'waypointLoopProgress': loop_progress}))
+            # 用“当前实时 RTK 位置 -> 目标路点”生成单点导航计划，计算起点、终点、距离、航向和速度。
             plan_result = build_go_to_point_plan(
                 global_cur_rtk_lat,
                 global_cur_rtk_lon,
@@ -4693,9 +5407,13 @@ def multiGoToPointThread(waypoints, loop_options):
                 waypoint.get('speed'),
             )
             if not plan_result.get('success'):
+                # 当前 RTK 不可用、目标点无效或速度无效时，阻塞任务并停止继续遍历。
                 _mark_runtime_blocked(plan_result.get('code', 'WAYPOINT_INVALID'), plan_result.get('msg', '路点无效'), plan_result)
                 break
             plan = plan_result.get('data') or {}
+            # 执行单个路点：
+            # pointToPointByRTKAutoHeading() 会先 turn() 转到目标航向，
+            # 再进入 pointToPointByRTK()，由 observer_go_correct() 按 RTK 数据持续纠偏。
             result = pointToPointByRTKAutoHeading(
                 plan.get("startLat"),
                 plan.get("startLon"),
@@ -4704,18 +5422,19 @@ def multiGoToPointThread(waypoints, loop_options):
                 plan.get("speed"),
             )
             if result != 1:
+                # 单个路点未完成时，不再执行后续路点，避免路径状态不连续。
                 _mark_runtime_blocked('WAYPOINT_INTERRUPTED', '多路点导航被中断', {'waypoint': waypoint})
                 break
         else:
+            # for 循环没有被 break 打断，说明所有路点/闭环目标都正常完成。
             _mark_runtime_complete('多路点导航完成', {'waypoints': waypoints, 'loopOptions': loop_options})
     except Exception as e:
         logger.error("multiGoToPointThread error: {}".format(traceback.format_exc()))
         _mark_runtime_blocked('MULTI_GO_TO_POINT_ERROR', '多路点导航异常: {}'.format(str(e)))
     finally:
-        redis_cli.set("mission", "complete")
+        # 无论正常完成、被打断还是异常，都关闭纠偏标记并停车收尾。
         redis_cli.set("correct", "false")
-        set_current_action('idle')
-        doParking()
+        doParking(update_runtime=False)
 
 
 @app.route("/vehicle/multiGoToPoint", methods=['POST'])
@@ -4728,10 +5447,21 @@ def multiGoToPoint():
         loop_options = normalize_loop_options(payload, len(waypoints))
     except ValueError as e:
         return jsonify({'success': False, 'code': 'WAYPOINT_LOOP_INVALID', 'msg': str(e)})
-    _set_waypoint_loop_progress(loop_options, 0, 0)
-    thread = threading.Thread(target=multiGoToPointThread, args=(waypoints, loop_options))
-    thread.daemon = True
-    thread.start()
+    with TASK_SWITCH_LOCK:
+        if not _can_start_runtime_task():
+            return jsonify(_runtime_not_startable_payload())
+        redis_cli.set('waypointTotal', len(waypoints))
+        redis_cli.set('waypointIndex', 0)
+        _set_waypoint_loop_progress(loop_options, 0, 0)
+        thread, error_payload = _start_runtime_thread(
+            'multi_go_to_point',
+            multiGoToPointThread,
+            args=(waypoints, loop_options),
+            ready_message='正在创建多路点导航线程',
+            detail={'waypoints': waypoints, 'loopOptions': loop_options},
+        )
+        if error_payload:
+            return jsonify(error_payload)
     return jsonify({
         'success': True,
         'code': 200,
@@ -4901,17 +5631,21 @@ def goToPointsReorder():
 @app.route("/vehicle/goToPoints/clear", methods=['POST'])
 def goToPointsClear():
     try:
-        redis_cli.delete('waypoints')
-        redis_cli.set('waypointTotal', 0)
-        redis_cli.set('waypointIndex', 0)
+        _clear_runtime_task_state('goToPointsClear', clear_waypoints=True, update_runtime=True,
+                                  message='waypoints cleared')
         return jsonify({"success": True, "msg": "路点已清空", "data": [], "total": 0})
     except Exception as e:
         logger.error("清空路点失败: {}".format(e), exc_info=True)
         return jsonify({"success": False, "msg": "清空路点失败"})
 
 
-def goToPointsThread():
-    global global_status, global_go, global_doCleanThreadStop
+def goToPointsThread(task_token=None):
+    global global_status, global_go, global_doCleanThreadStop, global_waypoint_nav_stop
+    if task_token is None:
+        task_token = _begin_runtime_task('multi_go_to_point')
+    if _runtime_task_should_stop(task_token, 'multi_go_to_point'):
+        logger.warn("goToPointsThread: task token is no longer active, exit")
+        return
     try:
         waypoints = _load_go_to_points()
         if not waypoints:
@@ -4946,12 +5680,13 @@ def goToPointsThread():
             return
 
         global_status = 'working'
-        set_current_action('multi_go_to_point')
-        redis_cli.set("mission", "working")
-        redis_cli.set("parking", "0")
         redis_cli.set("correct", "true")
         redis_cli.set('waypointTotal', len(waypoints))
-        _mark_runtime_running('多点路点导航启动', {'waypoints': waypoints, 'loopOptions': loop_options})
+        _mark_runtime_running('多点路点导航启动', {
+            'waypoints': waypoints,
+            'loopOptions': loop_options,
+            'action': 'multi_go_to_point',
+        })
 
         if loop_enabled:
             loop_count = None if loop_mode == 'continuous' else loop_target
@@ -4963,53 +5698,79 @@ def goToPointsThread():
             )
 
         completed_loop = 0
+        completed_normally = False
+        failed = False
         for target in target_iter:
-            if redis_cli.get('parking') == '1' or global_doCleanThreadStop:
+            if _runtime_task_should_stop(task_token, 'multi_go_to_point') or global_doCleanThreadStop:
+                failed = True
                 break
             if not _execute_go_to_points_target(target):
+                failed = True
+                _mark_runtime_blocked(
+                    'WAYPOINT_INTERRUPTED',
+                    '多点路点导航未完成',
+                    {'target': target}
+                )
                 break
             if target.get('completed_loop', 0) > completed_loop:
                 completed_loop = target['completed_loop']
                 redis_cli.set(WAYPOINT_LOOP_CURRENT_KEY, completed_loop)
                 logger.warn("多点闭环导航: 第{}圈完成".format(completed_loop))
+        completed_normally = (
+            not failed
+            and not _runtime_task_should_stop(task_token, 'multi_go_to_point')
+            and not global_doCleanThreadStop
+        )
+        if completed_normally:
+            _mark_runtime_complete('多点路点导航完成', {'waypoints': waypoints, 'loopOptions': loop_options})
         logger.warn("多点路点导航结束")
     except Exception as e:
         logger.error("多点路点导航异常: {}".format(e), exc_info=True)
         _mark_runtime_blocked('GO_TO_POINTS_ERROR', '多点路点导航异常: {}'.format(str(e)))
     finally:
-        global_go = 0
-        _publish_global_go(global_go)
-        redis_cli.set("mission", "complete")
-        redis_cli.set("correct", "false")
-        redis_cli.set('action', 'false')
-        set_current_action('idle')
-        redis_cli.set('waypointIndex', 0)
-        redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '0')
-        global_status = 'active'
-        doParking()
+        if _is_current_runtime_task(task_token):
+            global_go = 0
+            _publish_global_go(global_go)
+            _clear_runtime_task_state('goToPointsThread.finally', update_runtime=False,
+                                      message='go to points thread finished')
+            global_status = 'active'
+            doParking(update_runtime=False)
+        else:
+            logger.warn("goToPointsThread: stale task token, skip final runtime writes")
 
 
 @app.route("/vehicle/goToPoints/start", methods=['POST'])
 def goToPointsStart():
-    global global_doCleanThreadStop
+    global global_doCleanThreadStop, global_waypoint_nav_stop
     try:
-        if _is_runtime_task_active():
-            return jsonify({"success": False, "code": "ALREADY_RUNNING", "msg": "当前已有任务运行"})
         waypoints = _load_go_to_points()
         if not waypoints:
             return jsonify({"success": False, "code": "WAYPOINTS_EMPTY", "msg": "路点为空"})
         payload = _request_payload()
         loop_options = normalize_loop_options(payload, len(waypoints))
-        redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '1' if loop_options['loop'] else '0')
-        redis_cli.set(WAYPOINT_LOOP_MODE_KEY, loop_options['loopMode'])
-        redis_cli.set(WAYPOINT_LOOP_TARGET_KEY, loop_options['loopCount'])
-        redis_cli.set(WAYPOINT_LOOP_CURRENT_KEY, 0)
-        redis_cli.set('waypointTotal', len(waypoints))
-        redis_cli.set('waypointIndex', 0)
-        global_doCleanThreadStop = 0
-        thread = threading.Thread(target=goToPointsThread)
-        thread.daemon = True
-        thread.start()
+        with TASK_SWITCH_LOCK:
+            if not _can_start_runtime_task():
+                return jsonify(_runtime_not_startable_payload())
+            _set_auto_resume_allowed(False, 'prepare_go_to_points')
+            _request_runtime_stop('prepare_go_to_points', clear_auto_task=True,
+                                  update_runtime=False,
+                                  message='prepare go to points task')
+            redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '1' if loop_options['loop'] else '0')
+            redis_cli.set(WAYPOINT_LOOP_MODE_KEY, loop_options['loopMode'])
+            redis_cli.set(WAYPOINT_LOOP_TARGET_KEY, loop_options['loopCount'])
+            redis_cli.set(WAYPOINT_LOOP_CURRENT_KEY, 0)
+            redis_cli.set('waypointTotal', len(waypoints))
+            redis_cli.set('waypointIndex', 0)
+            global_doCleanThreadStop = 0
+            global_waypoint_nav_stop = 0
+            thread, error_payload = _start_runtime_thread(
+                'multi_go_to_point',
+                goToPointsThread,
+                ready_message='正在创建多点路点导航线程',
+                detail={'waypoints': waypoints, 'loopOptions': loop_options},
+            )
+            if error_payload:
+                return jsonify(error_payload)
         return jsonify({
             "success": True,
             "code": "MULTI_GO_TO_POINT_STARTED",
@@ -5028,13 +5789,14 @@ def goToPointsStart():
 
 @app.route("/vehicle/goToPoints/stop", methods=['POST'])
 def goToPointsStop():
-    global global_doCleanThreadStop
+    global global_doCleanThreadStop, global_waypoint_nav_stop
     try:
         global_doCleanThreadStop = 1
-        doParking()
-        set_current_action('idle')
-        redis_cli.set('waypointIndex', 0)
-        redis_cli.set(WAYPOINT_LOOP_ENABLED_KEY, '0')
+        global_waypoint_nav_stop = 1
+        _request_runtime_stop('goToPointsStop', update_runtime=False,
+                              message='go to points stopped')
+        _clear_runtime_task_state('goToPointsStop', update_runtime=True,
+                                  message='go to points stopped')
         logger.warn("多点路点导航: 收到停止命令")
         return jsonify({"success": True, "msg": "多点路点导航已停止"})
     except Exception as e:
@@ -5045,17 +5807,19 @@ def goToPointsStop():
 @app.route("/vehicle/goToPoints/progress", methods=['GET'])
 def goToPointsProgress():
     try:
-        current_action = redis_cli.get('currentAction') or ''
-        running = current_action == 'multi_go_to_point'
+        current_action = _runtime_action()
+        running = _is_runtime_task_active() and current_action == 'multi_go_to_point'
+        saved_total = len(_load_go_to_points())
         current_index = _coerce_int(redis_cli.get('waypointIndex'), 0) if running else 0
-        total = _coerce_int(redis_cli.get('waypointTotal'), 0) if running else 0
+        total = _coerce_int(redis_cli.get('waypointTotal'), saved_total) if running else saved_total
         return jsonify({
             "success": True,
             "data": {
                 "running": running,
                 "currentIndex": current_index,
                 "total": total,
-                "loop": redis_cli.get(WAYPOINT_LOOP_ENABLED_KEY) == '1',
+                "savedTotal": saved_total,
+                "loop": _coerce_bool(redis_cli.get(WAYPOINT_LOOP_ENABLED_KEY), False),
                 "loopMode": redis_cli.get(WAYPOINT_LOOP_MODE_KEY) or 'count',
                 "currentLoop": _coerce_int(redis_cli.get(WAYPOINT_LOOP_CURRENT_KEY), 0),
                 "targetLoop": _coerce_int(redis_cli.get(WAYPOINT_LOOP_TARGET_KEY), 0),
@@ -5076,7 +5840,7 @@ def observer_rtk_data(data):
     lon = data.lon
     if data.heading is None:
         if redis_cli.get('openLog') == '1':
-            logger.warning("RTK宸叉洿鏂扮粡绾害锛屼絾褰撳墠鏃犳湁鏁堣埅鍚戣锛岃烦杩囪埅鍚戝悓姝? lat={}, lon={}".format(lat, lon))
+            logger.warning("RTK已更新经纬度，但当前无有效航向角，跳过航向同步 lat={}, lon={}".format(lat, lon))
         return
     heading = float(data.heading)
     # preBuildCommand()
@@ -5134,7 +5898,7 @@ def observer_go_correct(data):
                 observer_go_correct._last_recovering_log_at = now
             return
         if data.heading is None:
-            logger.warning("RTK缁忕含搴﹀凡鏇存柊锛屼絾褰撳墠鏃犳湁鏁堣埅鍚戣锛屾殏涓嶆墽琛岀洿琛岀籂鍋?...")
+            logger.warning("RTK经纬度已更新，但当前无有效航向角，暂不执行直行纠偏...")
             return
         start_lat = global_cur_taskPoint['startLat']
         start_lon = global_cur_taskPoint['startLon']
@@ -5142,34 +5906,31 @@ def observer_go_correct(data):
         target_lon = global_cur_taskPoint['endLon']
         target_heading = float(global_cur_taskPoint['heading'])
 
-        # 计算期望航向角（从当前位置指向目标点）
-        distance_to_target, target_heading_cur = util.get_distance_angle(data.lat, data.lon, target_lat, target_lon)
-        heading_error = float(target_heading) - float(data.heading)
-        # 计算最短偏差
-        heading_error = (heading_error + 180) % 360 - 180
-        if distance_to_target < 1:
-            heading_error = max(-5,min(heading_error,5))
-        # 只有直行，才发送纠偏指令
-        cte = util.cross_track_error(start_lat, start_lon, target_lat, target_lon, data.lat, data.lon)
-
-        # cte_dot = (cte - global_last_cte) / 0.01
-        # raw_output = (heading_error * K_HEAD) - (cte * K_CTE_P) - (cte_dot * K_CTE_D)
-        # raw_output = - (cte * K_CTE_P) - (cte_dot * K_CTE_D)
-
-        # stree_output = int(raw_output)
-        # stree_output = heading_error*10 - int(450 * cte)
-        stree_output = compute_linear_steering(heading_error, cte, cte_gain=1000)
-        # if abs(heading_error) > 1 or abs(cte) > 0.02:
-            # logger.warning("视觉纠偏关闭，RTK纠偏开启")
-            # redis_cli.set("correct", "false")
-        # 发送电机控制指令
-        # 正数左轮快，向右偏，负数右轮快，向左偏
-        z_speed = -stree_output
-        z_speed = -stree_output
+        # 第四步：计算纠偏命令。
+        # build_tracking_command 内部先用 global_rtk_tracking_filter 对当前 RTK 坐标做 Kalman 滤波，
+        # 再用 global_straight_line_controller 按“起点 -> 终点”这条目标直线计算控制量。
+        # 返回值包含到终点距离、航向误差、横向偏差 cte，以及要下发给下位机的转向输出 z_speed。
+        tracking_command = build_tracking_command(
+            global_rtk_tracking_filter,
+            global_straight_line_controller,
+            start_lat=start_lat,
+            start_lon=start_lon,
+            end_lat=target_lat,
+            end_lon=target_lon,
+            current_lat=data.lat,
+            current_lon=data.lon,
+            vehicle_heading=data.heading,
+            target_heading=target_heading,
+            timestamp=now,
+        )
+        distance_to_target = tracking_command.distance_to_target_m
+        heading_error = tracking_command.heading_error_deg
+        cte = tracking_command.cte_m
+        z_speed = tracking_command.z_speed
         setZSpeed(z_speed)
         duplicateWriteCmd(ser, command)
         logger.info(
-            "linear correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m cte_gain=1000 z={}".format(
+            "kalman p correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m z={}".format(
                 target_heading, data.heading, heading_error, cte, global_last_cte, distance_to_target,
                 z_speed
             )
@@ -5178,19 +5939,12 @@ def observer_go_correct(data):
         # 打印状态
         logger.info("航向角:{:.2f} | 当前航向角:{:.2f} | heading_error:{:.2f}横向偏差:{:.2f}上次横向偏差:{:.2f}距离目标:{:.2f}m | 转向输出: {:.2f}"
                     .format(target_heading, data.heading, heading_error, cte, global_last_cte,distance_to_target,
-                            stree_output))
+                            z_speed))
         global_last_cte = cte
         if distance_to_target <= 2 and redis_cli.get('lastTask') == '1':
             sendCommandSetXSpeed(200)
 
-        signed_remaining = util.signed_along_track_distance(
-            start_lat,
-            start_lon,
-            target_lat,
-            target_lon,
-            data.lat,
-            data.lon,
-        )
+        signed_remaining = tracking_command.signed_remaining_m
         _publish_correction_debug(
             heading_error,
             cte,
@@ -5199,6 +5953,13 @@ def observer_go_correct(data):
             signed_remaining,
             target_heading,
             data.heading,
+            {
+                'rawLat': tracking_command.raw_lat,
+                'rawLon': tracking_command.raw_lon,
+                'filteredLat': tracking_command.filtered_lat,
+                'filteredLon': tracking_command.filtered_lon,
+                'controlSource': tracking_command.source,
+            }
         )
         if util.should_finish_point_to_point(
             distance_to_target,
@@ -5221,7 +5982,7 @@ def observer_go_correct(data):
 
 
 def goOnDoClean():
-    redis_cli.set('parking', 0)
+    _mark_runtime_running('继续清扫启动', {'action': 'go_on'})
     try:
         # 未完成的任务列表
         previousTaskList = [json.loads(item) for item in redis_cli.lrange('taskList', 0, -1)]
@@ -5232,7 +5993,7 @@ def goOnDoClean():
             logger.warn("清扫工作完成")
         sendBraking()
         logger.warn("任务执行结束")
-        redis_cli.set("mission", "complete")
+        _mark_runtime_complete('继续清扫结束', {'action': 'go_on'})
         redis_cli.set("correct", "false")
         redis_cli.set('action', 'false')
         # 表示自动清扫线程停止
@@ -5240,10 +6001,9 @@ def goOnDoClean():
     except Exception as e:
         logger.error(e.message)
 
-def goOnDoCleanByRTK():
+def goOnDoCleanByRTK(task_token=None):
     global global_go,global_doCleanThreadStop
-    redis_cli.set("mission", "working")
-    redis_cli.set("parking", "0")
+    _mark_runtime_running('RTK继续清扫启动', {'action': 'go_on'})
     # 未完成的任务列表
     previousTaskList = [json.loads(item) for item in redis_cli.lrange('taskList', 0, -1)]
     # 执行任务
@@ -5275,12 +6035,12 @@ def goOnDoCleanByRTK():
                 sendBraking()
                 global_doCleanThreadStop = 1
                 break
-            if redis_cli.get('parking') == '1':
+            if _is_runtime_stop_requested():
                 global_doCleanThreadStop = 1
                 break
             if mode == 1:
                 # moveBack(ser, turn_back_len)
-                if redis_cli.get('parking') == '1':
+                if _is_runtime_stop_requested():
                     global_doCleanThreadStop = 1
                     break
         speed = 350
@@ -5295,14 +6055,19 @@ def goOnDoCleanByRTK():
         else:
             if mode == 1:
                 moveBack(ser, back_len)
-                if redis_cli.get('parking') == '1':
+                if _is_runtime_stop_requested():
                     global_doCleanThreadStop = 1
                     break
-        if redis_cli.get('parking') == '0':
+        if not _is_runtime_stop_requested():
             logger.warn("删除任务{}".format(task['id']))
             redis_cli.lpop("taskList")
     logger.warn("继续清扫结束")
-    doParking()
+    completed_normally = global_doCleanThreadStop == 0 and not _is_runtime_stop_requested()
+    if completed_normally:
+        _mark_runtime_complete('RTK继续清扫结束', {'action': 'go_on'})
+        doParking(update_runtime=False)
+    else:
+        doParking()
 
 # 继续清扫
 @app.route("/vehicle/goOn", methods=['GET'])
@@ -5311,8 +6076,13 @@ def goOn():
     redis_cli.set("reverse", "false")
     # thread = threading.Thread(target=goOnDoClean)
     # thread.start()
-    thread = threading.Thread(target=goOnDoCleanByRTK)
-    thread.start()
+    thread, error_payload = _start_runtime_thread(
+        'go_on',
+        goOnDoCleanByRTK,
+        ready_message='正在创建继续清扫线程',
+    )
+    if error_payload:
+        return jsonify(error_payload)
     response = make_response("1")
     return response
 
@@ -5654,7 +6424,6 @@ def turnCheckPoint(originHeading):
     # 开启校正
     try:
         reset_odometer(ser)
-        redis_cli.set("mission", "working")
         # 获取原点航向角
         # heading = int(redis_cli.hget('taskParams', 'originHeading'))
         logger.warn("获取原点航向角：{}".format(originHeading))
@@ -6419,7 +7188,7 @@ def stopThenStart():
 
 
 def justMove(ser, arriveable=False):
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
     global global_status
     forward_speed = int(redis_cli.get("forwardSpeed"))
@@ -6434,7 +7203,7 @@ def justMove(ser, arriveable=False):
     logger.warn(' '.join(format(x, '02x') for x in command))
     duplicateWriteCmd(ser, command)
     # 这里开始判断路径和到边,1能走，0不行
-    while (getEdge() == "1" and redis_cli.get("mission") == "working") or (
+    while (getEdge() == "1" and _is_runtime_task_active()) or (
             arriveable and redis_cli.get("odometer_arrive") == "true"):
         print("keep walking")
         global_status = "keep walking"
@@ -6445,7 +7214,7 @@ def justMove(ser, arriveable=False):
 
 
 def moveBack(ser, distance=33):
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
     logger.warn('向后退了{}cm'.format(distance))
     global global_status
@@ -6459,7 +7228,7 @@ def moveBack(ser, distance=33):
     logger.warn(' '.join(format(x, '02x') for x in command))
     duplicateWriteCmd(ser, command)
 
-    while getDistanceArrive() == "0" and redis_cli.get("mission") == "working":
+    while getDistanceArrive() == "0" and _is_runtime_task_active():
         print("wait Distance finish")
         # global_status = "wait Distance finish"
     # 退到传感器给1了
@@ -6473,7 +7242,7 @@ def moveBack(ser, distance=33):
     #         setDistance(distance)
     #         command[17] = tem_listener(command, 17)
     #         duplicateWriteCmd(ser, command)
-    #         while getDistanceArrive() == "0" and redis_cli.get("mission") == "working":
+    #         while getDistanceArrive() == "0" and _is_runtime_task_active():
     #             print("wait Distance finish")
     #             global_status = "wait Distance finish"
     #         break
@@ -6495,7 +7264,7 @@ def goBackByLength(ser, length, speed=-100):
     duplicateWriteCmd(ser, command)
     # 这里开始判断路径和到边,1能走，0不行
     while getEdge() == "1" and getDistanceArrive() == "0":
-        if redis_cli.get("mission") == "complete":
+        if _is_runtime_stop_requested():
             return 0
         print("keep walking")
         # global_status = "keep walking"
@@ -6527,7 +7296,7 @@ def goByLength(ser, length, speed=100):
     # 这里开始判断路径和到边,1能走，0不行
     # getEdge() == "1" and
     while getDistanceArrive() == "0":
-        if redis_cli.get("mission") == "complete":
+        if _is_runtime_stop_requested():
             return 0
         print("keep walking")
         global_status = "keep walking"
@@ -6563,8 +7332,8 @@ def _send_distance_move_command(length, speed):
 
 def moveDiatance(ser, length, speed=100):
     logger.warn("向前移动{}cm".format(length))
-    logger.warn(redis_cli.get("mission"))
-    if redis_cli.get("mission") == "complete":
+    logger.warn(robot_lifecycle_fsm.get_state().get('controlState'))
+    if _is_runtime_stop_requested():
         return
     global global_status
     reSetStatus(ser)
@@ -6584,7 +7353,7 @@ def moveDiatance(ser, length, speed=100):
     # 这里开始判断路径和到边,1能走，0不行
     edge_accepted = False
     edge_recovery_attempts = 0
-    while getDistanceArrive() == "0" and redis_cli.get("mission") == "working":
+    while getDistanceArrive() == "0" and _is_runtime_task_active():
         if getEdge() != "1":
             edge_action = _handle_edge_stop_for_current_task('moveDiatance')
             if edge_action == EDGE_STOP_ACTION_TARGET:
@@ -6604,7 +7373,7 @@ def moveDiatance(ser, length, speed=100):
             return 0
         if global_go == 0:
             break
-        if redis_cli.get("mission") == "complete":
+        if _is_runtime_stop_requested():
             return 0
         print("keep walking")
         # global_status = "keep walking"
@@ -6620,22 +7389,126 @@ def moveDiatance(ser, length, speed=100):
         return 0
 
 
+def _turn_to_heading_by_rtk(ser, target_heading, source='turn', segment_index=None, task_id=None):
+    target_heading = float(target_heading) % 360.0
+    current_heading = _get_current_rtk_heading()
+    if current_heading is None:
+        logger.error("[turn_rtk_abort] no fresh RTK heading; target={}".format(target_heading))
+        sendBraking()
+        return 0
+
+    direction, relative_angle = choose_turn_direction(current_heading, target_heading)
+    initial_delta = _normalize_heading_delta(current_heading, target_heading)
+    if direction == 'none' or abs(initial_delta) <= TURN_RTK_FALLBACK_TOLERANCE_DEG:
+        logger.warn(
+            "[turn_rtk_done] already at target: target={:.2f}, current={:.2f}, delta={:.2f}".format(
+                target_heading, current_heading, initial_delta
+            )
+        )
+        sendBraking()
+        return 1
+
+    protocol_value = TURN_RIGHT_PROTOCOL_VALUE if direction == 'right' else TURN_LEFT_PROTOCOL_VALUE
+    sendBraking()
+    preBuildCommand()
+    setStatus(3)
+    setPowerOn(1)
+    setXSpeed(0)
+    setZSpeed(0)
+    setRotateTo(protocol_value)
+    command[17] = tem_listener(command, 17)
+    logger.warn(
+        "[turn_rtk_start] source={}, segment={}, taskId={}, direction={}, relativeAngle={:.2f}, target={:.2f}, current={:.2f}, protocolValue={}, frame={}".format(
+            source,
+            segment_index,
+            task_id,
+            direction,
+            relative_angle,
+            target_heading,
+            current_heading,
+            protocol_value,
+            ' '.join(format(x, '02x') for x in command),
+        )
+    )
+    duplicateWriteCmd(ser, command)
+
+    turn_start_at = time.time()
+    stable_count = 0
+    previous_delta = initial_delta
+    last_log_at = 0.0
+    while _is_runtime_task_active():
+        elapsed = time.time() - turn_start_at
+        if elapsed >= TURN_RTK_MAX_DURATION_SEC:
+            logger.error(
+                "[turn_rtk_timeout] direction={}, target={:.2f}, elapsed={:.2f}s".format(
+                    direction, target_heading, elapsed
+                )
+            )
+            sendBraking()
+            return 0
+
+        current_heading = _get_current_rtk_heading()
+        delta = _normalize_heading_delta(current_heading, target_heading)
+        if delta is not None:
+            crossed_target = _heading_delta_crossed_target(previous_delta, delta)
+            if abs(delta) <= TURN_RTK_FALLBACK_TOLERANCE_DEG:
+                stable_count += 1
+            else:
+                stable_count = 0
+            if stable_count >= TURN_RTK_FALLBACK_STABLE_COUNT or crossed_target:
+                logger.warn(
+                    "[turn_rtk_finish] direction={}, target={:.2f}, current={:.2f}, delta={:.2f}, elapsed={:.2f}s".format(
+                        direction, target_heading, current_heading, delta, elapsed
+                    )
+                )
+                sendBraking()
+                return 1
+            previous_delta = delta
+
+        if elapsed - last_log_at >= 1.0:
+            logger.info(
+                "[turn_rtk_wait] direction={}, target={:.2f}, current={}, delta={}, elapsed={:.2f}s".format(
+                    direction, target_heading, current_heading, delta, elapsed
+                )
+            )
+            last_log_at = elapsed
+        time.sleep(0.05)
+
+    sendBraking()
+    return 0
+
+
 def turn(ser, roundTo, target_heading=None, source='turn', segment_index=None, task_id=None):
+    normalized_target_heading = _coerce_float(target_heading, None)
+    if normalized_target_heading is not None:
+        return _turn_to_heading_by_rtk(
+            ser,
+            normalized_target_heading,
+            source=source,
+            segment_index=segment_index,
+            task_id=task_id,
+        )
+
+    # 转向控制入口：给下位机下发旋转命令，并等待旋转完成。
+    # roundTo 是下位机协议使用的角度值，调用方通常会传入 angle * 10。
     logger.warn('转向:{}'.format(roundTo))
+    # 每次转向前先清掉超声波报警标记，避免上一次报警状态影响本次转向流程。
     redis_cli.set("ultraSonic", "false")
-    redis_cli.set("mission","working")
-    # logger.warn(redis_cli.get("mission"))
-    if redis_cli.get("mission") == "complete":
+    # 如果运行时已经收到停止请求，直接退出，不再给下位机发送新的转向命令。
+    if _is_runtime_stop_requested():
         return
     global global_status
+    # 重新组装下位机命令：状态 3 表示旋转，RotateTo 是目标旋转角度，ZSpeed 是旋转速度。
     reSetStatus(ser)
     setStatus(3)
     setRotateTo(roundTo)
     setZSpeed(0.6)
+    # 重新计算校验位后，通过串口把转向命令发送给下位机。
     command[17] = tem_listener(command, 17)
     logger.warn(' '.join(format(x, '02x') for x in command))
     duplicateWriteCmd(ser, command)
 
+    # target_heading 用于 RTK 兜底判断：下位机没有及时回完成时，用实时航向判断是否已转到位。
     target_heading = _coerce_float(target_heading, None)
     turn_start_at = time.time()
     stable_count = 0
@@ -6648,8 +7521,9 @@ def turn(ser, roundTo, target_heading=None, source='turn', segment_index=None, t
         )
     )
 
-    # 如果未完成，则继续阻塞，等待旋转完成 and redis_cli.get("mission") == "working"
-    while redis_cli.get("mission") == "working":
+    # 阻塞等待旋转完成：只要当前运行任务还有效，就持续检查下位机和 RTK 航向。
+    while _is_runtime_task_active():
+        # 第一优先级：以下位机返回的旋转完成标志为准。
         rotate_arrive = getRotateArrive()
         if rotate_arrive != "0":
             logger.warn(
@@ -6663,15 +7537,20 @@ def turn(ser, roundTo, target_heading=None, source='turn', segment_index=None, t
         #     break
         logger.info("wait rotate finish")
         # global_status = "wait rotate finish"
+        # 没有传目标 RTK 航向时，只能继续等待下位机完成标志。
         if target_heading is None:
             continue
 
+        # 第二优先级：RTK 兜底判断。读取当前航向，计算当前航向与目标航向的最短角度差。
         elapsed = time.time() - turn_start_at
         current_heading = _get_current_rtk_heading()
         delta = _normalize_heading_delta(current_heading, target_heading)
         crossed_target = False
+        # 给下位机留出最小等待时间，超过后才启用 RTK 兜底，避免刚开始转向就误判完成。
         if delta is not None and elapsed >= TURN_RTK_FALLBACK_MIN_WAIT_SEC:
+            # 如果角度差从正到负或从负到正，说明车头已经越过目标航向，也可以认为转向到位。
             crossed_target = _heading_delta_crossed_target(previous_delta, delta)
+            # 连续多次进入允许误差范围，才认为航向稳定到位，减少 RTK 瞬时抖动导致的误判。
             if abs(delta) <= TURN_RTK_FALLBACK_TOLERANCE_DEG:
                 stable_count += 1
             else:
@@ -6692,15 +7571,18 @@ def turn(ser, roundTo, target_heading=None, source='turn', segment_index=None, t
                         stable_count,
                     )
                 )
+                # RTK 判断已经到位后，主动刹车停止旋转，并把本次转向视为成功。
                 sendBraking()
                 turn_result = 1
                 break
         else:
             stable_count = 0
 
+        # 保存上一次航向偏差，下一轮用于判断是否已经跨过目标航向。
         if delta is not None:
             previous_delta = delta
 
+        # 每 2 秒打印一次等待日志，方便排查转向卡住时的目标航向、当前航向和偏差。
         if elapsed - last_fallback_log_at >= 2.0:
             logger.info(
                 "[turn_wait] source={}, segment={}, taskId={}, target={}, current={}, delta={}, previousDelta={}, elapsed={:.2f}s, stableCount={}".format(
@@ -6719,6 +7601,7 @@ def turn(ser, roundTo, target_heading=None, source='turn', segment_index=None, t
 
     time.sleep(0.5)
 
+    # 转向流程结束后，把车辆状态恢复为可行走状态；调用方会根据返回值决定是否进入直行。
     redis_cli.set("carStatus", "go")
     # 传感器报警了，到边了
     # if redis_cli.get("ultraSonic") == "true":
@@ -6818,7 +7701,7 @@ def goUp(back_len=33):
     global global_go
     redis_cli.set("forwardSpeed", high_speed)
     drivingUp = True
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
     global global_status
     global cap
@@ -6834,7 +7717,7 @@ def goUp(back_len=33):
     logger.warn("moving back...")
     reSetStatus(ser)
     # global_status = "back"
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
     moveBack(ser, back_len)
     logger.warn("move back end.")
@@ -6849,12 +7732,12 @@ def goStop():
 
 
 def goRound():
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
 
     pathPlanning = redis_cli.get(PATH_PLANNING_KEY)
 
-    while redis_cli.get("mission") == "working":
+    while _is_runtime_task_active():
 
         command[0] = 123
 
@@ -6880,7 +7763,7 @@ def goRound():
 
         reset_odometer(ser)
 
-        if not moveDiatance(ser, 100) or redis_cli.get("mission") == "complete":
+        if not moveDiatance(ser, 100) or _is_runtime_stop_requested():
             break
 
         if pathPlanning == LEFT_PATH_PLANNING:
@@ -6903,7 +7786,7 @@ def goRound():
 
         reset_odometer(ser)
 
-        if not moveDiatance(ser, 100) or redis_cli.get("mission") == "complete":
+        if not moveDiatance(ser, 100) or _is_runtime_stop_requested():
             break
 
     moveBack(ser)
@@ -6936,7 +7819,7 @@ def horizontal_env_auto_clean():
 
 
 def init_status():
-    redis_cli.set("mission", "working")
+    _mark_runtime_running('视觉清扫启动', {'action': 'auto_drive'})
 
     redis_cli.set("correct", "true")
 
@@ -6950,7 +7833,7 @@ def drive_up():
 
     switch_on_clean_mode(ser)
 
-    if redis_cli.get("mission") == "complete":
+    if _is_runtime_stop_requested():
         return
 
     forward_speed = 280
@@ -6975,7 +7858,7 @@ def drive_up():
 
     # 这里开始判断路径和到边,1能走，0不行
 
-    while getEdge() == "1" and redis_cli.get("mission") == "working":
+    while getEdge() == "1" and _is_runtime_task_active():
         print("keep walking")
 
         time.sleep(0.25)
@@ -7010,7 +7893,7 @@ def doCleanThreadByRTK():
         logger.warn("清扫工作完成")
     sendBraking()
     logger.warn("任务执行结束")
-    redis_cli.set("mission", "complete")
+    _mark_runtime_complete('RTK清扫任务结束', {'action': 'auto_drive'})
     redis_cli.set("correct", "false")
     redis_cli.set('action', 'false')
     # 表示自动清扫线程停止
@@ -7028,9 +7911,8 @@ def doCleanThread():
     if isGarage(32.03646721, 118.92448852):
         # 后退出充电桩
         reset_odometer(ser)
-        redis_cli.set("mission", "working")
         moveBack(ser, 150)
-        if redis_cli.get('parking') == '1':
+        if _is_runtime_stop_requested():
             global_doCleanThreadStop = 1
         # 如果后退没有到达，则不往下执行
         if getDistanceArrive() == 0:
@@ -7052,12 +7934,12 @@ def doCleanThread():
         logger.warn("清扫工作完成")
     sendBraking()
     logger.warn("任务执行结束")
-    redis_cli.set("mission", "complete")
+    _mark_runtime_complete('清扫任务结束', {'action': 'auto_drive'})
     redis_cli.set("correct", "false")
     redis_cli.set('action', 'false')
 
     # 如果自动清扫被停止，则不继续运行
-    if redis_cli.get('parking') == '0':
+    if not _is_runtime_stop_requested():
         logger.warn('进充电桩')
         reset_odometer(ser)
         turn(ser, 180 * 10)
@@ -7078,17 +7960,15 @@ def doClean(tmpTaskList, goon=False):
     global global_is_need_rtk
 
     try:
-        redis_cli.set("mission", "working")
+        _mark_runtime_running('清扫任务执行中', {'action': 'go_on' if goon else 'auto_drive'})
         redis_cli.set("correct", "true")
         redis_cli.set('action', 'true')
-        # 使其每一次接口调用，都重新开始
-        redis_cli.set('parking', 0)
         reset_odometer(ser)
 
         logger.warn('任务获取成功！开始执行任务')
         for index, item in enumerate(tmpTaskList):
             # 通过重redis中获取一个值，看是否是暂停,0为false,1为true
-            if redis_cli.get('parking') == '0':
+            if not _is_runtime_stop_requested():
                 id = item['id']
                 angle = item['angle']
                 mode = item['mode']
@@ -7178,7 +8058,7 @@ def doClean(tmpTaskList, goon=False):
                     redis_cli.set("odometer_arrive", "false")
                     reset_odometer(ser)
                     justMove(ser)
-                if redis_cli.get("parking") != "1":
+                if not _is_runtime_stop_requested():
                     # 任务完成，从redis list中清除该任务
                     logger.warn("删除任务")
                     redis_cli.lpop("taskList")
@@ -7199,18 +8079,15 @@ def doCleanByRTK(tmpTaskList, goon=False):
     global global_is_need_rtk
 
     try:
-        redis_cli.set("mission", "working")
         # redis_cli.set("correct", "true")
         # redis_cli.set('action', 'true')
-        set_current_action('auto_drive')
-        # 使其每一次接口调用，都重新开始
-        redis_cli.set('parking', 0)
+        _mark_runtime_running('RTK清扫任务执行中', {'action': 'auto_drive'})
         reset_odometer(ser)
 
         logger.warn('任务获取成功！开始执行任务')
         for index, item in enumerate(tmpTaskList):
             # 通过重redis中获取一个值，看是否是暂停,0为false,1为true
-            if redis_cli.get('parking') == '0':
+            if not _is_runtime_stop_requested():
                 id = item['id']
                 angle = item['angle']
                 mode = item['mode']
@@ -7295,7 +8172,7 @@ def doCleanByRTK(tmpTaskList, goon=False):
                     redis_cli.set("odometer_arrive", "false")
                     reset_odometer(ser)
                     justMove(ser)
-                if redis_cli.get("parking") != "1":
+                if not _is_runtime_stop_requested():
                     # 任务完成，从redis list中清除该任务
                     logger.warn("删除任务")
                     redis_cli.lpop("taskList")
@@ -7314,12 +8191,10 @@ def starttt():
     global taskList  # 申明使用全局变量
     global global_go
 
-    redis_cli.set("mission", "working")
+    _mark_runtime_running('视觉清扫任务启动', {'action': 'auto_drive'})
     redis_cli.set("correct", "true")
     redis_cli.set('action', 'true')
 
-    # 使其每一次接口调用，都重新开始
-    redis_cli.set('parking', 0)
     reset_odometer(ser)
 
     taskList = util.readConfig("config_view.json")
@@ -7330,12 +8205,12 @@ def starttt():
     for item in taskList:
         # 将字典转为JSON字符串存储
         redis_cli.rpush('taskList', json.dumps(item))
-    # while redis_cli.get('parking') == '0':
+    # while not _is_runtime_stop_requested():
     logger.warn('任务获取成功！开始执行任务')
     for item in taskList:
         global_go = 1
         # 通过重redis中获取一个值，看是否是暂停,0为false,1为true
-        if redis_cli.get('parking') == '0':
+        if not _is_runtime_stop_requested():
             id = item['id']
             angle = item['angle']
             mode = item['mode']
@@ -7384,10 +8259,9 @@ def starttt():
             break
     sendBraking()
     logger.warn("任务执行结束")
-    redis_cli.set("mission", "complete")
+    _mark_runtime_complete('视觉清扫任务结束', {'action': 'auto_drive'})
     redis_cli.set("correct", "false")
     redis_cli.set('action', 'false')
-    set_current_action('idle')
     redis_cli.set('curTaskIndex', 0)
 
     return "1"
@@ -7663,7 +8537,7 @@ def listenerSlavePort():
                 continue
             _read_lower_machine_status_frame("listenerSlavePort", 0.25)
         except Exception as e:
-            logging.info('鐩戝惉鎶ラ敊:{}'.format(e))
+            logging.info('监听报错:{}'.format(e))
             time.sleep(0.5)
         time.sleep(0.1)
 
@@ -8017,7 +8891,7 @@ def isNeedReturnCharging():
 
 
 def listenerVoltage():
-    global global_status,drive_thread,global_doCleanThreadStop
+    global global_status,drive_thread,global_doCleanThreadStop, global_auto_clean_stop
 
     while True:
         # 如果voltageLisener为1表示开启电池监听
@@ -8025,30 +8899,38 @@ def listenerVoltage():
             voltage = redis_cli.get("voltage")
             logger.info("status={},voltage={}".format(global_status,voltage))
             # 当小车状态不是返回充电桩时并且需要返回充电桩充电时,就立即停止小车，并返回充电桩充电
-            if not _is_runtime_returning_to_charge() and isNeedReturnCharging() and redis_cli.llen('taskList') != 0:
+            if not _is_runtime_returning_to_charge() and isNeedReturnCharging():
                 _disable_loop_auto_clean('low_battery_return')
+                _set_auto_resume_allowed(True, 'low_battery_return')
                 global_doCleanThreadStop = 1
+                global_auto_clean_stop = 1
                 doParking()
                 if global_doCleanThreadStop == 1:
                     logger.warning("返回充电桩")
-                    set_current_action('return_to_point')
                     thread = threading.Thread(target=returnToPointByRTKThread)
                     thread.start()
 
             # 当电量大于93时并且有未完成的任务，则继续清扫未完成的任务
-            if _coerce_int(voltage, 0) >= 90 and redis_cli.llen('taskList') != 0:
+            if _is_auto_resume_allowed() and _coerce_int(voltage, 0) >= 90 and redis_cli.llen('taskList') != 0:
                 # 状态等于工作状态或者不等于从充电桩后退的状态，就可以启动
                 if not _is_runtime_task_active():
                     if drive_thread is None or not drive_thread.is_alive():
-                        drive_thread = threading.Thread(target=autoDriveByRTKThread)
-                        drive_thread.start()
+                        drive_thread, error_payload = _start_runtime_thread(
+                            'auto_drive',
+                            autoDriveByRTKThread,
+                            ready_message='电量恢复，继续未完成自动清扫任务'
+                        )
+                        if error_payload:
+                            logger.warning("auto resume rejected: {}".format(error_payload))
         # 防止cpu过载
         time.sleep(1)
 
 
 
 def _is_rtk_guard_task_active():
-    return _decode_redis_value(redis_cli.get("mission")) == "working" and not _coerce_bool(redis_cli.get('parking'), False)
+    fsm_state = robot_lifecycle_fsm.get_state()
+    control_state = str(fsm_state.get('controlState') or '').upper()
+    return control_state in ('RUNNING', 'PAUSED')
 
 
 def _resume_current_rtk_segment():
@@ -8072,7 +8954,7 @@ def _stop_task_after_rtk_timeout(detail):
     global_doCleanThreadStop = 1
     global_pointToPoint_flag = 1
     global_go = 0
-    doParking()
+    doParking(update_runtime=False)
     _mark_runtime_blocked(
         'RTK_FIX_TIMEOUT',
         'RTK fixed solution did not recover within 5 minutes; task stopped',
@@ -8268,12 +9150,13 @@ def main():
     try:
         # if not varifyGps():
         #     return
+        # 视觉线程Opencv
         if cap is not None and cap.isOpened():
             thread = threading.Thread(target=startOpencv)
             thread.start()
         else:
             logger.warning("camera unavailable; skip startOpencv thread")
-
+        # 下位机线程
         listener_thread = threading.Thread(target=listenerSlavePort)
         listener_thread.start()
 

@@ -117,7 +117,7 @@ def _lifecycle_state(control_state, mission, parking, action, fault_state):
     is_parking = _bool(parking)
     action_value = _text(action)
 
-    if control in ("INITIALIZING", "READY", "RUNNING", "PAUSED", "STOPPING", "STOPPED", "BLOCKED", "FAULT", "DISABLED", "UNKNOWN"):
+    if control in ("INITIALIZING", "READY", "RUNNING", "PAUSED", "STOPPING", "STOPPED", "COMPLETE", "BLOCKED", "FAULT", "DISABLED", "UNKNOWN"):
         return control
     if control == "IDLE":
         if is_parking:
@@ -145,8 +145,8 @@ def _effects(state, health, fault):
     requires_attention = state in ("BLOCKED", "FAULT", "DISABLED", "UNKNOWN") or health in ("WARN", "ERROR") or has_fault
     return {
         "motionAllowed": state == "RUNNING",
-        "taskActive": state in ("READY", "RUNNING", "PAUSED", "STOPPING"),
-        "startAllowed": state in ("IDLE", "READY", "STOPPED", "COMPLETE") and not requires_attention,
+        "taskActive": state in ("RUNNING", "PAUSED", "STOPPING"),
+        "startAllowed": state in ("IDLE", "STOPPED", "COMPLETE") and not requires_attention,
         "requiresAttention": requires_attention,
         "initializing": state == "INITIALIZING",
     }

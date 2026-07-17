@@ -77,7 +77,4 @@ def build_go_to_point_plan(
         "speed": speed,
     }
 
-    if distance < float(min_distance_m):
-        return _response(False, "TARGET_TOO_CLOSE", "目标点距离过近，不执行行驶", data)
-
     return _response(True, "GO_TO_POINT_READY", "前往目标点可以启动", data)

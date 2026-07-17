@@ -458,6 +458,18 @@
                 <div class="label">纠偏数据来源<span class="metric-code mono">correction source</span></div>
                 <div class="value mono">{{ textOrNone(correction.correction.source) }}</div>
               </div>
+              <div class="metric" title="当前控制算法来源；kalman_p_control 表示 RTK 位置先滤波，再使用航向误差和横向偏差做 P 控制。">
+                <div class="label">控制来源<span class="metric-code mono">control source</span></div>
+                <div class="value mono">{{ textOrNone(correction.correction.controlSource) }}</div>
+              </div>
+              <div class="metric" title="RTK Kalman 滤波后的可信位置纬度。">
+                <div class="label">滤波纬度<span class="metric-code mono">filtered lat</span></div>
+                <div class="value mono">{{ fmt(correction.correction.filteredLocation && correction.correction.filteredLocation.lat, 8) }}</div>
+              </div>
+              <div class="metric" title="RTK Kalman 滤波后的可信位置经度。">
+                <div class="label">滤波经度<span class="metric-code mono">filtered lon</span></div>
+                <div class="value mono">{{ fmt(correction.correction.filteredLocation && correction.correction.filteredLocation.lon, 8) }}</div>
+              </div>
               <div class="metric" title="航向误差参与纠偏公式时使用的放大系数。">
                 <div class="label">航向误差增益<span class="metric-code mono">headingGain</span></div>
                 <div class="value mono">{{ fmt(correction.parameters && correction.parameters.headingGain, 1) }}</div>
@@ -738,6 +750,16 @@
             .filter(item => this.hasLatLon(item.lat, item.lon))
             .map(item => ({ lat: Number(item.lat), lon: Number(item.lon) }));
         },
+        controlPosition(vehicleData) {
+          const filtered = ((this.correction.correction || {}).filteredLocation) || {};
+          if (this.hasLatLon(filtered.lat, filtered.lon)) {
+            return { lat: Number(filtered.lat), lon: Number(filtered.lon), filtered: true };
+          }
+          if (this.hasLatLon(vehicleData.lat, vehicleData.lon)) {
+            return { lat: Number(vehicleData.lat), lon: Number(vehicleData.lon), filtered: false };
+          }
+          return null;
+        },
         boundsFrom(points) {
           if (!points.length) return null;
           const bounds = points.reduce((acc, item) => ({
@@ -822,7 +844,10 @@
           const planSegments = this.plannedSegments();
           const segment = this.currentPreviewSegment(planSegments);
           const vehicleData = this.correction.vehicle || {};
-          const hasVehicle = this.hasLatLon(vehicleData.lat, vehicleData.lon);
+          const correctionData = this.correction.correction || {};
+          const controlPosition = this.controlPosition(vehicleData);
+          const hasVehicle = Boolean(controlPosition);
+          const hasRawVehicle = this.hasLatLon(vehicleData.lat, vehicleData.lon);
           const trace = this.tracePoints();
           if (!segment && !planSegments.length && !hasVehicle) {
             ctx.fillStyle = '#667683';
@@ -831,7 +856,7 @@
             return;
           }
 
-          const originSource = segment || planSegments[0] || { startLat: Number(vehicleData.lat), startLon: Number(vehicleData.lon) };
+          const originSource = segment || planSegments[0] || { startLat: Number(controlPosition.lat), startLon: Number(controlPosition.lon) };
           const origin = { lat: originSource.startLat, lon: originSource.startLon };
           const points = [];
           planSegments.forEach(item => {
@@ -842,7 +867,8 @@
             points.push(this.project(segment.startLat, segment.startLon, origin));
             points.push(this.project(segment.endLat, segment.endLon, origin));
           }
-          if (hasVehicle) points.push(this.project(vehicleData.lat, vehicleData.lon, origin));
+          if (hasVehicle) points.push(this.project(controlPosition.lat, controlPosition.lon, origin));
+          if (hasRawVehicle) points.push(this.project(vehicleData.lat, vehicleData.lon, origin));
           trace.forEach(item => points.push(this.project(item.lat, item.lon, origin)));
           const bounds = this.boundsFrom(points);
           if (!bounds) return;
@@ -878,7 +904,7 @@
             segmentEnd = this.project(segment.endLat, segment.endLon, origin);
           }
           if (hasVehicle) {
-            vehiclePoint = this.project(vehicleData.lat, vehicleData.lon, origin);
+            vehiclePoint = this.project(controlPosition.lat, controlPosition.lon, origin);
             vehicle = this.toCanvas(vehiclePoint, bounds, width, height);
           }
           if (segment && hasVehicle) {
@@ -905,6 +931,11 @@
           if (vehicle) {
             ctx.fillStyle = '#1f2933';
             ctx.beginPath(); ctx.arc(vehicle.x, vehicle.y, 7, 0, Math.PI * 2); ctx.fill();
+          }
+          if (hasRawVehicle && controlPosition && controlPosition.filtered) {
+            const rawPoint = this.toCanvas(this.project(vehicleData.lat, vehicleData.lon, origin), bounds, width, height);
+            ctx.fillStyle = '#8b949e';
+            ctx.beginPath(); ctx.arc(rawPoint.x, rawPoint.y, 4, 0, Math.PI * 2); ctx.fill();
           }
 
           if (vehicle) this.drawArrow(ctx, vehicle, vehicleData.heading || 0, 34, '#1f2933');

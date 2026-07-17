@@ -26,7 +26,7 @@ class GoToPointTest(unittest.TestCase):
         self.assertFalse(plan["success"])
         self.assertEqual(plan["code"], "CURRENT_RTK_UNAVAILABLE")
 
-    def test_rejects_target_that_is_too_close(self):
+    def test_allows_target_that_is_too_close(self):
         plan = build_go_to_point_plan(
             current_lat=31.1,
             current_lon=121.1,
@@ -35,8 +35,8 @@ class GoToPointTest(unittest.TestCase):
             min_distance_m=0.3,
         )
 
-        self.assertFalse(plan["success"])
-        self.assertEqual(plan["code"], "TARGET_TOO_CLOSE")
+        self.assertTrue(plan["success"])
+        self.assertEqual(plan["code"], "GO_TO_POINT_READY")
         self.assertEqual(plan["data"]["distance"], 0.0)
 
     def test_rejects_non_positive_speed(self):

@@ -13,6 +13,11 @@ import util
 from AppLogger import logger
 from mqtt_client import MQTTClient, get_mqtt_client
 from mqtt_handler import MQTTCommandHandler
+from status_values import (
+    live_heading_from_location,
+    live_value_from_report,
+    visible_task_field,
+)
 try:
     from ntrip_runtime import get_shared_runtime
 except Exception:
@@ -97,7 +102,7 @@ class MQTTIntegration:
                 'timestamp': int(time.time())
             })
         except Exception as e:
-            logger.error("鍙戝竷鍛戒护ACK澶辫触: {}".format(str(e)), exc_info=True)
+            logger.error("发布命令ACK失败: {}".format(str(e)), exc_info=True)
 
     def _publish_command_result(self, message_data, result):
         try:
@@ -119,14 +124,37 @@ class MQTTIntegration:
         try:
             current_location = self._get_redis_hash('currentLocation')
             task_params = self._get_redis_hash('taskParams')
+            runtime_state = self._read_runtime_state()
+            current_action = runtime_state.get('action') or self._get_redis_value('currentAction', str, '')
+            control_state = self._build_control_state(runtime_state)
+            hardware_report_at = self._get_optional_int('hardwareReportAt')
+            clean_task_count = self._build_task_count()
+            waypoint_count = self._build_waypoint_count(current_action == 'multi_go_to_point')
             lat = self._coerce_value(current_location.get('lat'), float, None)
             lon = self._coerce_value(current_location.get('lon'), float, None)
-            heading = self._coerce_value(current_location.get('heading'), float, None)
+            heading = live_heading_from_location(
+                lat,
+                lon,
+                self._coerce_value(current_location.get('heading'), float, None)
+            )
             local_x, local_y = self._compute_local_xy_cm(lat, lon)
             task_origin_fields = self._build_task_origin_status_fields(task_params, current_location)
+            active_task_name = visible_task_field(self._build_task_name(), current_action, control_state)
+            active_task_index = visible_task_field(
+                self._get_redis_value('curTaskIndex', int, None),
+                current_action,
+                control_state,
+            )
+            active_task_count = visible_task_field(
+                clean_task_count if clean_task_count > 0 else None,
+                current_action,
+                control_state,
+            )
             status = {
-                'speed': self._get_redis_value('forwardSpeed', int, 0),
-                'brush_speed': self._get_redis_value('brushSpeed', int, 0),
+                'speed': live_value_from_report(self._get_redis_value('xSpeed', int, None), hardware_report_at),
+                'brush_speed': live_value_from_report(self._get_redis_value('brushSpeedActual', int, None), hardware_report_at),
+                'command_speed': self._get_redis_value('forwardSpeed', int, None),
+                'command_brush_speed': self._get_redis_value('brushSpeed', int, None),
                 'voltage': self._get_redis_value('packVoltage', float, None),
                 'lat': lat,
                 'lon': lon,
@@ -138,21 +166,24 @@ class MQTTIntegration:
                 'distanceToTaskOriginM': task_origin_fields.get('distanceToTaskOriginM'),
                 'taskOriginToleranceM': task_origin_fields.get('taskOriginToleranceM'),
                 'isAtTaskOrigin': task_origin_fields.get('isAtTaskOrigin'),
-                'status': self._build_status(),
-                'action': self._build_action(),
-                'task_name': self._build_task_name(),
-                'cur_task_index': self._get_redis_value('waypointIndex', int, 0) if self._get_redis_value('currentAction', str, '') == 'multi_go_to_point' else self._get_redis_value('curTaskIndex', int, 0),
-                'task_count': self._get_redis_value('waypointTotal', int, 0) if self._get_redis_value('currentAction', str, '') == 'multi_go_to_point' else self._build_task_count(),
+                'status': self._build_status(runtime_state),
+                'action': self._build_action(runtime_state),
+                'task_name': active_task_name,
+                'cur_task_index': active_task_index,
+                'task_count': active_task_count,
+                'clean_task_count': active_task_count,
+                'waypoint_index': self._get_redis_value('waypointIndex', int, 0),
+                'waypoint_count': waypoint_count,
                 'battery': self._get_redis_value('batteryPercent', float, None),
                 'battery_percent': self._get_redis_value('batteryPercent', float, None),
                 'battery_raw': self._get_redis_value('batteryPercentRaw', float, None),
                 'battery_percent_raw': self._get_redis_value('batteryPercentRaw', float, None),
                 'pack_voltage': self._get_redis_value('packVoltage', float, None),
                 'online_state': 'ONLINE',
-                'mission_state': self._build_mission_state(),
-                'control_state': self._build_control_state(),
-                'health_state': self._build_health_state(),
-                'fault_state': self._build_fault_state(),
+                'mission_state': self._build_mission_state(runtime_state),
+                'control_state': control_state,
+                'health_state': self._build_health_state(runtime_state),
+                'fault_state': self._build_fault_state(runtime_state),
                 'tracking': self._get_redis_value('correct', self._bool_value, False),
                 'path_planning': self._get_redis_value('pathPlanning', str, ''),
                 'move_judge': self._get_redis_value('moveJudge', self._bool_value, False),
@@ -165,7 +196,11 @@ class MQTTIntegration:
                 'supported_status_fields': [
                     'control_state', 'health_state', 'fault_state', 'mission_state', 'detail', 'rtk'
                 ],
-                'detail': self._build_detail(task_params=task_params, current_location=current_location),
+                'detail': self._build_detail(
+                    task_params=task_params,
+                    current_location=current_location,
+                    runtime_state=runtime_state,
+                ),
                 'timestamp': int(time.time())
             }
             status.update(self._build_rtk_status_fields(status.get('detail')))
@@ -292,7 +327,7 @@ class MQTTIntegration:
             'currentLocation': {
                 'lat': current_lat,
                 'lon': current_lon,
-                'heading': current_heading,
+                'heading': live_heading_from_location(current_lat, current_lon, current_heading),
             },
             'distanceToTaskOriginM': distance_to_start,
             'taskOriginToleranceM': tolerance,
@@ -322,6 +357,16 @@ class MQTTIntegration:
         try:
             detail = json.loads(raw)
             return detail if isinstance(detail, dict) else {}
+        except Exception:
+            return {}
+
+    def _read_runtime_state(self):
+        raw = self._get_redis_value('runtimeState', str, '')
+        if not raw:
+            return {}
+        try:
+            state = json.loads(raw)
+            return state if isinstance(state, dict) else {}
         except Exception:
             return {}
 
@@ -379,7 +424,21 @@ class MQTTIntegration:
         })
         return status
 
-    def _build_status(self):
+    def _build_status(self, runtime_state=None):
+        runtime_state = runtime_state or {}
+        runtime_lifecycle = str(runtime_state.get('state') or runtime_state.get('controlState') or '').upper()
+        runtime_action = str(runtime_state.get('action') or '')
+        if runtime_action == 'return_to_point':
+            return 'returning'
+        if runtime_lifecycle in ('RUNNING', 'PAUSED', 'STOPPING'):
+            return 'working'
+        if runtime_lifecycle == 'BLOCKED':
+            return 'blocked'
+        if runtime_lifecycle in ('STOPPED', 'COMPLETE', 'DISABLED'):
+            return 'idle'
+        if runtime_lifecycle == 'UNKNOWN':
+            return 'unknown'
+
         mission = self._get_redis_value('mission', str, '')
         parking = self._get_redis_value('parking', str, '0')
         current_action = self._get_redis_value('currentAction', str, '')
@@ -393,7 +452,11 @@ class MQTTIntegration:
             return 'idle'
         return 'active'
 
-    def _build_action(self):
+    def _build_action(self, runtime_state=None):
+        runtime_state = runtime_state or {}
+        runtime_action = str(runtime_state.get('action') or '')
+        if runtime_action:
+            return runtime_action
         current_action = self._get_redis_value('currentAction', str, '')
         if current_action:
             return current_action
@@ -403,7 +466,15 @@ class MQTTIntegration:
             return 'parking'
         return 'idle'
 
-    def _build_mission_state(self):
+    def _build_mission_state(self, runtime_state=None):
+        runtime_state = runtime_state or {}
+        runtime_action = str(runtime_state.get('action') or '')
+        runtime_lifecycle = str(runtime_state.get('state') or runtime_state.get('controlState') or '').upper()
+        if runtime_action == 'return_to_point':
+            return 'RETURNING'
+        if runtime_lifecycle in ('INITIALIZING', 'READY', 'RUNNING', 'PAUSED', 'STOPPING', 'STOPPED', 'COMPLETE', 'BLOCKED', 'FAULT', 'DISABLED', 'UNKNOWN'):
+            return 'RUNNING' if runtime_lifecycle in ('PAUSED', 'STOPPING') else runtime_lifecycle
+
         current_action = self._get_redis_value('currentAction', str, '')
         if current_action == 'return_to_point':
             return 'RETURNING'
@@ -417,7 +488,11 @@ class MQTTIntegration:
             return 'COMPLETE'
         return 'IDLE'
 
-    def _build_control_state(self):
+    def _build_control_state(self, runtime_state=None):
+        runtime_state = runtime_state or {}
+        runtime_control = str(runtime_state.get('controlState') or runtime_state.get('state') or '').upper()
+        if runtime_control:
+            return runtime_control
         control_state = self._get_redis_value('controlState', str, '')
         if control_state and control_state not in ('DISABLED', 'UNKNOWN'):
             return control_state
@@ -430,25 +505,40 @@ class MQTTIntegration:
     def _is_ignored_enable_fault_state(self, fault_state):
         return fault_state in ('LOWER_MACHINE_DISABLED', 'LOWER_MACHINE_STATUS_UNKNOWN')
 
-    def _build_fault_state(self):
+    def _build_fault_state(self, runtime_state=None):
+        runtime_state = runtime_state or {}
+        runtime_fault = str(runtime_state.get('fault') or runtime_state.get('faultState') or '')
+        if runtime_fault and not self._is_ignored_enable_fault_state(runtime_fault):
+            return runtime_fault
         fault_state = self._get_redis_value('faultState', str, '')
         if fault_state and not self._is_ignored_enable_fault_state(fault_state):
             return fault_state
         return ''
 
-    def _build_health_state(self):
-        raw_fault_state = self._get_redis_value('faultState', str, '')
-        if self._build_fault_state():
+    def _build_health_state(self, runtime_state=None):
+        runtime_state = runtime_state or {}
+        runtime_health = str(runtime_state.get('health') or runtime_state.get('healthState') or '')
+        runtime_fault = str(runtime_state.get('fault') or runtime_state.get('faultState') or '')
+        if runtime_health:
+            return runtime_health
+        if runtime_fault and not self._is_ignored_enable_fault_state(runtime_fault):
             return 'WARN'
+        raw_fault_state = self._get_redis_value('faultState', str, '')
         health_state = self._get_redis_value('healthState', str, '')
         if self._is_ignored_enable_fault_state(raw_fault_state):
             return 'OK'
         if health_state:
             return health_state
+        if self._build_fault_state():
+            return 'WARN'
         return 'OK'
 
-    def _build_detail(self, task_params=None, current_location=None):
+    def _build_detail(self, task_params=None, current_location=None, runtime_state=None):
         detail = self._read_runtime_detail()
+        runtime_state = runtime_state or {}
+        runtime_detail = runtime_state.get('detail')
+        if isinstance(runtime_detail, dict):
+            detail.update(runtime_detail)
         task_params = task_params or self._get_redis_hash('taskParams')
         current_location = current_location or self._get_redis_hash('currentLocation')
         current_lat = self._coerce_value(current_location.get('lat'), float, None)
@@ -472,9 +562,25 @@ class MQTTIntegration:
         detail['distanceToTaskOriginM'] = distance_to_start
         detail['startToleranceM'] = task_origin_tolerance
         detail['taskOriginToleranceM'] = task_origin_tolerance
+        runtime_action = str(runtime_state.get('action') or self._get_redis_value('currentAction', str, ''))
+        control_state = self._build_control_state(runtime_state)
+        configured_task_count = self._build_task_count()
+        detail['cleanTaskCount'] = visible_task_field(
+            configured_task_count if configured_task_count > 0 else None,
+            runtime_action,
+            control_state,
+        )
+        detail['configuredTaskName'] = self._build_task_name()
+        detail['configuredCleanTaskCount'] = configured_task_count if configured_task_count > 0 else None
+        detail['commandSpeed'] = self._get_redis_value('forwardSpeed', int, None)
+        detail['commandBrushSpeed'] = self._get_redis_value('brushSpeed', int, None)
+        detail['waypointCount'] = self._build_waypoint_count(
+            runtime_action == 'multi_go_to_point'
+        )
+        detail['waypointIndex'] = self._get_redis_value('waypointIndex', int, 0)
         detail['currentLat'] = current_lat
         detail['currentLon'] = current_lon
-        detail['currentHeading'] = current_heading
+        detail['currentHeading'] = live_heading_from_location(current_lat, current_lon, current_heading)
         detail['taskStartLat'] = self._coerce_value(task_params.get('startLat'), float, None)
         detail['taskStartLon'] = self._coerce_value(task_params.get('startLon'), float, None)
         detail['originHeading'] = self._coerce_value(task_params.get('originHeading'), float, None)
@@ -504,6 +610,19 @@ class MQTTIntegration:
             return self.redis_client.llen('taskList')
         except Exception:
             return 0
+
+    def _build_waypoint_count(self, prefer_runtime_total=False):
+        if prefer_runtime_total:
+            runtime_total = self._get_redis_value('waypointTotal', int, 0)
+            if runtime_total > 0:
+                return runtime_total
+        try:
+            count = int(self.redis_client.llen('waypoints'))
+            if count > 0:
+                return count
+        except Exception:
+            pass
+        return self._get_redis_value('waypointTotal', int, 0)
 
     def _load_task_config(self):
         with open('config.json', 'r') as fp:

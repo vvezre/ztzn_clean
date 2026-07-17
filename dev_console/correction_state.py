@@ -154,6 +154,9 @@ def _empty_correction(global_go):
         "zSpeed": None,
         "distanceToTarget": None,
         "signedRemaining": None,
+        "rawLocation": {"lat": None, "lon": None},
+        "filteredLocation": {"lat": None, "lon": None},
+        "controlSource": None,
         "globalGo": global_go,
         "source": "unreported",
     }
@@ -169,6 +172,15 @@ def _runtime_correction_debug(redis_client, global_go):
         "zSpeed": _to_int(debug.get("zSpeed"), None),
         "distanceToTarget": _to_float(debug.get("distanceToTarget")),
         "signedRemaining": _to_float(debug.get("signedRemaining")),
+        "rawLocation": {
+            "lat": _to_float(debug.get("rawLat")),
+            "lon": _to_float(debug.get("rawLon")),
+        },
+        "filteredLocation": {
+            "lat": _to_float(debug.get("filteredLat")),
+            "lon": _to_float(debug.get("filteredLon")),
+        },
+        "controlSource": debug.get("controlSource"),
         "globalGo": global_go,
         "source": "runtime",
     }

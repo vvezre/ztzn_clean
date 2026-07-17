@@ -4,10 +4,25 @@ import sys
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from edge_target_guard import DEFAULT_EDGE_TARGET_TOLERANCE_M, should_accept_edge_stop, should_recover_from_edge_stop
+from edge_target_guard import (
+    DEFAULT_EDGE_TARGET_TOLERANCE_M,
+    EdgeTriggerLatch,
+    should_accept_edge_stop,
+    should_recover_from_edge_stop,
+)
 
 
 class EdgeTargetGuardTest(unittest.TestCase):
+    def test_edge_trigger_requires_release_before_retrigger(self):
+        latch = EdgeTriggerLatch()
+
+        self.assertFalse(latch.consume("1"))
+        self.assertTrue(latch.consume("0"))
+        self.assertFalse(latch.consume("0"))
+        self.assertFalse(latch.consume("0"))
+        self.assertFalse(latch.consume("1"))
+        self.assertTrue(latch.consume("0"))
+
     def test_default_tolerance_matches_robot_field_setting(self):
         self.assertEqual(DEFAULT_EDGE_TARGET_TOLERANCE_M, 0.10)
         self.assertTrue(should_accept_edge_stop(0.10))

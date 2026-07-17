@@ -15,9 +15,11 @@ class PointToPointCorrectionParamsTest(unittest.TestCase):
     def test_short_range_heading_limit_and_cross_track_gain_are_tuned(self):
         source = read_main()
 
-        self.assertIn("if distance_to_target < 1:", source)
-        self.assertIn("compute_linear_steering(heading_error, cte, cte_gain=1000)", source)
-        self.assertIn("cte_gain=1000 z={}", source)
+        self.assertIn("build_tracking_command(", source)
+        self.assertIn("global_rtk_tracking_filter", source)
+        self.assertIn("global_straight_line_controller", source)
+        self.assertNotIn("global_pure_pursuit_tracker", source)
+        self.assertNotIn("pure pursuit correction", source)
 
     def test_runtime_correction_debug_is_published_for_dev_console(self):
         source = read_main()

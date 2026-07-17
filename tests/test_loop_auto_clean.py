@@ -39,13 +39,13 @@ class LoopAutoCleanTest(unittest.TestCase):
 
         self.assertIn("while _is_loop_auto_clean_enabled()", body)
         self.assertIn("isNeedReturnCharging()", body)
-        self.assertIn("autoDriveByRTKThread()", body)
+        self.assertIn("autoDriveByRTKThread(task_token)", body)
         self.assertIn("_disable_loop_auto_clean('low_battery_return')", body)
 
     def test_manual_parking_disables_loop_mode(self):
         body = function_body(read_main(), "parking")
 
-        self.assertIn("_disable_loop_auto_clean('manual_parking')", body)
+        self.assertIn("_request_runtime_stop('manual_parking'", body)
 
     def test_vehicle_status_contains_loop_state(self):
         body = function_body(read_main(), "_build_vehicle_status_payload")

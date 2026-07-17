@@ -32,6 +32,16 @@ class EdgeTargetGuardIntegrationTest(unittest.TestCase):
         self.assertIn("_recover_from_abnormal_edge('moveDiatance')", body)
         self.assertIn("_send_distance_move_command(length, speed)", body)
 
+    def test_main_latches_edge_until_sensor_is_released(self):
+        body = read_main()
+
+        self.assertIn("EdgeTriggerLatch", body)
+        self.assertIn("global_edge_trigger_latch = EdgeTriggerLatch()", body)
+        self.assertGreaterEqual(
+            body.count("global_edge_trigger_latch.consume(getEdge())"),
+            3,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

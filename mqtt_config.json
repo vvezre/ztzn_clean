@@ -15,7 +15,8 @@
   },
   "topics": {
     "subscribe": "RAILCAR/S/-T01250001",
-    "publish": "RAILCAR/R/-T01250001"
+    "publish": "RAILCAR/R/-T01250001",
+    "startup_topic": "RAILCAR/S/-T01250001/startup"
   },
   "commands": {
     "enabled": [

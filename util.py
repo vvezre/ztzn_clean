@@ -933,12 +933,12 @@ def _readRTK_v2_legacy(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
         try:
             rtk_port = util.findPort('$GN')
             if not rtk_port:
-                logger.warning("鏈壘鍒癛TK涓插彛锛岀瓑寰呴噸璇?...")
+                logger.warning("未找到RTK串口，等待重试...")
                 time.sleep(1)
                 continue
 
             with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=0.1) as ser_rtk:
-                logger.warning("RTK涓插彛宸叉墦寮€: {}".format(rtk_port))
+                logger.warning("RTK串口已打开: {}".format(rtk_port))
                 configure_rtk_output(ser_rtk)
                 _flush_serial_input(ser_rtk, 'open', rtk_port)
                 while ser_rtk.is_open:
@@ -1030,12 +1030,12 @@ def _readRTK_v2_legacy(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                                     'heading': heading_info[0]
                                 }
                     except Exception as e:
-                        logger.error("璇诲彇RTK鏁版嵁寮傚父: {}".format(e))
+                        logger.error("读取RTK数据异常: {}".format(e))
                         break
         except serial.SerialException as e:
-            logger.error("鎵撳紑RTK涓插彛澶辫触: {}".format(e))
+            logger.error("打开RTK串口失败: {}".format(e))
         except Exception as e:
-            logger.error("RTK涓插彛鍏朵粬閿欒: {}".format(e))
+            logger.error("RTK串口其他错误: {}".format(e))
         finally:
             correction_runtime.close()
 
@@ -1053,12 +1053,12 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
         try:
             rtk_port = util.findPort('$GN')
             if not rtk_port:
-                logger.warning("鏈壘鍒癛TK涓插彛锛岀瓑寰呴噸璇?...")
+                logger.warning("未找到RTK串口，等待重试...")
                 time.sleep(1)
                 continue
 
             with serial.Serial(rtk_port, ser_rtk_params['baudRate'], timeout=0.1) as ser_rtk:
-                logger.warning("RTK涓插彛宸叉墦寮€: {}".format(rtk_port))
+                logger.warning("RTK串口已打开: {}".format(rtk_port))
                 state = _RtkLatestState(sync_threshold=sync_threshold)
                 configure_rtk_output(ser_rtk)
                 _flush_serial_input(ser_rtk, 'open', rtk_port)
@@ -1100,12 +1100,12 @@ def readRTK_v2(ser_rtk_params, sync_threshold = 0.5, timeout = 1):
                         if latest_sample is not None:
                             yield latest_sample[0], latest_sample[1], latest_sample[2]
                     except Exception as e:
-                        logger.error("璇诲彇RTK鏁版嵁寮傚父: {}".format(e))
+                        logger.error("读取RTK数据异常: {}".format(e))
                         break
         except serial.SerialException as e:
-            logger.error("鎵撳紑RTK涓插彛澶辫触: {}".format(e))
+            logger.error("打开RTK串口失败: {}".format(e))
         except Exception as e:
-            logger.error("RTK涓插彛鍏朵粬閿欒: {}".format(e))
+            logger.error("RTK串口其他错误: {}".format(e))
         finally:
             if ntrip_stop_event is not None:
                 ntrip_stop_event.set()
@@ -1334,12 +1334,22 @@ def signed_along_track_distance(start_lat, start_lon, end_lat, end_lon, current_
 
 def should_finish_point_to_point(distance_to_target, signed_remaining, cte,
                                  target_tolerance_m=0.03, cte_tolerance_m=0.30):
+    """判断当前点到点直行是否可以结束。
+
+    distance_to_target 是当前点到终点的真实距离；
+    signed_remaining 是沿目标路径方向还剩多少米，小于等于 0 表示已经到达或越过终点投影；
+    cte 是横向偏差，表示当前点距离目标直线有多远。
+    """
+
+    # 第一种完成条件：车辆已经非常接近终点，直接认为当前路径段完成。
     if distance_to_target is not None and float(distance_to_target) <= target_tolerance_m:
         return True
 
+    # 如果没有沿路径剩余距离或横向偏差，就无法判断是否已经越过终点。
     if signed_remaining is None or cte is None:
         return False
 
+    # 第二种完成条件：车辆已经沿路径方向到达/越过终点，并且横向偏差仍在允许范围内。
     return float(signed_remaining) <= 0 and abs(float(cte)) <= cte_tolerance_m
 
 def calculate_perpendicular_point(lat1, lon1, lat2, lon2, distance_meters, side='left'):
