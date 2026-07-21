@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import re
 import time
 
 from AppLogger import logger
@@ -33,6 +34,8 @@ class MQTTCommandHandler(object):
             'getStatus': self._handle_get_status,
             'getTaskPath': self._handle_get_task_path,
             'get_task_path': self._handle_get_task_path,
+            'getModelingPath': self._handle_get_modeling_path,
+            'get_modeling_path': self._handle_get_modeling_path,
         })
         logger.info("MQTT command handler initialized")
 
@@ -61,6 +64,7 @@ class MQTTCommandHandler(object):
             'save_params': self._handle_save_params,
             'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
+            'get_modeling_path': self._handle_get_modeling_path,
         }
 
     def handle(self, message_data):
@@ -119,6 +123,14 @@ class MQTTCommandHandler(object):
         if task_name is None:
             return ''
         return str(task_name).strip()
+
+    def _extract_model_id(self, params):
+        if not isinstance(params, dict):
+            return ''
+        model_id = params.get('modelId')
+        if model_id is None:
+            return ''
+        return str(model_id).strip()
 
     def _handle_drive(self, params):
         return self._call_controller('drive', '前进命令已执行', params.get('distance', 0), params.get('speed'))
@@ -217,6 +229,20 @@ class MQTTCommandHandler(object):
         if not task_name:
             return {'success': False, 'message': 'taskName不能为空'}
         return self._call_controller('set_current_task', '任务已设置为当前任务', task_name)
+
+    def _handle_get_modeling_path(self, params):
+        model_id = self._extract_model_id(params)
+        if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+            return {'success': False, 'message': 'valid modelId is required'}
+        try:
+            return self._call_controller(
+                'get_modeling_path',
+                'modeling path fetched',
+                model_id,
+            )
+        except Exception as exc:
+            logger.error("Fetch modeling path failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': 'modeling path fetch failed: {}'.format(exc)}
 
     def _fallback_task_path(self, params):
         config_path = 'config.json'

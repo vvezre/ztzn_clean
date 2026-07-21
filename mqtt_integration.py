@@ -62,9 +62,14 @@ class MQTTIntegration:
         self.mqtt_client.set_message_callback(self._on_mqtt_message)
 
         self.status_thread = None
+        self.position_thread = None
         self.heartbeat_thread = None
         self.running = False
         self.status_interval = config.get('mqtt', {}).get('status_interval', 5)
+        self.position_interval = max(
+            float(config.get('mqtt', {}).get('position_interval', 1)),
+            0.1
+        )
         self.heartbeat_interval = max(
             float(config.get('mqtt', {}).get('heartbeat_interval', max(self.status_interval * 3, 15))),
             1.0
@@ -137,7 +142,7 @@ class MQTTIntegration:
                 lon,
                 self._coerce_value(current_location.get('heading'), float, None)
             )
-            local_x, local_y = self._compute_local_xy_cm(lat, lon)
+            local_x, local_y = self._compute_local_xy_cm(lat, lon, runtime_state, current_action)
             task_origin_fields = self._build_task_origin_status_fields(task_params, current_location)
             active_task_name = visible_task_field(self._build_task_name(), current_action, control_state)
             active_task_index = visible_task_field(
@@ -190,11 +195,11 @@ class MQTTIntegration:
                 'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
                 'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
                 'supported_actions': [
-                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path'
+                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path'
                 ],
-                'supported_params': ['taskName', 'speed', 'tracking', 'path'],
+                'supported_params': ['taskName', 'modelId', 'speed', 'tracking', 'path'],
                 'supported_status_fields': [
-                    'control_state', 'health_state', 'fault_state', 'mission_state', 'detail', 'rtk'
+                    'control_state', 'health_state', 'fault_state', 'mission_state', 'local_x', 'local_y', 'detail', 'rtk'
                 ],
                 'detail': self._build_detail(
                     task_params=task_params,
@@ -210,10 +215,44 @@ class MQTTIntegration:
             logger.error("从Redis获取车辆状态失败: {}".format(str(e)), exc_info=True)
             return {}
 
-    def _compute_local_xy_cm(self, lat, lon):
+    def _modeling_local_xy_cm(self, lat, lon, runtime_state, current_action=None):
+        runtime_state = runtime_state if isinstance(runtime_state, dict) else {}
+        action = runtime_state.get('action') or current_action
+        if action != 'modeling_task':
+            return None
+
+        detail = runtime_state.get('detail')
+        if not isinstance(detail, dict):
+            detail = self._read_runtime_detail()
+        modeling_task = detail.get('modelingTask') if isinstance(detail, dict) else None
+        segments = modeling_task.get('segments') if isinstance(modeling_task, dict) else None
+        if not isinstance(segments, list) or not segments:
+            return None, None
+
+        anchor = segments[0] if isinstance(segments[0], dict) else {}
+        anchor_lat = self._coerce_value(anchor.get('startLat'), float, None)
+        anchor_lon = self._coerce_value(anchor.get('startLon'), float, None)
+        anchor_x = self._coerce_value(anchor.get('startX'), float, None)
+        anchor_y = self._coerce_value(anchor.get('startY'), float, None)
+        if None in (anchor_lat, anchor_lon, anchor_x, anchor_y):
+            return None, None
+
+        x_m, y_m = util.latlon_to_local_rotated_xy_precise(
+            anchor_lat, anchor_lon, lat, lon, 0.0
+        )
+        return (
+            int(round(anchor_x + x_m * 100.0)),
+            int(round(anchor_y + y_m * 100.0)),
+        )
+
+    def _compute_local_xy_cm(self, lat, lon, runtime_state=None, current_action=None):
         if lat is None or lon is None:
             return None, None
         try:
+            modeling_xy = self._modeling_local_xy_cm(lat, lon, runtime_state, current_action)
+            if modeling_xy is not None:
+                return modeling_xy
+
             task_params = self._get_redis_hash('taskParams')
             origin_lat = self._coerce_value(task_params.get('startLat'), float, None)
             origin_lon = self._coerce_value(task_params.get('startLon'), float, None)
@@ -648,6 +687,42 @@ class MQTTIntegration:
         except Exception as e:
             logger.error("发布车辆状态失败: {}".format(str(e)), exc_info=True)
 
+    def _get_vehicle_position_from_redis(self):
+        if not self.redis_client:
+            return {}
+
+        try:
+            current_location = self._get_redis_hash('currentLocation')
+            lat = self._coerce_value(current_location.get('lat'), float, None)
+            lon = self._coerce_value(current_location.get('lon'), float, None)
+            if lat is None or lon is None:
+                return {}
+
+            runtime_state = self._read_runtime_state()
+            current_action = runtime_state.get('action') or self._get_redis_value('currentAction', str, '')
+            local_x, local_y = self._compute_local_xy_cm(lat, lon, runtime_state, current_action)
+            if local_x is None or local_y is None:
+                return {}
+
+            return {
+                'local_x': local_x,
+                'local_y': local_y,
+            }
+        except Exception as e:
+            logger.error("读取车辆实时相对位置失败: {}".format(str(e)), exc_info=True)
+            return {}
+
+    def publish_vehicle_position(self):
+        try:
+            position = self._get_vehicle_position_from_redis()
+            if position:
+                self.mqtt_client.publish_realtime({
+                    'type': 'vehicle_position',
+                    'data': position,
+                })
+        except Exception as e:
+            logger.error("发布车辆实时相对位置失败: {}".format(str(e)), exc_info=True)
+
     def _status_publish_loop(self):
         logger.info("状态上报线程已启动，间隔 {} 秒".format(self.status_interval))
 
@@ -661,6 +736,21 @@ class MQTTIntegration:
                 time.sleep(self.status_interval)
             except Exception as e:
                 logger.error("状态上报循环异常: {}".format(str(e)), exc_info=True)
+                time.sleep(1)
+
+    def _position_publish_loop(self):
+        logger.info("实时相对位置上报线程已启动，间隔 {} 秒".format(self.position_interval))
+
+        while self.running:
+            try:
+                if not self.mqtt_client.ensure_connected():
+                    time.sleep(1)
+                    continue
+
+                self.publish_vehicle_position()
+                time.sleep(self.position_interval)
+            except Exception as e:
+                logger.error("实时相对位置上报循环异常: {}".format(str(e)), exc_info=True)
                 time.sleep(1)
 
     def _heartbeat_loop(self):
@@ -696,6 +786,10 @@ class MQTTIntegration:
             self.status_thread.daemon = True
             self.status_thread.start()
 
+            self.position_thread = threading.Thread(target=self._position_publish_loop)
+            self.position_thread.daemon = True
+            self.position_thread.start()
+
             self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
             self.heartbeat_thread.daemon = True
             self.heartbeat_thread.start()
@@ -711,6 +805,8 @@ class MQTTIntegration:
             self.running = False
             if self.status_thread:
                 self.status_thread.join(timeout=5)
+            if self.position_thread:
+                self.position_thread.join(timeout=5)
             if self.heartbeat_thread:
                 self.heartbeat_thread.join(timeout=5)
 

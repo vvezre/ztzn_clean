@@ -4,6 +4,7 @@ import time
 
 
 BRUSH_WIDTH_CM = 116.0
+DEFAULT_OVERLAP_CM = 40.7
 MIN_OVERLAP_CM = 10.0
 EPSILON = 1e-6
 
@@ -203,7 +204,7 @@ def _build_group_link_preview(link):
     }
 
 
-def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_cm=MIN_OVERLAP_CM):
+def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_cm=DEFAULT_OVERLAP_CM):
     if not isinstance(draft, dict):
         raise ModelingPreviewError("model draft is required")
     recognition = draft.get("recognition") or {}

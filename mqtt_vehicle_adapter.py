@@ -7,11 +7,11 @@ import json
 import os
 
 try:
-    from urllib import urlencode
+    from urllib import quote, urlencode
     from urllib2 import Request, URLError, urlopen
 except ImportError:
     from urllib.error import URLError
-    from urllib.parse import urlencode
+    from urllib.parse import quote, urlencode
     from urllib.request import Request, urlopen
 
 from AppLogger import logger
@@ -145,3 +145,36 @@ class VehicleControllerAdapter(object):
 
     def get_task_path(self):
         return self._call('/vehicle/getTaskPath')
+
+    def get_modeling_path(self, model_id):
+        encoded_model_id = quote(str(model_id), safe='')
+        response = self._call('/modeling/draft/{}'.format(encoded_model_id))
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': 'modeling draft response is invalid',
+            }
+        if response.get('success') is False:
+            return {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or 'modeling path fetch failed',
+            }
+
+        draft = response.get('data') or {}
+        task_plan = draft.get('taskPlan') if isinstance(draft, dict) else None
+        if not isinstance(task_plan, dict) or task_plan.get('status') != 'ready':
+            return {
+                'success': False,
+                'message': 'modeling task plan is not ready',
+            }
+
+        return {
+            'success': True,
+            'message': 'modeling path fetched',
+            'data': {
+                'modelId': draft.get('id') or str(model_id),
+                'taskName': task_plan.get('taskName') or draft.get('name') or '',
+                'updatedAt': draft.get('updatedAt') or task_plan.get('generatedAt'),
+                'taskPlan': task_plan,
+            },
+        }

@@ -10,6 +10,7 @@
     "keepalive": 60,
     "qos": 1,
     "status_interval": 5,
+    "position_interval": 1,
     "auto_reconnect": true,
     "reconnect_delay": 5
   },
@@ -40,7 +41,8 @@
       "select_task",
       "save_task",
       "save_params",
-      "get_status"
+      "get_status",
+      "get_modeling_path"
     ],
     "disabled": []
   },
@@ -53,6 +55,8 @@
       "voltage",
       "battery_percent",
       "angle",
+      "local_x",
+      "local_y",
       "tracking",
       "path_planning",
       "left_edge",

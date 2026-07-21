@@ -47,9 +47,45 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(preview["summary"]["groupCount"], 1)
         self.assertEqual(preview["summary"]["subAreaCount"], 1)
         self.assertGreater(preview["summary"]["laneCount"], 1)
+        self.assertEqual(preview["config"]["brushWidthCm"], 116.0)
+        self.assertEqual(preview["config"]["overlapCm"], 40.7)
+        self.assertEqual(preview["config"]["laneSpacingCm"], 75.3)
         lanes = preview["groups"][0]["subAreas"][0]["lanes"]
         self.assertEqual(lanes[0]["heading"], 180.0)
         self.assertGreater(lanes[0]["lengthCm"], 0)
+
+    def test_standard_panel_length_generates_four_cleaning_lanes(self):
+        from modeling_preview import build_model_preview
+
+        points = [
+            _point("p1", 0, 0),
+            _point("p2", 0, 226),
+            _point("p3", 339, 226),
+            _point("p4", 339, 0),
+        ]
+        draft = {
+            "id": "standard-panel-row",
+            "recognition": {"confirmed": True, "groupId": "g1"},
+            "groups": [{
+                "id": "g1",
+                "name": "panel-row",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{
+                    "id": "sa1",
+                    "name": "panel-row-area",
+                    "pointIds": ["p1", "p2", "p3", "p4"],
+                }],
+                "connectors": [],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+
+        self.assertEqual(preview["config"]["laneSpacingCm"], 75.3)
+        self.assertEqual(preview["groups"][0]["subAreas"][0]["laneCount"], 4)
 
     def test_build_preview_requires_confirmed_recognition(self):
         from modeling_preview import ModelingPreviewError, build_model_preview

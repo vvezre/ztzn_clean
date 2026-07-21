@@ -407,6 +407,10 @@ class MQTTClient:
         """
         return self.publish(self.publish_topic, status_data, retain=True)
 
+    def publish_realtime(self, realtime_data):
+        """Publish transient realtime data without replacing retained status."""
+        return self.publish(self.publish_topic, realtime_data, retain=False)
+
     def set_message_callback(self, callback):
         """
         设置消息处理回调函数
