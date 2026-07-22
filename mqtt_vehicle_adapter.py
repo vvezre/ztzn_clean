@@ -146,6 +146,90 @@ class VehicleControllerAdapter(object):
     def get_task_path(self):
         return self._call('/vehicle/getTaskPath')
 
+    def sample_modeling_point(self, model_id, group_id):
+        encoded_group_id = quote(str(group_id), safe='')
+        response = self._call(
+            '/modeling/groups/{}/sample-point'.format(encoded_group_id),
+            json_data={'modelId': str(model_id)},
+        )
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': 'modeling point response is invalid',
+            }
+        if response.get('success') is False:
+            error_data = {
+                'modelId': str(model_id),
+                'groupId': str(group_id),
+            }
+            if response.get('code'):
+                error_data['code'] = response.get('code')
+            return {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or 'modeling point recording failed',
+                'data': error_data,
+            }
+
+        response_data = response.get('data') or {}
+        point = response_data.get('point') if isinstance(response_data, dict) else None
+        if not isinstance(point, dict):
+            return {
+                'success': False,
+                'message': 'modeling point is missing from response',
+            }
+
+        return {
+            'success': True,
+            'message': 'modeling point recorded',
+            'data': {
+                'modelId': str(model_id),
+                'groupId': str(group_id),
+                'point': point,
+            },
+        }
+
+    def sample_modeling_link_point(self, model_id, link_id):
+        encoded_link_id = quote(str(link_id), safe='')
+        response = self._call(
+            '/modeling/group-links/{}/sample-point'.format(encoded_link_id),
+            json_data={'modelId': str(model_id)},
+        )
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': 'modeling link point response is invalid',
+            }
+        if response.get('success') is False:
+            error_data = {
+                'modelId': str(model_id),
+                'linkId': str(link_id),
+            }
+            if response.get('code'):
+                error_data['code'] = response.get('code')
+            return {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or 'modeling link point recording failed',
+                'data': error_data,
+            }
+
+        response_data = response.get('data') or {}
+        point = response_data.get('point') if isinstance(response_data, dict) else None
+        if not isinstance(point, dict):
+            return {
+                'success': False,
+                'message': 'modeling link point is missing from response',
+            }
+
+        return {
+            'success': True,
+            'message': 'modeling link point recorded',
+            'data': {
+                'modelId': str(model_id),
+                'linkId': str(link_id),
+                'point': point,
+            },
+        }
+
     def get_modeling_path(self, model_id):
         encoded_model_id = quote(str(model_id), safe='')
         response = self._call('/modeling/draft/{}'.format(encoded_model_id))

@@ -36,6 +36,10 @@ class MQTTCommandHandler(object):
             'get_task_path': self._handle_get_task_path,
             'getModelingPath': self._handle_get_modeling_path,
             'get_modeling_path': self._handle_get_modeling_path,
+            'sampleModelingPoint': self._handle_sample_modeling_point,
+            'sample_modeling_point': self._handle_sample_modeling_point,
+            'sampleModelingLinkPoint': self._handle_sample_modeling_link_point,
+            'sample_modeling_link_point': self._handle_sample_modeling_link_point,
         })
         logger.info("MQTT command handler initialized")
 
@@ -65,6 +69,8 @@ class MQTTCommandHandler(object):
             'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
             'get_modeling_path': self._handle_get_modeling_path,
+            'sample_modeling_point': self._handle_sample_modeling_point,
+            'sample_modeling_link_point': self._handle_sample_modeling_link_point,
         }
 
     def handle(self, message_data):
@@ -131,6 +137,22 @@ class MQTTCommandHandler(object):
         if model_id is None:
             return ''
         return str(model_id).strip()
+
+    def _extract_group_id(self, params):
+        if not isinstance(params, dict):
+            return ''
+        group_id = params.get('groupId')
+        if group_id is None:
+            return ''
+        return str(group_id).strip()
+
+    def _extract_link_id(self, params):
+        if not isinstance(params, dict):
+            return ''
+        link_id = params.get('linkId')
+        if link_id is None:
+            return ''
+        return str(link_id).strip()
 
     def _handle_drive(self, params):
         return self._call_controller('drive', '前进命令已执行', params.get('distance', 0), params.get('speed'))
@@ -229,6 +251,42 @@ class MQTTCommandHandler(object):
         if not task_name:
             return {'success': False, 'message': 'taskName不能为空'}
         return self._call_controller('set_current_task', '任务已设置为当前任务', task_name)
+
+    def _handle_sample_modeling_point(self, params):
+        model_id = self._extract_model_id(params)
+        group_id = self._extract_group_id(params)
+        if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+            return {'success': False, 'message': 'valid modelId is required'}
+        if not group_id or re.match(r'^[A-Za-z0-9_-]+$', group_id) is None:
+            return {'success': False, 'message': 'valid groupId is required'}
+        try:
+            return self._call_controller(
+                'sample_modeling_point',
+                'modeling point recorded',
+                model_id,
+                group_id,
+            )
+        except Exception as exc:
+            logger.error("Record modeling point failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': 'modeling point recording failed: {}'.format(exc)}
+
+    def _handle_sample_modeling_link_point(self, params):
+        model_id = self._extract_model_id(params)
+        link_id = self._extract_link_id(params)
+        if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+            return {'success': False, 'message': 'valid modelId is required'}
+        if not link_id or re.match(r'^[A-Za-z0-9_-]+$', link_id) is None:
+            return {'success': False, 'message': 'valid linkId is required'}
+        try:
+            return self._call_controller(
+                'sample_modeling_link_point',
+                'modeling link point recorded',
+                model_id,
+                link_id,
+            )
+        except Exception as exc:
+            logger.error("Record modeling link point failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': 'modeling link point recording failed: {}'.format(exc)}
 
     def _handle_get_modeling_path(self, params):
         model_id = self._extract_model_id(params)

@@ -4,6 +4,8 @@ import unittest
 class _FakeController(object):
     def __init__(self):
         self.model_id = None
+        self.group_id = None
+        self.link_id = None
 
     def get_modeling_path(self, model_id):
         self.model_id = model_id
@@ -16,10 +18,60 @@ class _FakeController(object):
             },
         }
 
+    def sample_modeling_point(self, model_id, group_id):
+        self.model_id = model_id
+        self.group_id = group_id
+        return {
+            "success": True,
+            "message": "modeling point recorded",
+            "data": {
+                "modelId": model_id,
+                "groupId": group_id,
+                "point": {
+                    "id": "p1",
+                    "sequence": 1,
+                    "lat": 32.0364,
+                    "lon": 118.1234,
+                },
+            },
+        }
+
+    def sample_modeling_link_point(self, model_id, link_id):
+        self.model_id = model_id
+        self.link_id = link_id
+        return {
+            "success": True,
+            "message": "modeling link point recorded",
+            "data": {
+                "modelId": model_id,
+                "linkId": link_id,
+                "point": {
+                    "id": "p2",
+                    "sequence": 2,
+                    "lat": 32.0365,
+                    "lon": 118.1235,
+                    "role": "group_link_end",
+                },
+            },
+        }
+
 
 class _StubAdapter(object):
     def _call(self, path, params=None, json_data=None):
         self.path = path
+        self.json_data = json_data
+        if path.endswith("/sample-point"):
+            return {
+                "success": True,
+                "data": {
+                    "point": {
+                        "id": "p1",
+                        "sequence": 1,
+                        "lat": 32.0364,
+                        "lon": 118.1234,
+                    },
+                },
+            }
         return {
             "success": True,
             "data": {
@@ -112,6 +164,90 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/draft/model-1")
         self.assertEqual(result["data"]["taskPlan"]["status"], "ready")
         self.assertIn("tasks", result["data"]["taskPlan"])
+
+    def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        controller = _FakeController()
+        result = MQTTCommandHandler(controller).handle({
+            "command": "sample_modeling_point",
+            "params": {"modelId": "model-1", "groupId": "group-1"},
+        })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(controller.model_id, "model-1")
+        self.assertEqual(controller.group_id, "group-1")
+        self.assertEqual(result["data"]["point"]["sequence"], 1)
+
+    def test_handler_requires_model_and_group_for_sampling(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        handler = MQTTCommandHandler(_FakeController())
+        missing_group = handler.handle({
+            "command": "sample_modeling_point",
+            "params": {"modelId": "model-1"},
+        })
+        invalid_model = handler.handle({
+            "command": "sample_modeling_point",
+            "params": {"modelId": "../bad", "groupId": "group-1"},
+        })
+
+        self.assertFalse(missing_group["success"])
+        self.assertIn("groupId", missing_group["message"])
+        self.assertFalse(invalid_model["success"])
+
+    def test_adapter_calls_existing_sample_point_endpoint(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.sample_modeling_point(adapter, "model-1", "group-1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/groups/group-1/sample-point")
+        self.assertEqual(adapter.json_data, {"modelId": "model-1"})
+        self.assertEqual(result["data"]["point"]["id"], "p1")
+
+    def test_handler_routes_sample_modeling_link_point_to_existing_adapter(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        controller = _FakeController()
+        result = MQTTCommandHandler(controller).handle({
+            "command": "sample_modeling_link_point",
+            "params": {"modelId": "model-1", "linkId": "link-1"},
+        })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(controller.model_id, "model-1")
+        self.assertEqual(controller.link_id, "link-1")
+        self.assertEqual(result["data"]["point"]["role"], "group_link_end")
+
+    def test_handler_requires_model_and_link_for_link_sampling(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        handler = MQTTCommandHandler(_FakeController())
+        missing_link = handler.handle({
+            "command": "sample_modeling_link_point",
+            "params": {"modelId": "model-1"},
+        })
+        invalid_link = handler.handle({
+            "command": "sample_modeling_link_point",
+            "params": {"modelId": "model-1", "linkId": "../bad"},
+        })
+
+        self.assertFalse(missing_link["success"])
+        self.assertIn("linkId", missing_link["message"])
+        self.assertFalse(invalid_link["success"])
+
+    def test_adapter_calls_existing_sample_link_point_endpoint(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.sample_modeling_link_point(adapter, "model-1", "link-1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/group-links/link-1/sample-point")
+        self.assertEqual(adapter.json_data, {"modelId": "model-1"})
+        self.assertEqual(result["data"]["point"]["id"], "p1")
 
     def test_modeling_live_position_uses_first_task_segment_as_coordinate_anchor(self):
         import math

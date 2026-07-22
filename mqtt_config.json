@@ -42,7 +42,9 @@
       "save_task",
       "save_params",
       "get_status",
-      "get_modeling_path"
+      "get_modeling_path",
+      "sample_modeling_point",
+      "sample_modeling_link_point"
     ],
     "disabled": []
   },
