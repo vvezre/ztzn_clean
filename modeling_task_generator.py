@@ -186,6 +186,230 @@ def _append_transition_tasks(tasks, current, target, area_number, mapper, task_i
     return task_id
 
 
+def _preview_group(preview, group_id):
+    return next(
+        (group for group in (preview.get("groups") or []) if group.get("groupId") == group_id),
+        None,
+    )
+
+
+def _draft_point_map(draft):
+    result = {}
+    for group in draft.get("groups") or []:
+        for point in group.get("points") or []:
+            if point.get("id"):
+                result[point["id"]] = point
+    for link in draft.get("groupLinks") or []:
+        for point in link.get("points") or []:
+            if point.get("id"):
+                result[point["id"]] = point
+    return result
+
+
+def _group_lane_segments(preview, group_id, entry, exit_point):
+    group = _preview_group(preview, group_id)
+    if group is None:
+        raise ModelingTaskGenerationError("route policy references an unknown modeling group")
+    lanes = []
+    for sub_area in group.get("subAreas") or []:
+        lanes.extend(sub_area.get("lanes") or [])
+    if not lanes:
+        raise ModelingTaskGenerationError("route policy group has no cleaning lanes")
+
+    candidates = []
+    for reverse_order in (False, True):
+        ordered = list(reversed(lanes)) if reverse_order else list(lanes)
+        for reverse_first in (False, True):
+            segments = []
+            for index, lane in enumerate(ordered):
+                points = _lane_points(lane, reverse=bool(index % 2) ^ reverse_first)
+                if points is None:
+                    continue
+                segments.append({
+                    "groupId": group_id,
+                    "areaNumber": group.get("areaNumber") or 1,
+                    "start": points[0],
+                    "end": points[1],
+                    "sourceId": lane.get("id"),
+                })
+            if not segments:
+                continue
+            score = _length_cm(entry, segments[0]["start"])
+            score += _length_cm(segments[-1]["end"], exit_point)
+            for index in range(len(segments) - 1):
+                score += _length_cm(segments[index]["end"], segments[index + 1]["start"])
+            candidates.append((score, reverse_order, reverse_first, segments))
+    if not candidates:
+        raise ModelingTaskGenerationError("route policy group has no usable cleaning lanes")
+    return min(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+
+
+def _append_xy_path(tasks, path_points, area_number, mapper, task_id, source):
+    for index in range(len(path_points) - 1):
+        task = _segment_task(
+            path_points[index],
+            path_points[index + 1],
+            2,
+            area_number,
+            task_id,
+            mapper,
+            source,
+        )
+        if task is not None:
+            tasks.append(task)
+            task_id += 1
+    return task_id
+
+
+def _point_ids_to_xy(point_ids, point_map, mapper):
+    result = []
+    for point_id in point_ids or []:
+        point = point_map.get(point_id)
+        xy = mapper.point_to_xy(point)
+        if xy is None:
+            raise ModelingTaskGenerationError("route policy point coordinates are missing")
+        if not result or not _is_same_point(result[-1], xy):
+            result.append(xy)
+    return result
+
+
+def _append_clean_segments(tasks, segments, current, mapper, task_id):
+    clean_count = 0
+    for segment in segments:
+        if current is not None and not _is_same_point(current, segment["start"]):
+            task_id = _append_xy_path(
+                tasks,
+                [current, segment["start"]],
+                segment["areaNumber"],
+                mapper,
+                task_id,
+                "modeling_transfer",
+            )
+        task = _segment_task(
+            segment["start"],
+            segment["end"],
+            1,
+            segment["areaNumber"],
+            task_id,
+            mapper,
+            "modeling_clean",
+        )
+        if task is not None:
+            task["sourceLaneId"] = segment.get("sourceId")
+            tasks.append(task)
+            task_id += 1
+            clean_count += 1
+            current = segment["end"]
+    return current, task_id, clean_count
+
+
+def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=None):
+    point_map = _draft_point_map(draft)
+    anchors = route_policy.get("groupAnchors") or {}
+    remote_group_id = route_policy.get("remoteGroupId")
+    home_group_id = route_policy.get("homeGroupId")
+    remote_group = _preview_group(preview, remote_group_id) or {}
+    home_group = _preview_group(preview, home_group_id) or {}
+    remote_anchor = anchors.get(remote_group_id) or {}
+    home_anchor = anchors.get(home_group_id) or {}
+
+    remote_entry = mapper.point_to_xy(point_map.get(remote_anchor.get("entryPointId")))
+    remote_exit = mapper.point_to_xy(point_map.get(remote_anchor.get("exitPointId")))
+    home_entry = mapper.point_to_xy(point_map.get(home_anchor.get("entryPointId")))
+    home_exit = mapper.point_to_xy(point_map.get(home_anchor.get("exitPointId")))
+    if None in (remote_entry, remote_exit, home_entry, home_exit):
+        raise ModelingTaskGenerationError("route policy anchors are incomplete")
+
+    tasks = []
+    task_id = 1
+    clean_count = 0
+    outbound = _point_ids_to_xy(route_policy.get("outboundPointIds"), point_map, mapper)
+    if len(outbound) < 2:
+        raise ModelingTaskGenerationError("route policy outbound path is incomplete")
+    task_id = _append_xy_path(
+        tasks,
+        outbound,
+        remote_group.get("areaNumber") or 2,
+        mapper,
+        task_id,
+        "modeling_outbound",
+    )
+    current = outbound[-1]
+
+    remote_segments = _group_lane_segments(
+        preview,
+        remote_group_id,
+        remote_entry,
+        remote_exit,
+    )
+    current, task_id, added = _append_clean_segments(
+        tasks, remote_segments, current, mapper, task_id
+    )
+    clean_count += added
+    if not _is_same_point(current, remote_exit):
+        task_id = _append_xy_path(
+            tasks,
+            [current, remote_exit],
+            remote_group.get("areaNumber") or 2,
+            mapper,
+            task_id,
+            "modeling_transfer",
+        )
+        current = remote_exit
+
+    return_path = _point_ids_to_xy(route_policy.get("returnPointIds"), point_map, mapper)
+    if not return_path:
+        raise ModelingTaskGenerationError("route policy return path is incomplete")
+    if not _is_same_point(current, return_path[0]):
+        return_path.insert(0, current)
+    task_id = _append_xy_path(
+        tasks,
+        return_path,
+        home_group.get("areaNumber") or 1,
+        mapper,
+        task_id,
+        "modeling_bridge_return",
+    )
+    current = return_path[-1]
+
+    home_segments = _group_lane_segments(
+        preview,
+        home_group_id,
+        home_entry,
+        home_exit,
+    )
+    current, task_id, added = _append_clean_segments(
+        tasks, home_segments, current, mapper, task_id
+    )
+    clean_count += added
+    if not _is_same_point(current, home_exit):
+        task_id = _append_xy_path(
+            tasks,
+            [current, home_exit],
+            home_group.get("areaNumber") or 1,
+            mapper,
+            task_id,
+            "modeling_return_origin",
+        )
+
+    if not tasks or clean_count == 0:
+        raise ModelingTaskGenerationError("route policy produced no cleaning tasks")
+    total_length = sum(int(task.get("length") or 0) for task in tasks)
+    return {
+        "status": "ready",
+        "generatedAt": int(now if now is not None else time.time()),
+        "taskName": draft.get("name") or draft.get("id") or "",
+        "routeType": "bridge_round_trip",
+        "summary": {
+            "taskCount": len(tasks),
+            "cleanTaskCount": clean_count,
+            "transferTaskCount": len(tasks) - clean_count,
+            "totalLengthCm": total_length,
+        },
+        "tasks": tasks,
+    }
+
+
 def generate_task_plan(draft, now=None):
     if not isinstance(draft, dict):
         raise ModelingTaskGenerationError("model draft is required")
@@ -194,6 +418,15 @@ def generate_task_plan(draft, now=None):
         raise ModelingTaskGenerationError("路径预览未生成或不可用，不能生成执行任务")
 
     mapper = _CoordinateMapper(draft)
+    route_policy = draft.get("routePolicy") or {}
+    if route_policy.get("type") == "bridge_round_trip":
+        return _generate_bridge_round_trip_plan(
+            draft,
+            preview,
+            mapper,
+            route_policy,
+            now=now,
+        )
     tasks = []
     task_id = 1
     previous = None

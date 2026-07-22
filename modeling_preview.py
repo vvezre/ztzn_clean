@@ -4,7 +4,7 @@ import time
 
 
 BRUSH_WIDTH_CM = 116.0
-DEFAULT_OVERLAP_CM = 40.7
+DEFAULT_OVERLAP_CM = 53.0
 MIN_OVERLAP_CM = 10.0
 EPSILON = 1e-6
 
@@ -129,7 +129,23 @@ def _line_polygon_intersections(polygon_xy, normal, offset):
     return _unique_intersections(intersections)
 
 
-def _generate_lanes(polygon, sweep_angle, lane_spacing_cm):
+def _nearest_even_lane_count(span, target_spacing):
+    if span <= EPSILON:
+        return 0
+    ideal = span / max(float(target_spacing), 1.0) + 1.0
+    lower = max(2, int(math.floor(ideal / 2.0)) * 2)
+    candidates = sorted(set([max(2, lower - 2), lower, lower + 2, lower + 4]))
+    return min(
+        candidates,
+        key=lambda count: (
+            abs(span / float(count - 1) - target_spacing),
+            abs(count - ideal),
+            count,
+        ),
+    )
+
+
+def _generate_lanes(polygon, sweep_angle, lane_spacing_cm, force_even=False):
     polygon_xy = [_point_xy(point) for point in polygon]
     polygon_xy = [xy for xy in polygon_xy if xy is not None]
     if len(polygon_xy) < 3 or sweep_angle is None:
@@ -143,10 +159,22 @@ def _generate_lanes(polygon, sweep_angle, lane_spacing_cm):
     max_offset = max(offsets)
     spacing = max(float(lane_spacing_cm), 1.0)
 
+    span = max_offset - min_offset
+    if force_even and span > EPSILON:
+        lane_count = _nearest_even_lane_count(span, spacing)
+        actual_spacing = span / float(lane_count - 1)
+        lane_offsets = [min_offset + actual_spacing * index for index in range(lane_count)]
+    else:
+        actual_spacing = spacing
+        lane_offsets = []
+        offset = min_offset
+        while offset <= max_offset + EPSILON:
+            lane_offsets.append(offset)
+            offset += spacing
+
     lanes = []
-    offset = min_offset
     index = 1
-    while offset <= max_offset + EPSILON:
+    for offset in lane_offsets:
         intersections = _line_polygon_intersections(polygon_xy, normal, offset)
         if len(intersections) >= 2:
             ordered = sorted(intersections, key=lambda xy: direction[0] * xy[0] + direction[1] * xy[1])
@@ -161,9 +189,9 @@ def _generate_lanes(polygon, sweep_angle, lane_spacing_cm):
                     "endX": round(end[0], 1),
                     "endY": round(end[1], 1),
                     "lengthCm": round(_distance(start, end), 1),
+                    "laneSpacingCm": round(actual_spacing, 1),
                 })
                 index += 1
-        offset += spacing
 
     if lanes:
         return lanes
@@ -220,6 +248,8 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
     connector_count = 0
     lane_count = 0
     warnings = []
+    route_policy = draft.get("routePolicy") or {}
+    force_even_lanes = bool(route_policy.get("forceEvenLanes"))
 
     for group in draft.get("groups") or []:
         points = list(group.get("points") or [])
@@ -233,7 +263,12 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
             ]
             polygon = _clean_polygon_points(polygon)
             sweep_angle = _group_sweep_angle(group, polygon)
-            lanes = _generate_lanes(polygon, sweep_angle, lane_spacing)
+            lanes = _generate_lanes(
+                polygon,
+                sweep_angle,
+                lane_spacing,
+                force_even=force_even_lanes,
+            )
             sub_area_count += 1
             lane_count += len(lanes)
             if len(polygon) < 3:
@@ -246,6 +281,7 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
                 "polygon": [_preview_point(point) for point in polygon],
                 "lanes": lanes,
                 "laneCount": len(lanes),
+                "laneSpacingCm": lanes[0].get("laneSpacingCm") if lanes else None,
             })
         connectors = list(group.get("connectors") or [])
         connector_count += len(connectors)

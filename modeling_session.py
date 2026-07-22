@@ -5,6 +5,8 @@ import os
 import threading
 import time
 
+from modeling_capture import MixedCaptureError, resolve_mixed_capture
+
 
 SESSION_SCHEMA_VERSION = 1
 
@@ -68,6 +70,27 @@ class ModelingSession(object):
     def _find_link(self, draft, link_id):
         return next((link for link in (draft.get("groupLinks") or []) if link.get("id") == link_id), None)
 
+    def _append_capture_event(self, model_id, draft, point_type, point):
+        events = list(draft.get("captureSequence") or [])
+        events.append({
+            "sequence": len(events) + 1,
+            "pointType": point_type,
+            "pointId": point.get("id"),
+        })
+        draft["captureSequence"] = events
+        return self.store.save_draft(model_id, draft)
+
+    def _remove_capture_points(self, model_id, draft, point_ids):
+        point_ids = set(point_ids or [])
+        events = [
+            event for event in (draft.get("captureSequence") or [])
+            if event.get("pointId") not in point_ids
+        ]
+        for sequence, event in enumerate(events, start=1):
+            event["sequence"] = sequence
+        draft["captureSequence"] = events
+        return self.store.save_draft(model_id, draft)
+
     def _summary(self, state, draft=None):
         if not state:
             return {
@@ -118,6 +141,7 @@ class ModelingSession(object):
                 "currentGroupId": group["id"],
                 "currentLinkId": None,
                 "pendingGroupId": None,
+                "captureMode": None,
                 "currentPointType": "area",
                 "createdAt": timestamp,
             })
@@ -140,14 +164,21 @@ class ModelingSession(object):
                         "MODELING_LINK_INCOMPLETE",
                         "record both connection points before recording the next area",
                     )
-                state["currentGroupId"] = state.get("pendingGroupId")
-                state["currentLinkId"] = None
-                state["pendingGroupId"] = None
+                if state.get("captureMode") != "mixed_boundary":
+                    state["currentGroupId"] = state.get("pendingGroupId")
+                    state["currentLinkId"] = None
+                    state["pendingGroupId"] = None
 
             group_id = state.get("currentGroupId")
             if not group_id:
                 raise ModelingSessionError("MODELING_GROUP_MISSING", "current modeling area is missing")
             result = self.store.append_group_point(model_id, group_id, self._sample())
+            saved = self._append_capture_event(
+                model_id,
+                result["draft"],
+                "area",
+                result["point"],
+            )
             state["currentPointType"] = "area"
             state = self._write_state(state)
             return {
@@ -156,7 +187,7 @@ class ModelingSession(object):
                 "pointType": "area",
                 "pointNo": result["point"].get("sequence"),
                 "point": result["point"],
-                "session": self._summary(state, result["draft"]),
+                "session": self._summary(state, saved),
             }
 
     def record_link_point(self):
@@ -167,14 +198,11 @@ class ModelingSession(object):
             current_group = self._find_group(draft, state.get("currentGroupId"))
             if current_group is None:
                 raise ModelingSessionError("MODELING_GROUP_MISSING", "current modeling area is missing")
-            if len(current_group.get("points") or []) < 4:
-                raise ModelingSessionError(
-                    "MODELING_AREA_INCOMPLETE",
-                    "record at least four area points before recording a connection",
-                )
 
             link_id = state.get("currentLinkId")
             if not link_id:
+                if len(current_group.get("points") or []) < 4:
+                    state["captureMode"] = "mixed_boundary"
                 next_group = self.store.create_group(model_id, None)["group"]
                 created = self.store.create_group_link(model_id, {
                     "startGroupId": current_group["id"],
@@ -186,6 +214,12 @@ class ModelingSession(object):
                 draft = created["draft"]
 
             result = self.store.append_group_link_point(model_id, link_id, self._sample())
+            saved = self._append_capture_event(
+                model_id,
+                result["draft"],
+                "link",
+                result["point"],
+            )
             state["currentPointType"] = "link"
             state = self._write_state(state)
             return {
@@ -194,7 +228,7 @@ class ModelingSession(object):
                 "pointType": "link",
                 "pointNo": result["point"].get("sequence"),
                 "point": result["point"],
-                "session": self._summary(state, result["draft"]),
+                "session": self._summary(state, saved),
             }
 
     def undo(self, point_type=None):
@@ -209,14 +243,14 @@ class ModelingSession(object):
                 if not points:
                     raise ModelingSessionError("MODELING_POINT_MISSING", "there is no area point to undo")
                 result = self.store.delete_group_point(model_id, group["id"], points[-1]["id"])
-                draft = result["draft"]
+                draft = self._remove_capture_points(model_id, result["draft"], [points[-1]["id"]])
             elif point_type == "link":
                 link = self._find_link(draft, state.get("currentLinkId"))
                 points = list((link or {}).get("points") or [])
                 if not points:
                     raise ModelingSessionError("MODELING_POINT_MISSING", "there is no connection point to undo")
                 result = self.store.delete_group_link_point(model_id, link["id"], points[-1]["id"])
-                draft = result["draft"]
+                draft = self._remove_capture_points(model_id, result["draft"], [points[-1]["id"]])
             else:
                 raise ModelingSessionError("MODELING_POINT_TYPE_INVALID", "pointType must be area or link")
 
@@ -232,20 +266,26 @@ class ModelingSession(object):
             state = self._require_state()
             point_type = str(point_type or state.get("currentPointType") or "area").strip().lower()
             model_id = state["modelId"]
+            draft = self.store.get_draft(model_id)
             if point_type == "area":
+                group = self._find_group(draft, state.get("currentGroupId")) or {}
+                removed_ids = [point.get("id") for point in (group.get("points") or [])]
                 result = self.store.clear_group_points(model_id, state.get("currentGroupId"))
             elif point_type == "link":
                 if not state.get("currentLinkId"):
                     raise ModelingSessionError("MODELING_LINK_MISSING", "current connection is missing")
+                link = self._find_link(draft, state.get("currentLinkId")) or {}
+                removed_ids = [point.get("id") for point in (link.get("points") or [])]
                 result = self.store.clear_group_link_points(model_id, state.get("currentLinkId"))
             else:
                 raise ModelingSessionError("MODELING_POINT_TYPE_INVALID", "pointType must be area or link")
 
+            saved = self._remove_capture_points(model_id, result["draft"], removed_ids)
             state["currentPointType"] = point_type
             state = self._write_state(state)
             return {
                 "pointType": point_type,
-                "session": self._summary(state, result["draft"]),
+                "session": self._summary(state, saved),
             }
 
     def finish(self):
@@ -253,6 +293,12 @@ class ModelingSession(object):
             state = self._require_state()
             model_id = state["modelId"]
             draft = self.store.get_draft(model_id)
+            if state.get("captureMode") == "mixed_boundary":
+                try:
+                    draft = resolve_mixed_capture(draft)
+                except MixedCaptureError as error:
+                    raise ModelingSessionError(error.code, error.message)
+                draft = self.store.save_draft(model_id, draft)
             links = list(draft.get("groupLinks") or [])
             incomplete_links = [link for link in links if len(link.get("points") or []) != 2]
             if incomplete_links:

@@ -107,6 +107,103 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(finished["taskPlan"]["status"], "ready")
         self.assertGreater(finished["taskPlan"]["summary"]["transferTaskCount"], 0)
 
+    def test_mixed_boundary_capture_generates_remote_first_round_trip(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            _point("p1", 0, 0),
+            _point("p2", 0, 452),
+            _point("p3", 0, 470),
+            _point("p4", 0, 534),
+            _point("p5", 0, 552),
+            _point("p6", 0, 778),
+            _point("p7", 452, 778),
+            _point("p8", 452, 552),
+            _point("p9", 565, 452),
+            _point("p10", 565, 0),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        session.start("confirmed-route")
+
+        session.record_area_point()
+        session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+        for _ in range(6):
+            session.record_area_point()
+        finished = session.finish()
+
+        draft = store.get_draft(finished["modelId"])
+        self.assertEqual(
+            [[point["id"] for point in group["points"]] for group in draft["groups"]],
+            [["p1", "p2", "p9", "p10"], ["p5", "p6", "p7", "p8"]],
+        )
+        self.assertEqual(
+            [group["subAreas"][0]["laneCount"] for group in draft["taskPreview"]["groups"]],
+            [8, 4],
+        )
+        task_plan = finished["taskPlan"]
+        self.assertEqual(task_plan["routeType"], "bridge_round_trip")
+        self.assertEqual(task_plan["summary"]["cleanTaskCount"], 12)
+        self.assertEqual(
+            (task_plan["tasks"][0]["startX"], task_plan["tasks"][0]["startY"]),
+            (0, 0),
+        )
+        self.assertEqual(
+            (task_plan["tasks"][0]["endX"], task_plan["tasks"][0]["endY"]),
+            (0, 452),
+        )
+        clean_tasks = [task for task in task_plan["tasks"] if task["mode"] == 1]
+        self.assertEqual([task["areaNumber"] for task in clean_tasks], [2] * 4 + [1] * 8)
+        self.assertEqual(
+            (clean_tasks[0]["startX"], clean_tasks[0]["startY"], clean_tasks[0]["endX"], clean_tasks[0]["endY"]),
+            (0, 778, 452, 778),
+        )
+        self.assertEqual(
+            (task_plan["tasks"][-1]["endX"], task_plan["tasks"][-1]["endY"]),
+            (0, 0),
+        )
+        self.assertTrue(any(task["source"] == "modeling_bridge_return" for task in task_plan["tasks"]))
+
+    def test_mixed_boundary_capture_keeps_extra_home_boundary_points(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            _point("p1", 0, 0),
+            _point("p2", 0, 452),
+            _point("p3", 0, 470),
+            _point("p4", 0, 534),
+            _point("p5", 0, 552),
+            _point("p6", 0, 778),
+            _point("p7", 452, 778),
+            _point("p8", 452, 552),
+            _point("assist1", 10, 452),
+            _point("assist2", 250, 452),
+            _point("p9", 565, 452),
+            _point("p10", 565, 0),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        session.start("extra-points")
+        session.record_area_point()
+        session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+        for _ in range(8):
+            session.record_area_point()
+
+        finished = session.finish()
+        draft = store.get_draft(finished["modelId"])
+
+        self.assertEqual(
+            [point["id"] for point in draft["groups"][0]["points"]],
+            ["p1", "p2", "assist1", "assist2", "p9", "p10"],
+        )
+        self.assertEqual(finished["taskPlan"]["summary"]["cleanTaskCount"], 12)
+
     def test_undo_and_clear_apply_to_selected_point_type(self):
         from modeling_session import ModelingSession
         from modeling_store import ModelingStore
