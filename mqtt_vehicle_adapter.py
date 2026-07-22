@@ -146,7 +146,75 @@ class VehicleControllerAdapter(object):
     def get_task_path(self):
         return self._call('/vehicle/getTaskPath')
 
-    def sample_modeling_point(self, model_id, group_id):
+    def _normalize_modeling_response(self, response, default_message):
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': '{} response is invalid'.format(default_message),
+            }
+        if response.get('success') is False:
+            data = response.get('data') if isinstance(response.get('data'), dict) else {}
+            if response.get('code'):
+                data = dict(data)
+                data['code'] = response.get('code')
+            result = {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or '{} failed'.format(default_message),
+            }
+            if data:
+                result['data'] = data
+            return result
+        return {
+            'success': True,
+            'message': default_message,
+            'data': response.get('data') or {},
+        }
+
+    def start_modeling(self, name=None, restart=False):
+        payload = {'restart': bool(restart)}
+        if name:
+            payload['name'] = str(name)
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/start', json_data=payload),
+            'modeling started',
+        )
+
+    def get_modeling_state(self):
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/current'),
+            'modeling state fetched',
+        )
+
+    def undo_modeling_point(self, point_type=None):
+        payload = {}
+        if point_type:
+            payload['pointType'] = str(point_type)
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/undo', json_data=payload),
+            'modeling point undone',
+        )
+
+    def clear_modeling_points(self, point_type=None):
+        payload = {}
+        if point_type:
+            payload['pointType'] = str(point_type)
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/clear', json_data=payload),
+            'modeling points cleared',
+        )
+
+    def finish_modeling(self):
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/finish', json_data={}),
+            'modeling path generated',
+        )
+
+    def sample_modeling_point(self, model_id=None, group_id=None):
+        if model_id is None and group_id is None:
+            return self._normalize_modeling_response(
+                self._call('/modeling/session/record-area-point', json_data={}),
+                'modeling point recorded',
+            )
         encoded_group_id = quote(str(group_id), safe='')
         response = self._call(
             '/modeling/groups/{}/sample-point'.format(encoded_group_id),
@@ -188,7 +256,12 @@ class VehicleControllerAdapter(object):
             },
         }
 
-    def sample_modeling_link_point(self, model_id, link_id):
+    def sample_modeling_link_point(self, model_id=None, link_id=None):
+        if model_id is None and link_id is None:
+            return self._normalize_modeling_response(
+                self._call('/modeling/session/record-link-point', json_data={}),
+                'modeling link point recorded',
+            )
         encoded_link_id = quote(str(link_id), safe='')
         response = self._call(
             '/modeling/group-links/{}/sample-point'.format(encoded_link_id),
@@ -230,7 +303,12 @@ class VehicleControllerAdapter(object):
             },
         }
 
-    def get_modeling_path(self, model_id):
+    def get_modeling_path(self, model_id=None):
+        if model_id is None:
+            return self._normalize_modeling_response(
+                self._call('/modeling/session/path'),
+                'modeling path fetched',
+            )
         encoded_model_id = quote(str(model_id), safe='')
         response = self._call('/modeling/draft/{}'.format(encoded_model_id))
         if not isinstance(response, dict):

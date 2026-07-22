@@ -7,26 +7,26 @@ class _FakeController(object):
         self.group_id = None
         self.link_id = None
 
-    def get_modeling_path(self, model_id):
+    def get_modeling_path(self, model_id=None):
         self.model_id = model_id
         return {
             "success": True,
             "message": "ok",
             "data": {
-                "modelId": model_id,
+                "modelId": model_id or "active-model",
                 "taskPlan": {"status": "ready", "tasks": []},
             },
         }
 
-    def sample_modeling_point(self, model_id, group_id):
+    def sample_modeling_point(self, model_id=None, group_id=None):
         self.model_id = model_id
         self.group_id = group_id
         return {
             "success": True,
             "message": "modeling point recorded",
             "data": {
-                "modelId": model_id,
-                "groupId": group_id,
+                "modelId": model_id or "active-model",
+                "groupId": group_id or "active-group",
                 "point": {
                     "id": "p1",
                     "sequence": 1,
@@ -36,15 +36,15 @@ class _FakeController(object):
             },
         }
 
-    def sample_modeling_link_point(self, model_id, link_id):
+    def sample_modeling_link_point(self, model_id=None, link_id=None):
         self.model_id = model_id
         self.link_id = link_id
         return {
             "success": True,
             "message": "modeling link point recorded",
             "data": {
-                "modelId": model_id,
-                "linkId": link_id,
+                "modelId": model_id or "active-model",
+                "linkId": link_id or "active-link",
                 "point": {
                     "id": "p2",
                     "sequence": 2,
@@ -55,8 +55,27 @@ class _FakeController(object):
             },
         }
 
+    def start_modeling(self, name=None, restart=False):
+        return {"success": True, "data": {"status": "recording", "name": name}}
+
+    def finish_modeling(self):
+        return {"success": True, "data": {"modelId": "active-model", "taskPlan": {"status": "ready"}}}
+
+    def get_modeling_state(self):
+        return {"success": True, "data": {"status": "recording"}}
+
+    def undo_modeling_point(self, point_type=None):
+        return {"success": True, "data": {"pointType": point_type or "area"}}
+
+    def clear_modeling_points(self, point_type=None):
+        return {"success": True, "data": {"pointType": point_type or "area"}}
+
 
 class _StubAdapter(object):
+    def _normalize_modeling_response(self, response, default_message):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+        return VehicleControllerAdapter._normalize_modeling_response(self, response, default_message)
+
     def _call(self, path, params=None, json_data=None):
         self.path = path
         self.json_data = json_data
@@ -137,7 +156,7 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(controller.model_id, "model-1")
         self.assertEqual(result["data"]["modelId"], "model-1")
 
-    def test_handler_requires_model_id(self):
+    def test_handler_uses_current_session_when_model_id_is_missing(self):
         from mqtt_handler import MQTTCommandHandler
 
         result = MQTTCommandHandler(_FakeController()).handle({
@@ -145,8 +164,8 @@ class MqttModelingBridgeTest(unittest.TestCase):
             "params": {},
         })
 
-        self.assertFalse(result["success"])
-        self.assertIn("modelId", result["message"])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["modelId"], "active-model")
 
         invalid = MQTTCommandHandler(_FakeController()).handle({
             "command": "get_modeling_path",
@@ -179,10 +198,14 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(controller.group_id, "group-1")
         self.assertEqual(result["data"]["point"]["sequence"], 1)
 
-    def test_handler_requires_model_and_group_for_sampling(self):
+    def test_handler_uses_current_session_or_requires_complete_identifier_pair(self):
         from mqtt_handler import MQTTCommandHandler
 
         handler = MQTTCommandHandler(_FakeController())
+        current_session = handler.handle({
+            "command": "sample_modeling_point",
+            "params": {},
+        })
         missing_group = handler.handle({
             "command": "sample_modeling_point",
             "params": {"modelId": "model-1"},
@@ -192,6 +215,7 @@ class MqttModelingBridgeTest(unittest.TestCase):
             "params": {"modelId": "../bad", "groupId": "group-1"},
         })
 
+        self.assertTrue(current_session["success"])
         self.assertFalse(missing_group["success"])
         self.assertIn("groupId", missing_group["message"])
         self.assertFalse(invalid_model["success"])
@@ -207,6 +231,16 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.json_data, {"modelId": "model-1"})
         self.assertEqual(result["data"]["point"]["id"], "p1")
 
+    def test_adapter_uses_session_point_endpoint_when_ids_are_omitted(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.sample_modeling_point(adapter)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/session/record-area-point")
+        self.assertEqual(adapter.json_data, {})
+
     def test_handler_routes_sample_modeling_link_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler
 
@@ -221,10 +255,14 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(controller.link_id, "link-1")
         self.assertEqual(result["data"]["point"]["role"], "group_link_end")
 
-    def test_handler_requires_model_and_link_for_link_sampling(self):
+    def test_handler_uses_current_session_or_requires_complete_link_identifier_pair(self):
         from mqtt_handler import MQTTCommandHandler
 
         handler = MQTTCommandHandler(_FakeController())
+        current_session = handler.handle({
+            "command": "sample_modeling_link_point",
+            "params": {},
+        })
         missing_link = handler.handle({
             "command": "sample_modeling_link_point",
             "params": {"modelId": "model-1"},
@@ -234,6 +272,7 @@ class MqttModelingBridgeTest(unittest.TestCase):
             "params": {"modelId": "model-1", "linkId": "../bad"},
         })
 
+        self.assertTrue(current_session["success"])
         self.assertFalse(missing_link["success"])
         self.assertIn("linkId", missing_link["message"])
         self.assertFalse(invalid_link["success"])
@@ -248,6 +287,20 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/group-links/link-1/sample-point")
         self.assertEqual(adapter.json_data, {"modelId": "model-1"})
         self.assertEqual(result["data"]["point"]["id"], "p1")
+
+    def test_handler_routes_session_lifecycle_commands(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        handler = MQTTCommandHandler(_FakeController())
+
+        self.assertTrue(handler.handle({"command": "start_modeling", "params": {"name": "area-a"}})["success"])
+        self.assertTrue(handler.handle({"command": "get_modeling_state", "params": {}})["success"])
+        self.assertTrue(handler.handle({"command": "undo_modeling_point", "params": {"pointType": "link"}})["success"])
+        self.assertTrue(handler.handle({"command": "clear_modeling_points", "params": {"pointType": "area"}})["success"])
+        self.assertTrue(handler.handle({"command": "finish_modeling", "params": {}})["success"])
+
+        invalid = handler.handle({"command": "undo_modeling_point", "params": {"pointType": "bad"}})
+        self.assertFalse(invalid["success"])
 
     def test_modeling_live_position_uses_first_task_segment_as_coordinate_anchor(self):
         import math

@@ -100,6 +100,18 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(point["sequence"], 1)
         self.assertEqual(sampled.get_json()["data"]["group"]["points"][0]["source"], "rtk_mean")
 
+    def test_session_routes_manage_current_model_without_frontend_ids(self):
+        started = self.client.post("/modeling/session/start", json={"name": "mini-program-area"})
+        recorded = self.client.post("/modeling/session/record-area-point", json={})
+        current = self.client.get("/modeling/session/current")
+
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(started.get_json()["data"]["status"], "recording")
+        self.assertEqual(recorded.status_code, 200)
+        self.assertEqual(recorded.get_json()["data"]["pointType"], "area")
+        self.assertEqual(recorded.get_json()["data"]["pointNo"], 1)
+        self.assertEqual(current.get_json()["data"]["areaPointCount"], 1)
+
     def test_sample_status_route_reports_current_readiness(self):
         response = self.client.get("/modeling/sample-status")
 

@@ -392,6 +392,55 @@ class ModelingStore(object):
             "point": saved_link["points"][-1],
         }
 
+    def delete_group_link_point(self, model_id, link_id, point_id, now=None):
+        point_id = self._validate_model_id(point_id)
+        current_time = self._timestamp(now)
+        draft = self.get_draft(model_id)
+        index = self._find_group_link_index(draft, link_id)
+        link = dict(draft["groupLinks"][index])
+        points = list(link.get("points") or [])
+        next_points = [point for point in points if point.get("id") != point_id]
+        if len(next_points) == len(points):
+            raise ModelNotFoundError("point not found")
+
+        for sequence, point in enumerate(next_points, start=1):
+            point["sequence"] = sequence
+            point["role"] = "group_link_start" if sequence == 1 else "group_link_end"
+            point["roles"] = ["group_connector"]
+            point["updatedAt"] = current_time
+
+        link["points"] = next_points
+        link["status"] = "ready" if len(next_points) == 2 else "draft"
+        link["updatedAt"] = current_time
+        draft["groupLinks"][index] = link
+        self._clear_task_outputs(draft)
+
+        saved = self.save_draft(model_id, draft, now=current_time)
+        saved_index = self._find_group_link_index(saved, link_id)
+        return {
+            "draft": saved,
+            "groupLink": saved["groupLinks"][saved_index],
+            "pointId": point_id,
+        }
+
+    def clear_group_link_points(self, model_id, link_id, now=None):
+        current_time = self._timestamp(now)
+        draft = self.get_draft(model_id)
+        index = self._find_group_link_index(draft, link_id)
+        link = dict(draft["groupLinks"][index])
+        link["points"] = []
+        link["status"] = "draft"
+        link["updatedAt"] = current_time
+        draft["groupLinks"][index] = link
+        self._clear_task_outputs(draft)
+
+        saved = self.save_draft(model_id, draft, now=current_time)
+        saved_index = self._find_group_link_index(saved, link_id)
+        return {
+            "draft": saved,
+            "groupLink": saved["groupLinks"][saved_index],
+        }
+
     def delete_group_link(self, model_id, link_id, now=None):
         draft = self.get_draft(model_id)
         index = self._find_group_link_index(draft, link_id)

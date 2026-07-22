@@ -42,6 +42,11 @@
       "save_task",
       "save_params",
       "get_status",
+      "start_modeling",
+      "finish_modeling",
+      "get_modeling_state",
+      "undo_modeling_point",
+      "clear_modeling_points",
       "get_modeling_path",
       "sample_modeling_point",
       "sample_modeling_link_point"

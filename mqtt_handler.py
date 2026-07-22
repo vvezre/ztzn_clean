@@ -40,6 +40,16 @@ class MQTTCommandHandler(object):
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sampleModelingLinkPoint': self._handle_sample_modeling_link_point,
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
+            'startModeling': self._handle_start_modeling,
+            'start_modeling': self._handle_start_modeling,
+            'finishModeling': self._handle_finish_modeling,
+            'finish_modeling': self._handle_finish_modeling,
+            'getModelingState': self._handle_get_modeling_state,
+            'get_modeling_state': self._handle_get_modeling_state,
+            'undoModelingPoint': self._handle_undo_modeling_point,
+            'undo_modeling_point': self._handle_undo_modeling_point,
+            'clearModelingPoints': self._handle_clear_modeling_points,
+            'clear_modeling_points': self._handle_clear_modeling_points,
         })
         logger.info("MQTT command handler initialized")
 
@@ -71,6 +81,11 @@ class MQTTCommandHandler(object):
             'get_modeling_path': self._handle_get_modeling_path,
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
+            'start_modeling': self._handle_start_modeling,
+            'finish_modeling': self._handle_finish_modeling,
+            'get_modeling_state': self._handle_get_modeling_state,
+            'undo_modeling_point': self._handle_undo_modeling_point,
+            'clear_modeling_points': self._handle_clear_modeling_points,
         }
 
     def handle(self, message_data):
@@ -255,11 +270,16 @@ class MQTTCommandHandler(object):
     def _handle_sample_modeling_point(self, params):
         model_id = self._extract_model_id(params)
         group_id = self._extract_group_id(params)
-        if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
-            return {'success': False, 'message': 'valid modelId is required'}
-        if not group_id or re.match(r'^[A-Za-z0-9_-]+$', group_id) is None:
-            return {'success': False, 'message': 'valid groupId is required'}
         try:
+            if not model_id and not group_id:
+                return self._call_controller(
+                    'sample_modeling_point',
+                    'modeling point recorded',
+                )
+            if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+                return {'success': False, 'message': 'valid modelId is required when identifiers are provided'}
+            if not group_id or re.match(r'^[A-Za-z0-9_-]+$', group_id) is None:
+                return {'success': False, 'message': 'valid groupId is required when identifiers are provided'}
             return self._call_controller(
                 'sample_modeling_point',
                 'modeling point recorded',
@@ -273,11 +293,16 @@ class MQTTCommandHandler(object):
     def _handle_sample_modeling_link_point(self, params):
         model_id = self._extract_model_id(params)
         link_id = self._extract_link_id(params)
-        if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
-            return {'success': False, 'message': 'valid modelId is required'}
-        if not link_id or re.match(r'^[A-Za-z0-9_-]+$', link_id) is None:
-            return {'success': False, 'message': 'valid linkId is required'}
         try:
+            if not model_id and not link_id:
+                return self._call_controller(
+                    'sample_modeling_link_point',
+                    'modeling link point recorded',
+                )
+            if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+                return {'success': False, 'message': 'valid modelId is required when identifiers are provided'}
+            if not link_id or re.match(r'^[A-Za-z0-9_-]+$', link_id) is None:
+                return {'success': False, 'message': 'valid linkId is required when identifiers are provided'}
             return self._call_controller(
                 'sample_modeling_link_point',
                 'modeling link point recorded',
@@ -290,9 +315,14 @@ class MQTTCommandHandler(object):
 
     def _handle_get_modeling_path(self, params):
         model_id = self._extract_model_id(params)
-        if not model_id or re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
-            return {'success': False, 'message': 'valid modelId is required'}
         try:
+            if not model_id:
+                return self._call_controller(
+                    'get_modeling_path',
+                    'modeling path fetched',
+                )
+            if re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+                return {'success': False, 'message': 'valid modelId is required when provided'}
             return self._call_controller(
                 'get_modeling_path',
                 'modeling path fetched',
@@ -301,6 +331,35 @@ class MQTTCommandHandler(object):
         except Exception as exc:
             logger.error("Fetch modeling path failed: {}".format(exc), exc_info=True)
             return {'success': False, 'message': 'modeling path fetch failed: {}'.format(exc)}
+
+    def _handle_start_modeling(self, params):
+        name = str(params.get('name') or '').strip() if isinstance(params, dict) else ''
+        restart = bool(params.get('restart', False)) if isinstance(params, dict) else False
+        return self._call_controller('start_modeling', 'modeling started', name or None, restart)
+
+    def _handle_finish_modeling(self, params):
+        return self._call_controller('finish_modeling', 'modeling path generated')
+
+    def _handle_get_modeling_state(self, params):
+        return self._call_controller('get_modeling_state', 'modeling state fetched')
+
+    def _extract_point_type(self, params):
+        point_type = str(params.get('pointType') or '').strip().lower() if isinstance(params, dict) else ''
+        if point_type and point_type not in ('area', 'link'):
+            return None, {'success': False, 'message': 'pointType must be area or link'}
+        return point_type or None, None
+
+    def _handle_undo_modeling_point(self, params):
+        point_type, error = self._extract_point_type(params)
+        if error:
+            return error
+        return self._call_controller('undo_modeling_point', 'modeling point undone', point_type)
+
+    def _handle_clear_modeling_points(self, params):
+        point_type, error = self._extract_point_type(params)
+        if error:
+            return error
+        return self._call_controller('clear_modeling_points', 'modeling points cleared', point_type)
 
     def _fallback_task_path(self, params):
         config_path = 'config.json'

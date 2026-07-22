@@ -11,6 +11,7 @@ from modeling_store import (
     ModelingStore,
 )
 from modeling_sampler import ModelingSampleError, inspect_sample_readiness
+from modeling_session import ModelingSession, ModelingSessionError
 
 
 def _ok(data=None, msg="ok"):
@@ -33,6 +34,8 @@ def _error(code, msg, status_code):
 
 
 def _handle_store_error(error):
+    if isinstance(error, ModelingSessionError):
+        return _error(error.code, error.message, 400)
     if isinstance(error, ModelingSampleError):
         return _error(error.code, error.message, 400)
     if isinstance(error, ModelingPreviewError):
@@ -57,6 +60,69 @@ def register_modeling_routes(app, storage_dir=None, store=None, sample_point_pro
                              task_execution_starter=None, task_progress_reader=None,
                              task_stop_handler=None):
     modeling_store = store or ModelingStore(storage_dir or "modeling_models")
+    modeling_session = ModelingSession(modeling_store, sample_point_provider)
+
+    @app.route("/modeling/session/start", methods=["POST"])
+    def modeling_session_start():
+        payload = request.get_json(silent=True) or {}
+        try:
+            return _ok(modeling_session.start(
+                name=payload.get("name"),
+                restart=bool(payload.get("restart", False)),
+            ))
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/current", methods=["GET"])
+    def modeling_session_current():
+        try:
+            return _ok(modeling_session.current())
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/path", methods=["GET"])
+    def modeling_session_path():
+        try:
+            return _ok(modeling_session.current_path())
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/record-area-point", methods=["POST"])
+    def modeling_session_record_area_point():
+        try:
+            return _ok(modeling_session.record_area_point())
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/record-link-point", methods=["POST"])
+    def modeling_session_record_link_point():
+        try:
+            return _ok(modeling_session.record_link_point())
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/undo", methods=["POST"])
+    def modeling_session_undo():
+        payload = request.get_json(silent=True) or {}
+        try:
+            return _ok(modeling_session.undo(payload.get("pointType")))
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/clear", methods=["POST"])
+    def modeling_session_clear():
+        payload = request.get_json(silent=True) or {}
+        try:
+            return _ok(modeling_session.clear(payload.get("pointType")))
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/finish", methods=["POST"])
+    def modeling_session_finish():
+        try:
+            return _ok(modeling_session.finish())
+        except Exception as error:
+            return _handle_store_error(error)
 
     @app.route("/modeling/models", methods=["GET"])
     def modeling_list_models():
