@@ -334,6 +334,7 @@ class ModelingSession(object):
                 "modelId": model_id,
                 "taskName": generated["taskPlan"].get("taskName") or saved.get("name") or "",
                 "updatedAt": saved.get("updatedAt"),
+                "taskPreview": saved.get("taskPreview"),
                 "taskPlan": generated["taskPlan"],
                 "session": self._summary(state, saved),
             }
@@ -349,5 +350,6 @@ class ModelingSession(object):
                 "modelId": draft.get("id") or state["modelId"],
                 "taskName": task_plan.get("taskName") or draft.get("name") or "",
                 "updatedAt": draft.get("updatedAt") or task_plan.get("generatedAt"),
+                "taskPreview": draft.get("taskPreview"),
                 "taskPlan": task_plan,
             }

@@ -50,12 +50,16 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(recorded[-1]["pointNo"], 4)
         self.assertEqual(recorded[-1]["session"]["areaPointCount"], 4)
         self.assertEqual(finished["session"]["status"], "ready")
+        self.assertEqual(finished["taskPreview"]["status"], "ready")
+        self.assertEqual(len(finished["taskPreview"]["groups"][0]["subAreas"][0]["polygon"]), 4)
         self.assertEqual(finished["taskPlan"]["status"], "ready")
         self.assertGreaterEqual(finished["taskPlan"]["summary"]["cleanTaskCount"], 1)
 
         reloaded = ModelingSession(store, None, now=lambda: 1001)
         self.assertEqual(reloaded.current()["modelId"], started["modelId"])
-        self.assertEqual(reloaded.current_path()["taskPlan"]["status"], "ready")
+        current_path = reloaded.current_path()
+        self.assertEqual(current_path["taskPreview"]["status"], "ready")
+        self.assertEqual(current_path["taskPlan"]["status"], "ready")
 
     def test_connection_clicks_keep_original_two_endpoint_rule_and_open_next_area(self):
         from modeling_session import ModelingSession
@@ -144,6 +148,14 @@ class ModelingSessionTest(unittest.TestCase):
             [group["subAreas"][0]["laneCount"] for group in draft["taskPreview"]["groups"]],
             [8, 4],
         )
+        self.assertEqual(
+            [
+                [point["id"] for point in group["subAreas"][0]["polygon"]]
+                for group in finished["taskPreview"]["groups"]
+            ],
+            [["p1", "p2", "p9", "p10"], ["p5", "p6", "p7", "p8"]],
+        )
+        self.assertEqual(len(finished["taskPreview"]["groupLinks"]), 1)
         task_plan = finished["taskPlan"]
         self.assertEqual(task_plan["routeType"], "bridge_round_trip")
         self.assertEqual(task_plan["summary"]["cleanTaskCount"], 12)

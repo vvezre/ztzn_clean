@@ -337,6 +337,7 @@ class VehicleControllerAdapter(object):
                 'modelId': draft.get('id') or str(model_id),
                 'taskName': task_plan.get('taskName') or draft.get('name') or '',
                 'updatedAt': draft.get('updatedAt') or task_plan.get('generatedAt'),
+                'taskPreview': draft.get('taskPreview'),
                 'taskPlan': task_plan,
             },
         }

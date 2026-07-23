@@ -102,6 +102,21 @@ class _StubAdapter(object):
                     "taskName": "area-a",
                     "tasks": [{"startX": 0, "startY": 0, "endX": 100, "endY": 0}],
                 },
+                "taskPreview": {
+                    "status": "ready",
+                    "groups": [{
+                        "areaNumber": 1,
+                        "subAreas": [{
+                            "polygon": [
+                                {"id": "p1", "x": 0, "y": 0},
+                                {"id": "p2", "x": 100, "y": 0},
+                                {"id": "p3", "x": 100, "y": 100},
+                                {"id": "p4", "x": 0, "y": 100},
+                            ],
+                        }],
+                    }],
+                    "groupLinks": [],
+                },
             },
         }
 
@@ -183,6 +198,11 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/draft/model-1")
         self.assertEqual(result["data"]["taskPlan"]["status"], "ready")
         self.assertIn("tasks", result["data"]["taskPlan"])
+        self.assertEqual(result["data"]["taskPreview"]["status"], "ready")
+        self.assertEqual(
+            len(result["data"]["taskPreview"]["groups"][0]["subAreas"][0]["polygon"]),
+            4,
+        )
 
     def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler
