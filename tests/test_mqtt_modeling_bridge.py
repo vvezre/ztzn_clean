@@ -18,6 +18,30 @@ class _FakeController(object):
             },
         }
 
+    def get_modeling_points(self, model_id=None):
+        self.model_id = model_id
+        return {
+            "success": True,
+            "message": "modeling points fetched",
+            "data": {
+                "modelId": model_id or "active-model",
+                "areaPointCount": 1,
+                "linkPointCount": 1,
+                "groups": [{
+                    "groupId": "group-1",
+                    "points": [{"id": "p1", "sequence": 1}],
+                }],
+                "groupLinks": [{
+                    "linkId": "link-1",
+                    "points": [{"id": "p2", "sequence": 1}],
+                }],
+                "captureSequence": [
+                    {"sequence": 1, "pointType": "area", "pointId": "p1"},
+                    {"sequence": 2, "pointType": "link", "pointId": "p2"},
+                ],
+            },
+        }
+
     def sample_modeling_point(self, model_id=None, group_id=None):
         self.model_id = model_id
         self.group_id = group_id
@@ -79,6 +103,14 @@ class _StubAdapter(object):
     def _call(self, path, params=None, json_data=None):
         self.path = path
         self.json_data = json_data
+        if path == "/modeling/session/current":
+            return {
+                "success": True,
+                "data": {
+                    "status": "recording",
+                    "modelId": "model-1",
+                },
+            }
         if path.endswith("/sample-point"):
             return {
                 "success": True,
@@ -97,6 +129,37 @@ class _StubAdapter(object):
                 "id": "model-1",
                 "name": "area-a",
                 "updatedAt": 123,
+                "captureSequence": [
+                    {"sequence": 1, "pointType": "area", "pointId": "p1"},
+                    {"sequence": 2, "pointType": "link", "pointId": "lp1"},
+                ],
+                "groups": [{
+                    "id": "group-1",
+                    "areaNumber": 1,
+                    "name": "area-1",
+                    "points": [{
+                        "id": "p1",
+                        "sequence": 1,
+                        "lat": 32.0364,
+                        "lon": 118.1234,
+                        "x": 0,
+                        "y": 0,
+                    }],
+                }],
+                "groupLinks": [{
+                    "id": "link-1",
+                    "startGroupId": "group-1",
+                    "endGroupId": "group-2",
+                    "status": "draft",
+                    "points": [{
+                        "id": "lp1",
+                        "sequence": 1,
+                        "lat": 32.0365,
+                        "lon": 118.1235,
+                        "x": 0,
+                        "y": 100,
+                    }],
+                }],
                 "taskPlan": {
                     "status": "ready",
                     "taskName": "area-a",
@@ -203,6 +266,52 @@ class MqttModelingBridgeTest(unittest.TestCase):
             len(result["data"]["taskPreview"]["groups"][0]["subAreas"][0]["polygon"]),
             4,
         )
+
+    def test_handler_routes_get_modeling_points_to_existing_adapter(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        controller = _FakeController()
+        result = MQTTCommandHandler(controller).handle({
+            "command": "get_modeling_points",
+            "params": {"modelId": "model-1"},
+        })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(controller.model_id, "model-1")
+        self.assertEqual(result["data"]["areaPointCount"], 1)
+        self.assertEqual(result["data"]["linkPointCount"], 1)
+
+        invalid = MQTTCommandHandler(controller).handle({
+            "command": "get_modeling_points",
+            "params": {"modelId": "../bad"},
+        })
+        self.assertFalse(invalid["success"])
+
+    def test_adapter_returns_all_area_and_link_points_from_existing_draft(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.get_modeling_points(adapter, "model-1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/draft/model-1")
+        self.assertEqual(result["data"]["groups"][0]["groupId"], "group-1")
+        self.assertEqual(result["data"]["groups"][0]["points"][0]["id"], "p1")
+        self.assertEqual(result["data"]["groupLinks"][0]["linkId"], "link-1")
+        self.assertEqual(result["data"]["groupLinks"][0]["points"][0]["id"], "lp1")
+        self.assertEqual(result["data"]["areaPointCount"], 1)
+        self.assertEqual(result["data"]["linkPointCount"], 1)
+        self.assertEqual(len(result["data"]["captureSequence"]), 2)
+
+    def test_adapter_uses_current_modeling_session_when_model_id_is_missing(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.get_modeling_points(adapter)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/draft/model-1")
+        self.assertEqual(result["data"]["modelId"], "model-1")
 
     def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler

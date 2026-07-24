@@ -36,6 +36,8 @@ class MQTTCommandHandler(object):
             'get_task_path': self._handle_get_task_path,
             'getModelingPath': self._handle_get_modeling_path,
             'get_modeling_path': self._handle_get_modeling_path,
+            'getModelingPoints': self._handle_get_modeling_points,
+            'get_modeling_points': self._handle_get_modeling_points,
             'sampleModelingPoint': self._handle_sample_modeling_point,
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sampleModelingLinkPoint': self._handle_sample_modeling_link_point,
@@ -79,6 +81,7 @@ class MQTTCommandHandler(object):
             'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
             'get_modeling_path': self._handle_get_modeling_path,
+            'get_modeling_points': self._handle_get_modeling_points,
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
             'start_modeling': self._handle_start_modeling,
@@ -331,6 +334,25 @@ class MQTTCommandHandler(object):
         except Exception as exc:
             logger.error("Fetch modeling path failed: {}".format(exc), exc_info=True)
             return {'success': False, 'message': 'modeling path fetch failed: {}'.format(exc)}
+
+    def _handle_get_modeling_points(self, params):
+        model_id = self._extract_model_id(params)
+        try:
+            if not model_id:
+                return self._call_controller(
+                    'get_modeling_points',
+                    'modeling points fetched',
+                )
+            if re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+                return {'success': False, 'message': 'valid modelId is required when provided'}
+            return self._call_controller(
+                'get_modeling_points',
+                'modeling points fetched',
+                model_id,
+            )
+        except Exception as exc:
+            logger.error("Fetch modeling points failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': 'modeling points fetch failed: {}'.format(exc)}
 
     def _handle_start_modeling(self, params):
         name = str(params.get('name') or '').strip() if isinstance(params, dict) else ''

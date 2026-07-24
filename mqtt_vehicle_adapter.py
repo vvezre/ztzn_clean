@@ -303,6 +303,90 @@ class VehicleControllerAdapter(object):
             },
         }
 
+    def get_modeling_points(self, model_id=None):
+        if model_id is None:
+            current_response = self._call('/modeling/session/current')
+            if not isinstance(current_response, dict):
+                return {
+                    'success': False,
+                    'message': 'modeling state response is invalid',
+                }
+            if current_response.get('success') is False:
+                return {
+                    'success': False,
+                    'message': current_response.get('msg') or current_response.get('message') or 'modeling state fetch failed',
+                }
+            current_data = current_response.get('data') or {}
+            model_id = current_data.get('modelId') if isinstance(current_data, dict) else None
+            if not model_id:
+                return {
+                    'success': False,
+                    'message': 'modeling session is not active',
+                }
+
+        encoded_model_id = quote(str(model_id), safe='')
+        response = self._call('/modeling/draft/{}'.format(encoded_model_id))
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': 'modeling draft response is invalid',
+            }
+        if response.get('success') is False:
+            return {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or 'modeling points fetch failed',
+            }
+
+        draft = response.get('data') or {}
+        if not isinstance(draft, dict):
+            return {
+                'success': False,
+                'message': 'modeling draft data is invalid',
+            }
+
+        groups = []
+        area_point_count = 0
+        for group in draft.get('groups') or []:
+            if not isinstance(group, dict):
+                continue
+            points = list(group.get('points') or [])
+            area_point_count += len(points)
+            groups.append({
+                'groupId': group.get('id'),
+                'areaNumber': group.get('areaNumber'),
+                'name': group.get('name') or '',
+                'points': points,
+            })
+
+        group_links = []
+        link_point_count = 0
+        for link in draft.get('groupLinks') or []:
+            if not isinstance(link, dict):
+                continue
+            points = list(link.get('points') or [])
+            link_point_count += len(points)
+            group_links.append({
+                'linkId': link.get('id'),
+                'startGroupId': link.get('startGroupId'),
+                'endGroupId': link.get('endGroupId'),
+                'status': link.get('status'),
+                'points': points,
+            })
+
+        return {
+            'success': True,
+            'message': 'modeling points fetched',
+            'data': {
+                'modelId': draft.get('id') or str(model_id),
+                'updatedAt': draft.get('updatedAt'),
+                'areaPointCount': area_point_count,
+                'linkPointCount': link_point_count,
+                'groups': groups,
+                'groupLinks': group_links,
+                'captureSequence': list(draft.get('captureSequence') or []),
+            },
+        }
+
     def get_modeling_path(self, model_id=None):
         if model_id is None:
             return self._normalize_modeling_response(

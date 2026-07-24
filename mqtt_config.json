@@ -48,6 +48,7 @@
       "undo_modeling_point",
       "clear_modeling_points",
       "get_modeling_path",
+      "get_modeling_points",
       "sample_modeling_point",
       "sample_modeling_link_point"
     ],
