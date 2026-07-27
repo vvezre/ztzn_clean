@@ -23,7 +23,7 @@ def _float_or_none(value):
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(number):
+    if math.isnan(number) or math.isinf(number):
         return None
     return number
 

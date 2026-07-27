@@ -46,9 +46,12 @@ class ModelingSession(object):
         state["version"] = SESSION_SCHEMA_VERSION
         state["updatedAt"] = self._timestamp()
         temporary_path = self._state_path + ".tmp"
+        serialized = json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True)
+        if not isinstance(serialized, type(u"")):
+            serialized = serialized.decode("utf-8")
         with io.open(temporary_path, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(temporary_path, self._state_path)
+            handle.write(serialized)
+        getattr(os, "replace", os.rename)(temporary_path, self._state_path)
         return state
 
     def _require_state(self, allow_ready=False):

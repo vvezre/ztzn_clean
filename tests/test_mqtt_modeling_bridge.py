@@ -24,21 +24,15 @@ class _FakeController(object):
             "success": True,
             "message": "modeling points fetched",
             "data": {
-                "modelId": model_id or "active-model",
-                "areaPointCount": 1,
-                "linkPointCount": 1,
-                "groups": [{
-                    "groupId": "group-1",
-                    "points": [{"id": "p1", "sequence": 1}],
+                "points": [{
+                    "id": "p1",
+                    "name": "区域点1",
+                    "sequence": 1,
+                    "x": 0,
+                    "y": 0,
+                    "lat": 32.0364,
+                    "lon": 118.1234,
                 }],
-                "groupLinks": [{
-                    "linkId": "link-1",
-                    "points": [{"id": "p2", "sequence": 1}],
-                }],
-                "captureSequence": [
-                    {"sequence": 1, "pointType": "area", "pointId": "p1"},
-                    {"sequence": 2, "pointType": "link", "pointId": "p2"},
-                ],
             },
         }
 
@@ -132,6 +126,7 @@ class _StubAdapter(object):
                 "captureSequence": [
                     {"sequence": 1, "pointType": "area", "pointId": "p1"},
                     {"sequence": 2, "pointType": "link", "pointId": "lp1"},
+                    {"sequence": 3, "pointType": "area", "pointId": "p2"},
                 ],
                 "groups": [{
                     "id": "group-1",
@@ -144,6 +139,18 @@ class _StubAdapter(object):
                         "lon": 118.1234,
                         "x": 0,
                         "y": 0,
+                    }],
+                }, {
+                    "id": "group-2",
+                    "areaNumber": 2,
+                    "name": "area-2",
+                    "points": [{
+                        "id": "p2",
+                        "sequence": 1,
+                        "lat": 32.0366,
+                        "lon": 118.1236,
+                        "x": 200,
+                        "y": 100,
                     }],
                 }],
                 "groupLinks": [{
@@ -278,8 +285,8 @@ class MqttModelingBridgeTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(controller.model_id, "model-1")
-        self.assertEqual(result["data"]["areaPointCount"], 1)
-        self.assertEqual(result["data"]["linkPointCount"], 1)
+        self.assertEqual(len(result["data"]["points"]), 1)
+        self.assertEqual(result["data"]["points"][0]["id"], "p1")
 
         invalid = MQTTCommandHandler(controller).handle({
             "command": "get_modeling_points",
@@ -287,7 +294,7 @@ class MqttModelingBridgeTest(unittest.TestCase):
         })
         self.assertFalse(invalid["success"])
 
-    def test_adapter_returns_all_area_and_link_points_from_existing_draft(self):
+    def test_adapter_returns_flat_frontend_area_point_list(self):
         from mqtt_vehicle_adapter import VehicleControllerAdapter
 
         adapter = _StubAdapter()
@@ -295,13 +302,21 @@ class MqttModelingBridgeTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(adapter.path, "/modeling/draft/model-1")
-        self.assertEqual(result["data"]["groups"][0]["groupId"], "group-1")
-        self.assertEqual(result["data"]["groups"][0]["points"][0]["id"], "p1")
-        self.assertEqual(result["data"]["groupLinks"][0]["linkId"], "link-1")
-        self.assertEqual(result["data"]["groupLinks"][0]["points"][0]["id"], "lp1")
-        self.assertEqual(result["data"]["areaPointCount"], 1)
-        self.assertEqual(result["data"]["linkPointCount"], 1)
-        self.assertEqual(len(result["data"]["captureSequence"]), 2)
+        self.assertEqual(
+            [point["id"] for point in result["data"]["points"]],
+            ["p1", "p2"],
+        )
+        self.assertEqual(
+            [point["name"] for point in result["data"]["points"]],
+            ["区域点1", "区域点2"],
+        )
+        self.assertEqual(
+            [point["sequence"] for point in result["data"]["points"]],
+            [1, 2],
+        )
+        self.assertEqual(result["data"]["points"][1]["x"], 200)
+        self.assertNotIn("groups", result["data"])
+        self.assertNotIn("groupLinks", result["data"])
 
     def test_adapter_uses_current_modeling_session_when_model_id_is_missing(self):
         from mqtt_vehicle_adapter import VehicleControllerAdapter
@@ -311,7 +326,7 @@ class MqttModelingBridgeTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(adapter.path, "/modeling/draft/model-1")
-        self.assertEqual(result["data"]["modelId"], "model-1")
+        self.assertEqual(len(result["data"]["points"]), 2)
 
     def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler

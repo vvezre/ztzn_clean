@@ -18,6 +18,9 @@ class MQTTCommandHandler(object):
             'joystickMove': self._handle_joystick_move,
             'autoDrive': self._handle_auto_drive,
             'goOn': self._handle_go_on,
+            'resumeAfterBatterySwap': self._handle_resume_after_battery_swap,
+            'getBatterySwapStatus': self._handle_get_battery_swap_status,
+            'clearBatterySwapCheckpoint': self._handle_clear_battery_swap_checkpoint,
             'returnToPoint': self._handle_return_to_point,
             'enterGarage': self._handle_enter_garage,
             'exitGarage': self._handle_exit_garage,
@@ -66,6 +69,9 @@ class MQTTCommandHandler(object):
             'joystick_move': self._handle_joystick_move,
             'auto_drive': self._handle_auto_drive,
             'go_on': self._handle_go_on,
+            'resume_after_battery_swap': self._handle_resume_after_battery_swap,
+            'get_battery_swap_status': self._handle_get_battery_swap_status,
+            'clear_battery_swap_checkpoint': self._handle_clear_battery_swap_checkpoint,
             'return_to_point': self._handle_return_to_point,
             'enter_garage': self._handle_enter_garage,
             'exit_garage': self._handle_exit_garage,
@@ -204,6 +210,15 @@ class MQTTCommandHandler(object):
 
     def _handle_go_on(self, params):
         return self._call_controller('go_on', '继续清扫命令已执行')
+
+    def _handle_resume_after_battery_swap(self, params):
+        return self._call_controller('resume_after_battery_swap', 'resume after battery swap command executed')
+
+    def _handle_get_battery_swap_status(self, params):
+        return self._call_controller('get_battery_swap_status', 'battery swap status fetched')
+
+    def _handle_clear_battery_swap_checkpoint(self, params):
+        return self._call_controller('clear_battery_swap_checkpoint', 'battery swap checkpoint cleared')
 
     def _handle_return_to_point(self, params):
         return self._call_controller('return_to_point', '返回原点命令已执行')

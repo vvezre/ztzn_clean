@@ -17,6 +17,54 @@ except ImportError:
 from AppLogger import logger
 
 
+def _frontend_area_points(draft):
+    """Build the flat area-point list expected by the mini-program."""
+    points_by_id = {}
+    fallback_point_ids = []
+
+    for group in draft.get('groups') or []:
+        if not isinstance(group, dict):
+            continue
+        for point in group.get('points') or []:
+            if not isinstance(point, dict):
+                continue
+            point_id = point.get('id')
+            if not point_id or point_id in points_by_id:
+                continue
+            points_by_id[point_id] = point
+            fallback_point_ids.append(point_id)
+
+    ordered_point_ids = []
+    seen_point_ids = set()
+    for event in draft.get('captureSequence') or []:
+        if not isinstance(event, dict) or event.get('pointType') != 'area':
+            continue
+        point_id = event.get('pointId')
+        if point_id not in points_by_id or point_id in seen_point_ids:
+            continue
+        ordered_point_ids.append(point_id)
+        seen_point_ids.add(point_id)
+
+    for point_id in fallback_point_ids:
+        if point_id not in seen_point_ids:
+            ordered_point_ids.append(point_id)
+            seen_point_ids.add(point_id)
+
+    result = []
+    for sequence, point_id in enumerate(ordered_point_ids, start=1):
+        point = points_by_id[point_id]
+        result.append({
+            'id': point_id,
+            'name': u'\u533a\u57df\u70b9{}'.format(sequence),
+            'sequence': sequence,
+            'x': point.get('x'),
+            'y': point.get('y'),
+            'lat': point.get('lat'),
+            'lon': point.get('lon'),
+        })
+    return result
+
+
 class VehicleControllerAdapter(object):
     def __init__(self, base_url=None, timeout=10):
         self.base_url = (base_url or os.environ.get('CLEANER_HTTP_BASE_URL') or 'http://127.0.0.1:7899').rstrip('/')
@@ -99,6 +147,15 @@ class VehicleControllerAdapter(object):
 
     def go_on(self):
         return self._call('/vehicle/goOn')
+
+    def resume_after_battery_swap(self):
+        return self._call('/vehicle/resumeAfterBatterySwap')
+
+    def get_battery_swap_status(self):
+        return self._call('/vehicle/getBatterySwapStatus')
+
+    def clear_battery_swap_checkpoint(self):
+        return self._call('/vehicle/clearBatterySwapCheckpoint')
 
     def return_to_point(self):
         return self._call('/vehicle/returnToPoint')
@@ -344,46 +401,11 @@ class VehicleControllerAdapter(object):
                 'message': 'modeling draft data is invalid',
             }
 
-        groups = []
-        area_point_count = 0
-        for group in draft.get('groups') or []:
-            if not isinstance(group, dict):
-                continue
-            points = list(group.get('points') or [])
-            area_point_count += len(points)
-            groups.append({
-                'groupId': group.get('id'),
-                'areaNumber': group.get('areaNumber'),
-                'name': group.get('name') or '',
-                'points': points,
-            })
-
-        group_links = []
-        link_point_count = 0
-        for link in draft.get('groupLinks') or []:
-            if not isinstance(link, dict):
-                continue
-            points = list(link.get('points') or [])
-            link_point_count += len(points)
-            group_links.append({
-                'linkId': link.get('id'),
-                'startGroupId': link.get('startGroupId'),
-                'endGroupId': link.get('endGroupId'),
-                'status': link.get('status'),
-                'points': points,
-            })
-
         return {
             'success': True,
             'message': 'modeling points fetched',
             'data': {
-                'modelId': draft.get('id') or str(model_id),
-                'updatedAt': draft.get('updatedAt'),
-                'areaPointCount': area_point_count,
-                'linkPointCount': link_point_count,
-                'groups': groups,
-                'groupLinks': group_links,
-                'captureSequence': list(draft.get('captureSequence') or []),
+                'points': _frontend_area_points(draft),
             },
         }
 

@@ -1,4 +1,5 @@
 # coding=utf-8
+import io
 import json
 import os
 import re
@@ -12,6 +13,21 @@ from modeling_task_generator import generate_task_plan
 
 MODEL_SCHEMA_VERSION = 1
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+try:
+    text_type = unicode
+    binary_type = str
+except NameError:
+    text_type = str
+    binary_type = bytes
+
+
+def _text(value):
+    if isinstance(value, text_type):
+        return value
+    if isinstance(value, binary_type):
+        return value.decode("utf-8")
+    return text_type(value)
 
 
 class ModelingStoreError(Exception):
@@ -61,14 +77,17 @@ class ModelingStore(object):
     def _read_json(self, path):
         if not os.path.exists(path):
             raise ModelNotFoundError("model not found")
-        with open(path, "r", encoding="utf-8") as handle:
+        with io.open(path, "r", encoding="utf-8") as handle:
             return json.load(handle)
 
     def _write_json(self, path, payload):
         tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp_path, path)
+        serialized = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
+        if not isinstance(serialized, type(u"")):
+            serialized = serialized.decode("utf-8")
+        with io.open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+        getattr(os, "replace", os.rename)(tmp_path, path)
 
     def _new_model_id(self):
         return uuid.uuid4().hex[:12]
@@ -112,7 +131,7 @@ class ModelingStore(object):
         normalized = dict(payload)
         normalized["id"] = self._validate_model_id(group_id or normalized.get("id") or self._new_group_id())
         normalized["areaNumber"] = int(normalized.get("areaNumber") or area_number or 1)
-        normalized["name"] = str(normalized.get("name") or "区域组{}".format(normalized["areaNumber"]))
+        normalized["name"] = _text(normalized.get("name") or "区域组{}".format(normalized["areaNumber"]))
         direction = str(normalized.get("sweepDirection") or "auto")
         if direction not in ("auto", "manual"):
             raise InvalidModelPayloadError("invalid sweep direction")
@@ -152,7 +171,7 @@ class ModelingStore(object):
         current_time = self._timestamp(now)
         normalized = dict(payload)
         normalized["id"] = self._validate_model_id(model_id or normalized.get("id") or self._new_model_id())
-        normalized["name"] = str(normalized.get("name") or "untitled-model")
+        normalized["name"] = _text(normalized.get("name") or "untitled-model")
         normalized["version"] = int(normalized.get("version") or MODEL_SCHEMA_VERSION)
         normalized["status"] = status or str(normalized.get("status") or "draft")
         normalized["createdAt"] = int(normalized.get("createdAt") or current_time)
@@ -332,7 +351,7 @@ class ModelingStore(object):
         link = {
             "id": self._validate_model_id(payload.get("id") or self._new_group_link_id()),
             "type": "group_connector",
-            "name": str(payload.get("name") or "{} -> {}".format(start_group.get("name"), end_group.get("name"))),
+            "name": _text(payload.get("name") or u"{} -> {}".format(start_group.get("name"), end_group.get("name"))),
             "startGroupId": start_group_id,
             "endGroupId": end_group_id,
             "points": [],

@@ -15,7 +15,7 @@ def _number(value):
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if math.isfinite(number) else None
+    return number if not math.isnan(number) and not math.isinf(number) else None
 
 
 def _lat_lon_to_xy_cm(origin_lat, origin_lon, lat, lon):

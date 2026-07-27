@@ -20,7 +20,7 @@ def _number(value):
         result = float(value)
     except (TypeError, ValueError):
         return None
-    return result if math.isfinite(result) else None
+    return result if not math.isnan(result) and not math.isinf(result) else None
 
 
 def _local_xy(point, origin):
