@@ -113,6 +113,32 @@ def _frontend_link_points(draft):
     return result
 
 
+def _frontend_path_points(task_plan):
+    """Build ordered route points from the robot's executable task segments."""
+    result = []
+    for task in task_plan.get('tasks') or []:
+        if not isinstance(task, dict):
+            continue
+        for prefix in ('start', 'end'):
+            x = task.get(prefix + 'X')
+            y = task.get(prefix + 'Y')
+            if x is None or y is None:
+                continue
+            if result and result[-1].get('x') == x and result[-1].get('y') == y:
+                continue
+            sequence = len(result) + 1
+            result.append({
+                'id': 'p{}'.format(sequence),
+                'name': u'\u8def\u5f84\u70b9{}'.format(sequence),
+                'sequence': sequence,
+                'x': x,
+                'y': y,
+                'lat': task.get(prefix + 'Lat'),
+                'lon': task.get(prefix + 'Lon'),
+            })
+    return result
+
+
 class VehicleControllerAdapter(object):
     def __init__(self, base_url=None, timeout=10):
         self.base_url = (base_url or os.environ.get('CLEANER_HTTP_BASE_URL') or 'http://127.0.0.1:7899').rstrip('/')
@@ -569,5 +595,57 @@ class VehicleControllerAdapter(object):
                 'updatedAt': draft.get('updatedAt') or task_plan.get('generatedAt'),
                 'taskPreview': draft.get('taskPreview'),
                 'taskPlan': task_plan,
+            },
+        }
+
+    def get_modeling_result(self, model_id=None):
+        if model_id is None:
+            current_response = self._call('/modeling/session/current')
+            if not isinstance(current_response, dict):
+                return {
+                    'success': False,
+                    'message': 'modeling state response is invalid',
+                }
+            if current_response.get('success') is False:
+                return {
+                    'success': False,
+                    'message': current_response.get('msg') or current_response.get('message') or 'modeling state fetch failed',
+                }
+            current_data = current_response.get('data') or {}
+            model_id = current_data.get('modelId') if isinstance(current_data, dict) else None
+            if not model_id:
+                return {
+                    'success': False,
+                    'message': 'modeling session is not active',
+                }
+
+        encoded_model_id = quote(str(model_id), safe='')
+        response = self._call('/modeling/draft/{}'.format(encoded_model_id))
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': 'modeling draft response is invalid',
+            }
+        if response.get('success') is False:
+            return {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or 'modeling result fetch failed',
+            }
+
+        draft = response.get('data') or {}
+        task_plan = draft.get('taskPlan') if isinstance(draft, dict) else None
+        if not isinstance(task_plan, dict) or task_plan.get('status') != 'ready':
+            return {
+                'success': False,
+                'message': 'modeling task plan is not ready',
+            }
+
+        return {
+            'success': True,
+            'message': 'modeling result fetched',
+            'data': {
+                'areaPoints': _frontend_area_points(draft),
+                'linkPoints': _frontend_link_points(draft),
+                'pathPoints': _frontend_path_points(task_plan),
             },
         }

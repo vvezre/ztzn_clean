@@ -54,6 +54,18 @@ class _FakeController(object):
             },
         }
 
+    def get_modeling_result(self, model_id=None):
+        self.model_id = model_id
+        return {
+            "success": True,
+            "message": "modeling result fetched",
+            "data": {
+                "areaPoints": [{"id": "p1"}],
+                "linkPoints": [{"id": "lp1"}],
+                "pathPoints": [{"id": "p1"}, {"id": "p2"}],
+            },
+        }
+
     def sample_modeling_point(self, model_id=None, group_id=None):
         self.model_id = model_id
         self.group_id = group_id
@@ -441,6 +453,35 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/session/delete-area-point")
         self.assertEqual(adapter.json_data, {"id": "p1"})
         self.assertEqual(deleted["data"]["id"], "p1")
+
+    def test_handler_and_adapter_return_combined_modeling_result(self):
+        from mqtt_handler import MQTTCommandHandler
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        controller = _FakeController()
+        handled = MQTTCommandHandler(controller).handle({
+            "command": "get_modeling_result",
+            "params": {"modelId": "model-1"},
+        })
+        invalid = MQTTCommandHandler(controller).handle({
+            "command": "get_modeling_result",
+            "params": {"modelId": "../bad"},
+        })
+        adapter = _StubAdapter()
+        combined = VehicleControllerAdapter.get_modeling_result(adapter, "model-1")
+
+        self.assertTrue(handled["success"])
+        self.assertIn("areaPoints", handled["data"])
+        self.assertIn("linkPoints", handled["data"])
+        self.assertIn("pathPoints", handled["data"])
+        self.assertFalse(invalid["success"])
+        self.assertTrue(combined["success"])
+        self.assertEqual(adapter.path, "/modeling/draft/model-1")
+        self.assertEqual(
+            [point["id"] for point in combined["data"]["pathPoints"]],
+            ["p1", "p2"],
+        )
+        self.assertEqual(combined["data"]["pathPoints"][1]["x"], 100)
 
     def test_handler_and_adapter_delete_requested_link_point_by_id(self):
         from mqtt_handler import MQTTCommandHandler
