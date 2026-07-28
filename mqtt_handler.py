@@ -41,6 +41,8 @@ class MQTTCommandHandler(object):
             'get_modeling_path': self._handle_get_modeling_path,
             'getModelingPoints': self._handle_get_modeling_points,
             'get_modeling_points': self._handle_get_modeling_points,
+            'getModelingLinkPoints': self._handle_get_modeling_link_points,
+            'get_modeling_link_points': self._handle_get_modeling_link_points,
             'sampleModelingPoint': self._handle_sample_modeling_point,
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sampleModelingLinkPoint': self._handle_sample_modeling_link_point,
@@ -53,6 +55,8 @@ class MQTTCommandHandler(object):
             'get_modeling_state': self._handle_get_modeling_state,
             'undoModelingPoint': self._handle_undo_modeling_point,
             'undo_modeling_point': self._handle_undo_modeling_point,
+            'deleteModelingPoint': self._handle_delete_modeling_point,
+            'delete_modeling_point': self._handle_delete_modeling_point,
             'clearModelingPoints': self._handle_clear_modeling_points,
             'clear_modeling_points': self._handle_clear_modeling_points,
         })
@@ -88,12 +92,14 @@ class MQTTCommandHandler(object):
             'get_status': self._handle_get_status,
             'get_modeling_path': self._handle_get_modeling_path,
             'get_modeling_points': self._handle_get_modeling_points,
+            'get_modeling_link_points': self._handle_get_modeling_link_points,
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
             'start_modeling': self._handle_start_modeling,
             'finish_modeling': self._handle_finish_modeling,
             'get_modeling_state': self._handle_get_modeling_state,
             'undo_modeling_point': self._handle_undo_modeling_point,
+            'delete_modeling_point': self._handle_delete_modeling_point,
             'clear_modeling_points': self._handle_clear_modeling_points,
         }
 
@@ -369,6 +375,25 @@ class MQTTCommandHandler(object):
             logger.error("Fetch modeling points failed: {}".format(exc), exc_info=True)
             return {'success': False, 'message': 'modeling points fetch failed: {}'.format(exc)}
 
+    def _handle_get_modeling_link_points(self, params):
+        model_id = self._extract_model_id(params)
+        try:
+            if not model_id:
+                return self._call_controller(
+                    'get_modeling_link_points',
+                    'modeling link points fetched',
+                )
+            if re.match(r'^[A-Za-z0-9_-]+$', model_id) is None:
+                return {'success': False, 'message': 'valid modelId is required when provided'}
+            return self._call_controller(
+                'get_modeling_link_points',
+                'modeling link points fetched',
+                model_id,
+            )
+        except Exception as exc:
+            logger.error("Fetch modeling link points failed: {}".format(exc), exc_info=True)
+            return {'success': False, 'message': 'modeling link points fetch failed: {}'.format(exc)}
+
     def _handle_start_modeling(self, params):
         name = str(params.get('name') or '').strip() if isinstance(params, dict) else ''
         restart = bool(params.get('restart', False)) if isinstance(params, dict) else False
@@ -391,6 +416,16 @@ class MQTTCommandHandler(object):
         if error:
             return error
         return self._call_controller('undo_modeling_point', 'modeling point undone', point_type)
+
+    def _handle_delete_modeling_point(self, params):
+        point_id = str(params.get('id') or '').strip() if isinstance(params, dict) else ''
+        if not point_id or re.match(r'^[A-Za-z0-9_-]+$', point_id) is None:
+            return {'success': False, 'message': 'valid point id is required'}
+        return self._call_controller(
+            'delete_modeling_point',
+            'modeling point deleted',
+            point_id,
+        )
 
     def _handle_clear_modeling_points(self, params):
         point_type, error = self._extract_point_type(params)

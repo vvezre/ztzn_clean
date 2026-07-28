@@ -65,6 +65,54 @@ def _frontend_area_points(draft):
     return result
 
 
+def _frontend_link_points(draft):
+    """Build the flat connection-point list expected by the mini-program."""
+    points_by_id = {}
+    fallback_point_ids = []
+
+    for link in draft.get('groupLinks') or []:
+        if not isinstance(link, dict):
+            continue
+        for point in link.get('points') or []:
+            if not isinstance(point, dict):
+                continue
+            point_id = point.get('id')
+            if not point_id or point_id in points_by_id:
+                continue
+            points_by_id[point_id] = point
+            fallback_point_ids.append(point_id)
+
+    ordered_point_ids = []
+    seen_point_ids = set()
+    for event in draft.get('captureSequence') or []:
+        if not isinstance(event, dict) or event.get('pointType') != 'link':
+            continue
+        point_id = event.get('pointId')
+        if point_id not in points_by_id or point_id in seen_point_ids:
+            continue
+        ordered_point_ids.append(point_id)
+        seen_point_ids.add(point_id)
+
+    for point_id in fallback_point_ids:
+        if point_id not in seen_point_ids:
+            ordered_point_ids.append(point_id)
+            seen_point_ids.add(point_id)
+
+    result = []
+    for sequence, point_id in enumerate(ordered_point_ids, start=1):
+        point = points_by_id[point_id]
+        result.append({
+            'id': point_id,
+            'name': u'\u8fde\u63a5\u70b9{}'.format(sequence),
+            'sequence': sequence,
+            'x': point.get('x'),
+            'y': point.get('y'),
+            'lat': point.get('lat'),
+            'lon': point.get('lon'),
+        })
+    return result
+
+
 class VehicleControllerAdapter(object):
     def __init__(self, base_url=None, timeout=10):
         self.base_url = (base_url or os.environ.get('CLEANER_HTTP_BASE_URL') or 'http://127.0.0.1:7899').rstrip('/')
@@ -251,6 +299,15 @@ class VehicleControllerAdapter(object):
             'modeling point undone',
         )
 
+    def delete_modeling_point(self, point_id):
+        return self._normalize_modeling_response(
+            self._call(
+                '/modeling/session/delete-area-point',
+                json_data={'id': str(point_id)},
+            ),
+            'modeling point deleted',
+        )
+
     def clear_modeling_points(self, point_type=None):
         payload = {}
         if point_type:
@@ -406,6 +463,55 @@ class VehicleControllerAdapter(object):
             'message': 'modeling points fetched',
             'data': {
                 'points': _frontend_area_points(draft),
+            },
+        }
+
+    def get_modeling_link_points(self, model_id=None):
+        if model_id is None:
+            current_response = self._call('/modeling/session/current')
+            if not isinstance(current_response, dict):
+                return {
+                    'success': False,
+                    'message': 'modeling state response is invalid',
+                }
+            if current_response.get('success') is False:
+                return {
+                    'success': False,
+                    'message': current_response.get('msg') or current_response.get('message') or 'modeling state fetch failed',
+                }
+            current_data = current_response.get('data') or {}
+            model_id = current_data.get('modelId') if isinstance(current_data, dict) else None
+            if not model_id:
+                return {
+                    'success': False,
+                    'message': 'modeling session is not active',
+                }
+
+        encoded_model_id = quote(str(model_id), safe='')
+        response = self._call('/modeling/draft/{}'.format(encoded_model_id))
+        if not isinstance(response, dict):
+            return {
+                'success': False,
+                'message': 'modeling draft response is invalid',
+            }
+        if response.get('success') is False:
+            return {
+                'success': False,
+                'message': response.get('msg') or response.get('message') or 'modeling link points fetch failed',
+            }
+
+        draft = response.get('data') or {}
+        if not isinstance(draft, dict):
+            return {
+                'success': False,
+                'message': 'modeling draft data is invalid',
+            }
+
+        return {
+            'success': True,
+            'message': 'modeling link points fetched',
+            'data': {
+                'points': _frontend_link_points(draft),
             },
         }
 

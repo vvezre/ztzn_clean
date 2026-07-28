@@ -246,6 +246,43 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(cleared_link["session"]["linkPointCount"], 0)
         self.assertEqual(cleared_area["session"]["areaPointCount"], 0)
 
+    def test_delete_area_point_by_id_removes_requested_point_and_resequences(self):
+        from modeling_session import ModelingSession, ModelingSessionError
+        from modeling_store import ModelingStore
+
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(
+            store,
+            _PointProvider([
+                _point("p1", 0, 0),
+                _point("p2", 100, 0),
+                _point("p3", 100, 100),
+            ]),
+            now=lambda: 1000,
+        )
+        started = session.start("delete-by-id")
+        for _ in range(3):
+            session.record_area_point()
+
+        deleted = session.delete_area_point("p2")
+        draft = store.get_draft(started["modelId"])
+
+        self.assertEqual(deleted["id"], "p2")
+        self.assertEqual(
+            [point["id"] for point in draft["groups"][0]["points"]],
+            ["p1", "p3"],
+        )
+        self.assertEqual(
+            [point["sequence"] for point in draft["groups"][0]["points"]],
+            [1, 2],
+        )
+        self.assertEqual(
+            [event["pointId"] for event in draft["captureSequence"]],
+            ["p1", "p3"],
+        )
+        with self.assertRaises(ModelingSessionError):
+            session.delete_area_point("missing")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,24 @@ class _FakeController(object):
             },
         }
 
+    def get_modeling_link_points(self, model_id=None):
+        self.model_id = model_id
+        return {
+            "success": True,
+            "message": "modeling link points fetched",
+            "data": {
+                "points": [{
+                    "id": "lp1",
+                    "name": "连接点1",
+                    "sequence": 1,
+                    "x": 0,
+                    "y": 100,
+                    "lat": 32.0365,
+                    "lon": 118.1235,
+                }],
+            },
+        }
+
     def sample_modeling_point(self, model_id=None, group_id=None):
         self.model_id = model_id
         self.group_id = group_id
@@ -85,6 +103,9 @@ class _FakeController(object):
     def undo_modeling_point(self, point_type=None):
         return {"success": True, "data": {"pointType": point_type or "area"}}
 
+    def delete_modeling_point(self, point_id):
+        return {"success": True, "data": {"pointType": "area", "id": point_id}}
+
     def clear_modeling_points(self, point_type=None):
         return {"success": True, "data": {"pointType": point_type or "area"}}
 
@@ -115,6 +136,14 @@ class _StubAdapter(object):
                         "lat": 32.0364,
                         "lon": 118.1234,
                     },
+                },
+            }
+        if path == "/modeling/session/delete-area-point":
+            return {
+                "success": True,
+                "data": {
+                    "pointType": "area",
+                    "id": json_data["id"],
                 },
             }
         return {
@@ -327,6 +356,63 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(adapter.path, "/modeling/draft/model-1")
         self.assertEqual(len(result["data"]["points"]), 2)
+
+    def test_handler_and_adapter_return_flat_frontend_link_point_list(self):
+        from mqtt_handler import MQTTCommandHandler
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        controller = _FakeController()
+        handled = MQTTCommandHandler(controller).handle({
+            "command": "get_modeling_link_points",
+            "params": {"modelId": "model-1"},
+        })
+        invalid = MQTTCommandHandler(controller).handle({
+            "command": "get_modeling_link_points",
+            "params": {"modelId": "../bad"},
+        })
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.get_modeling_link_points(adapter, "model-1")
+
+        self.assertTrue(handled["success"])
+        self.assertEqual(controller.model_id, "model-1")
+        self.assertEqual(handled["data"]["points"][0]["id"], "lp1")
+        self.assertFalse(invalid["success"])
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/draft/model-1")
+        self.assertEqual(result["data"]["points"], [{
+            "id": "lp1",
+            "name": "连接点1",
+            "sequence": 1,
+            "x": 0,
+            "y": 100,
+            "lat": 32.0365,
+            "lon": 118.1235,
+        }])
+        self.assertNotIn("groupLinks", result["data"])
+
+    def test_handler_and_adapter_delete_requested_modeling_point_by_id(self):
+        from mqtt_handler import MQTTCommandHandler
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        controller = _FakeController()
+        handled = MQTTCommandHandler(controller).handle({
+            "command": "delete_modeling_point",
+            "params": {"id": "p1"},
+        })
+        invalid = MQTTCommandHandler(controller).handle({
+            "command": "delete_modeling_point",
+            "params": {"id": "../bad"},
+        })
+        adapter = _StubAdapter()
+        deleted = VehicleControllerAdapter.delete_modeling_point(adapter, "p1")
+
+        self.assertTrue(handled["success"])
+        self.assertEqual(handled["data"]["id"], "p1")
+        self.assertFalse(invalid["success"])
+        self.assertTrue(deleted["success"])
+        self.assertEqual(adapter.path, "/modeling/session/delete-area-point")
+        self.assertEqual(adapter.json_data, {"id": "p1"})
+        self.assertEqual(deleted["data"]["id"], "p1")
 
     def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler

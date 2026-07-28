@@ -112,6 +112,24 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(recorded.get_json()["data"]["pointNo"], 1)
         self.assertEqual(current.get_json()["data"]["areaPointCount"], 1)
 
+    def test_session_delete_area_point_route_uses_only_point_id(self):
+        self.client.post("/modeling/session/start", json={"name": "delete-area-point"})
+        first = self.client.post(
+            "/modeling/session/record-area-point",
+            json={},
+        ).get_json()["data"]["point"]
+        self.client.post("/modeling/session/record-area-point", json={})
+
+        deleted = self.client.post(
+            "/modeling/session/delete-area-point",
+            json={"id": first["id"]},
+        )
+        current = self.client.get("/modeling/session/current")
+
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.get_json()["data"]["id"], first["id"])
+        self.assertEqual(current.get_json()["data"]["areaPointCount"], 1)
+
     def test_sample_status_route_reports_current_readiness(self):
         response = self.client.get("/modeling/sample-status")
 
