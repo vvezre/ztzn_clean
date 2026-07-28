@@ -353,6 +353,50 @@ class ModelingSession(object):
                 "session": self._summary(state, saved),
             }
 
+    def clear_all(self, point_type):
+        with self._lock:
+            state = self._require_state()
+            point_type = str(point_type or "").strip().lower()
+            if point_type not in ("area", "link"):
+                raise ModelingSessionError(
+                    "MODELING_POINT_TYPE_INVALID",
+                    "pointType must be area or link",
+                )
+
+            model_id = state["modelId"]
+            draft = self.store.get_draft(model_id)
+            removed_ids = []
+            if point_type == "area":
+                items = list(draft.get("groups") or [])
+                for group in items:
+                    removed_ids.extend(
+                        point.get("id")
+                        for point in (group.get("points") or [])
+                        if point.get("id")
+                    )
+                    result = self.store.clear_group_points(model_id, group.get("id"))
+                    draft = result["draft"]
+            else:
+                items = list(draft.get("groupLinks") or [])
+                for link in items:
+                    removed_ids.extend(
+                        point.get("id")
+                        for point in (link.get("points") or [])
+                        if point.get("id")
+                    )
+                    result = self.store.clear_group_link_points(model_id, link.get("id"))
+                    draft = result["draft"]
+
+            saved = self._remove_capture_points(model_id, draft, removed_ids)
+            state["currentPointType"] = point_type
+            state = self._write_state(state)
+            return {
+                "modelId": model_id,
+                "pointType": point_type,
+                "clearedPointCount": len(removed_ids),
+                "session": self._summary(state, saved),
+            }
+
     def finish(self):
         with self._lock:
             state = self._require_state()

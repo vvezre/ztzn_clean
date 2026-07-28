@@ -61,6 +61,10 @@ class MQTTCommandHandler(object):
             'delete_modeling_link_point': self._handle_delete_modeling_link_point,
             'clearModelingPoints': self._handle_clear_modeling_points,
             'clear_modeling_points': self._handle_clear_modeling_points,
+            'clearModelingAreaPoints': self._handle_clear_modeling_area_points,
+            'clear_modeling_area_points': self._handle_clear_modeling_area_points,
+            'clearModelingLinkPoints': self._handle_clear_modeling_link_points,
+            'clear_modeling_link_points': self._handle_clear_modeling_link_points,
         })
         logger.info("MQTT command handler initialized")
 
@@ -104,6 +108,8 @@ class MQTTCommandHandler(object):
             'delete_modeling_point': self._handle_delete_modeling_point,
             'delete_modeling_link_point': self._handle_delete_modeling_link_point,
             'clear_modeling_points': self._handle_clear_modeling_points,
+            'clear_modeling_area_points': self._handle_clear_modeling_area_points,
+            'clear_modeling_link_points': self._handle_clear_modeling_link_points,
         }
 
     def handle(self, message_data):
@@ -445,6 +451,20 @@ class MQTTCommandHandler(object):
         if error:
             return error
         return self._call_controller('clear_modeling_points', 'modeling points cleared', point_type)
+
+    def _handle_clear_modeling_area_points(self, params):
+        return self._call_controller(
+            'clear_all_modeling_points',
+            'all modeling area points cleared',
+            'area',
+        )
+
+    def _handle_clear_modeling_link_points(self, params):
+        return self._call_controller(
+            'clear_all_modeling_points',
+            'all modeling link points cleared',
+            'link',
+        )
 
     def _fallback_task_path(self, params):
         config_path = 'config.json'

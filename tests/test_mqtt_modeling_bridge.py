@@ -112,6 +112,15 @@ class _FakeController(object):
     def clear_modeling_points(self, point_type=None):
         return {"success": True, "data": {"pointType": point_type or "area"}}
 
+    def clear_all_modeling_points(self, point_type):
+        return {
+            "success": True,
+            "data": {
+                "pointType": point_type,
+                "clearedPointCount": 2,
+            },
+        }
+
 
 class _StubAdapter(object):
     def _normalize_modeling_response(self, response, default_message):
@@ -155,6 +164,14 @@ class _StubAdapter(object):
                 "data": {
                     "pointType": "link",
                     "id": json_data["id"],
+                },
+            }
+        if path == "/modeling/session/clear-all":
+            return {
+                "success": True,
+                "data": {
+                    "pointType": json_data["pointType"],
+                    "clearedPointCount": 2,
                 },
             }
         return {
@@ -449,6 +466,30 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/session/delete-link-point")
         self.assertEqual(adapter.json_data, {"id": "lp1"})
         self.assertEqual(deleted["data"]["id"], "lp1")
+
+    def test_handler_and_adapter_clear_all_area_and_link_points(self):
+        from mqtt_handler import MQTTCommandHandler
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        handler = MQTTCommandHandler(_FakeController())
+        cleared_area = handler.handle({
+            "command": "clear_modeling_area_points",
+            "params": {},
+        })
+        cleared_link = handler.handle({
+            "command": "clear_modeling_link_points",
+            "params": {},
+        })
+        adapter = _StubAdapter()
+        adapted = VehicleControllerAdapter.clear_all_modeling_points(adapter, "link")
+
+        self.assertTrue(cleared_area["success"])
+        self.assertEqual(cleared_area["data"]["pointType"], "area")
+        self.assertTrue(cleared_link["success"])
+        self.assertEqual(cleared_link["data"]["pointType"], "link")
+        self.assertTrue(adapted["success"])
+        self.assertEqual(adapter.path, "/modeling/session/clear-all")
+        self.assertEqual(adapter.json_data, {"pointType": "link"})
 
     def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler

@@ -326,6 +326,15 @@ class VehicleControllerAdapter(object):
             'modeling points cleared',
         )
 
+    def clear_all_modeling_points(self, point_type):
+        return self._normalize_modeling_response(
+            self._call(
+                '/modeling/session/clear-all',
+                json_data={'pointType': str(point_type)},
+            ),
+            'all modeling points cleared',
+        )
+
     def finish_modeling(self):
         return self._normalize_modeling_response(
             self._call('/modeling/session/finish', json_data={}),

@@ -151,6 +151,33 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(deleted.get_json()["data"]["pointType"], "link")
         self.assertEqual(current.get_json()["data"]["linkPointCount"], 1)
 
+    def test_session_clear_all_route_clears_all_areas_and_connections(self):
+        self.client.post("/modeling/session/start", json={"name": "clear-all-points"})
+        for _ in range(4):
+            self.client.post("/modeling/session/record-area-point", json={})
+        self.client.post("/modeling/session/record-link-point", json={})
+        self.client.post("/modeling/session/record-link-point", json={})
+        for _ in range(2):
+            self.client.post("/modeling/session/record-area-point", json={})
+
+        cleared_area = self.client.post(
+            "/modeling/session/clear-all",
+            json={"pointType": "area"},
+        )
+        cleared_link = self.client.post(
+            "/modeling/session/clear-all",
+            json={"pointType": "link"},
+        )
+        current = self.client.get("/modeling/session/current").get_json()["data"]
+
+        self.assertEqual(cleared_area.status_code, 200)
+        self.assertEqual(cleared_area.get_json()["data"]["clearedPointCount"], 6)
+        self.assertEqual(cleared_area.get_json()["data"]["session"]["totalAreaPointCount"], 0)
+        self.assertEqual(cleared_link.status_code, 200)
+        self.assertEqual(cleared_link.get_json()["data"]["clearedPointCount"], 2)
+        self.assertEqual(current["totalAreaPointCount"], 0)
+        self.assertEqual(current["totalLinkPointCount"], 0)
+
     def test_sample_status_route_reports_current_readiness(self):
         response = self.client.get("/modeling/sample-status")
 

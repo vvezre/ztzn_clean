@@ -139,6 +139,14 @@ def register_modeling_routes(app, storage_dir=None, store=None, sample_point_pro
         except Exception as error:
             return _handle_store_error(error)
 
+    @app.route("/modeling/session/clear-all", methods=["POST"])
+    def modeling_session_clear_all():
+        payload = request.get_json(silent=True) or {}
+        try:
+            return _ok(modeling_session.clear_all(payload.get("pointType")))
+        except Exception as error:
+            return _handle_store_error(error)
+
     @app.route("/modeling/session/finish", methods=["POST"])
     def modeling_session_finish():
         try:

@@ -322,6 +322,59 @@ class ModelingSessionTest(unittest.TestCase):
         with self.assertRaises(ModelingSessionError):
             session.delete_link_point("missing")
 
+    def test_clear_all_removes_points_from_every_area_and_connection(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(
+            store,
+            _PointProvider([
+                _point("a1", 0, 0),
+                _point("a2", 100, 0),
+                _point("a3", 100, 100),
+                _point("a4", 0, 100),
+                _point("l1", 100, 50),
+                _point("l2", 200, 50),
+                _point("b1", 200, 0),
+                _point("b2", 300, 0),
+                _point("b3", 300, 100),
+                _point("b4", 200, 100),
+            ]),
+            now=lambda: 1000,
+        )
+        started = session.start("clear-all")
+        for _ in range(4):
+            session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+        for _ in range(4):
+            session.record_area_point()
+
+        cleared_area = session.clear_all("area")
+        area_draft = store.get_draft(started["modelId"])
+
+        self.assertEqual(cleared_area["clearedPointCount"], 8)
+        self.assertEqual(cleared_area["session"]["totalAreaPointCount"], 0)
+        self.assertEqual(cleared_area["session"]["totalLinkPointCount"], 2)
+        self.assertEqual(
+            [group["points"] for group in area_draft["groups"]],
+            [[], []],
+        )
+        self.assertEqual(
+            [event["pointId"] for event in area_draft["captureSequence"]],
+            ["l1", "l2"],
+        )
+
+        cleared_link = session.clear_all("link")
+        final_draft = store.get_draft(started["modelId"])
+
+        self.assertEqual(cleared_link["clearedPointCount"], 2)
+        self.assertEqual(cleared_link["session"]["totalLinkPointCount"], 0)
+        self.assertEqual(final_draft["groupLinks"][0]["points"], [])
+        self.assertEqual(final_draft["groupLinks"][0]["status"], "draft")
+        self.assertEqual(final_draft["captureSequence"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
