@@ -283,6 +283,45 @@ class ModelingSessionTest(unittest.TestCase):
         with self.assertRaises(ModelingSessionError):
             session.delete_area_point("missing")
 
+    def test_delete_link_point_by_id_marks_connection_incomplete(self):
+        from modeling_session import ModelingSession, ModelingSessionError
+        from modeling_store import ModelingStore
+
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(
+            store,
+            _PointProvider([
+                _point("p1", 0, 0),
+                _point("p2", 100, 0),
+                _point("p3", 100, 100),
+                _point("p4", 0, 100),
+                _point("l1", 100, 50),
+                _point("l2", 200, 50),
+            ]),
+            now=lambda: 1000,
+        )
+        started = session.start("delete-link-by-id")
+        for _ in range(4):
+            session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+
+        deleted = session.delete_link_point("l1")
+        draft = store.get_draft(started["modelId"])
+        link = draft["groupLinks"][0]
+
+        self.assertEqual(deleted["id"], "l1")
+        self.assertEqual(deleted["pointType"], "link")
+        self.assertEqual(link["status"], "draft")
+        self.assertEqual([point["id"] for point in link["points"]], ["l2"])
+        self.assertEqual(link["points"][0]["sequence"], 1)
+        self.assertEqual(link["points"][0]["role"], "group_link_start")
+        self.assertNotIn("l1", [
+            event["pointId"] for event in draft["captureSequence"]
+        ])
+        with self.assertRaises(ModelingSessionError):
+            session.delete_link_point("missing")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -308,6 +308,15 @@ class VehicleControllerAdapter(object):
             'modeling point deleted',
         )
 
+    def delete_modeling_link_point(self, point_id):
+        return self._normalize_modeling_response(
+            self._call(
+                '/modeling/session/delete-link-point',
+                json_data={'id': str(point_id)},
+            ),
+            'modeling link point deleted',
+        )
+
     def clear_modeling_points(self, point_type=None):
         payload = {}
         if point_type:

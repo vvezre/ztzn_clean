@@ -295,6 +295,37 @@ class ModelingSession(object):
                 "session": self._summary(state, saved),
             }
 
+    def delete_link_point(self, point_id):
+        with self._lock:
+            state = self._require_state()
+            point_id = str(point_id or "").strip()
+            if not point_id:
+                raise ModelingSessionError("MODELING_POINT_ID_REQUIRED", "point id is required")
+
+            model_id = state["modelId"]
+            draft = self.store.get_draft(model_id)
+            link = next((
+                item for item in (draft.get("groupLinks") or [])
+                if any(
+                    point.get("id") == point_id
+                    for point in (item.get("points") or [])
+                )
+            ), None)
+            if link is None:
+                raise ModelingSessionError("MODELING_POINT_NOT_FOUND", "connection point not found")
+
+            result = self.store.delete_group_link_point(model_id, link.get("id"), point_id)
+            saved = self._remove_capture_points(model_id, result["draft"], [point_id])
+            state["currentPointType"] = "link"
+            state = self._write_state(state)
+            return {
+                "modelId": model_id,
+                "linkId": link.get("id"),
+                "pointType": "link",
+                "id": point_id,
+                "session": self._summary(state, saved),
+            }
+
     def clear(self, point_type=None):
         with self._lock:
             state = self._require_state()

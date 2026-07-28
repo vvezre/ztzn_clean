@@ -57,6 +57,8 @@ class MQTTCommandHandler(object):
             'undo_modeling_point': self._handle_undo_modeling_point,
             'deleteModelingPoint': self._handle_delete_modeling_point,
             'delete_modeling_point': self._handle_delete_modeling_point,
+            'deleteModelingLinkPoint': self._handle_delete_modeling_link_point,
+            'delete_modeling_link_point': self._handle_delete_modeling_link_point,
             'clearModelingPoints': self._handle_clear_modeling_points,
             'clear_modeling_points': self._handle_clear_modeling_points,
         })
@@ -100,6 +102,7 @@ class MQTTCommandHandler(object):
             'get_modeling_state': self._handle_get_modeling_state,
             'undo_modeling_point': self._handle_undo_modeling_point,
             'delete_modeling_point': self._handle_delete_modeling_point,
+            'delete_modeling_link_point': self._handle_delete_modeling_link_point,
             'clear_modeling_points': self._handle_clear_modeling_points,
         }
 
@@ -424,6 +427,16 @@ class MQTTCommandHandler(object):
         return self._call_controller(
             'delete_modeling_point',
             'modeling point deleted',
+            point_id,
+        )
+
+    def _handle_delete_modeling_link_point(self, params):
+        point_id = str(params.get('id') or '').strip() if isinstance(params, dict) else ''
+        if not point_id or re.match(r'^[A-Za-z0-9_-]+$', point_id) is None:
+            return {'success': False, 'message': 'valid connection point id is required'}
+        return self._call_controller(
+            'delete_modeling_link_point',
+            'modeling link point deleted',
             point_id,
         )
 
