@@ -1,3 +1,5 @@
+import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -111,6 +113,67 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(recorded.get_json()["data"]["pointType"], "area")
         self.assertEqual(recorded.get_json()["data"]["pointNo"], 1)
         self.assertEqual(current.get_json()["data"]["areaPointCount"], 1)
+
+    def test_session_save_task_requires_ready_path_and_delegates_named_plan(self):
+        from modeling_routes import register_modeling_routes
+
+        calls = []
+        app = Flask(__name__)
+
+        def fake_save_handler(task_name, current_path):
+            calls.append((task_name, current_path))
+            return {
+                "taskName": task_name,
+                "taskCount": len(current_path["taskPlan"]["tasks"]),
+            }
+
+        register_modeling_routes(
+            app,
+            storage_dir=self.tmpdir,
+            sample_point_provider=lambda: self.sample_provider(),
+            task_save_handler=fake_save_handler,
+        )
+        client = app.test_client()
+        started = client.post(
+            "/modeling/session/start",
+            json={"name": "route-preview"},
+        ).get_json()["data"]
+
+        not_ready = client.post(
+            "/modeling/session/save-task",
+            json={"taskName": "route-a"},
+        )
+        self.assertEqual(not_ready.status_code, 400)
+        self.assertEqual(not_ready.get_json()["code"], "MODELING_PATH_NOT_READY")
+
+        draft = client.get(
+            "/modeling/draft/" + started["modelId"],
+        ).get_json()["data"]
+        draft["taskPlan"] = {
+            "status": "ready",
+            "tasks": [{"id": 1, "startX": 0, "startY": 0, "endX": 0, "endY": 100}],
+        }
+        client.post(
+            "/modeling/draft",
+            json={"modelId": started["modelId"], "draft": draft},
+        )
+        state_path = os.path.join(self.tmpdir, "active_session.json")
+        with open(state_path, "r") as handle:
+            state = json.load(handle)
+        state["status"] = "ready"
+        with open(state_path, "w") as handle:
+            json.dump(state, handle)
+
+        saved = client.post(
+            "/modeling/session/save-task",
+            json={"taskName": "route-a"},
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json()["data"]["taskName"], "route-a")
+        self.assertEqual(saved.get_json()["data"]["taskCount"], 1)
+        self.assertEqual(calls[0][0], "route-a")
+        self.assertEqual(calls[0][1]["modelId"], started["modelId"])
 
     def test_session_delete_area_point_route_uses_only_point_id(self):
         self.client.post("/modeling/session/start", json={"name": "delete-area-point"})

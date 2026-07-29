@@ -1,0 +1,55 @@
+import unittest
+
+from modeling_task_persistence import (
+    ModelingTaskPersistenceError,
+    build_named_task,
+    normalize_task_name,
+)
+
+
+class ModelingTaskPersistenceTest(unittest.TestCase):
+    def test_builds_named_robot_task_from_ready_modeling_plan(self):
+        base_config = {
+            "goBackLen": 10,
+            "originHeading": 180,
+            "taskList": [{"id": 99}],
+        }
+        first_task = {
+            "id": 1,
+            "startLat": 32.0364,
+            "startLon": 118.1234,
+            "endLat": 32.0365,
+            "endLon": 118.1234,
+            "heading": 0,
+        }
+        current_path = {
+            "modelId": "model-1",
+            "taskPlan": {
+                "status": "ready",
+                "tasks": [first_task],
+            },
+        }
+
+        saved = build_named_task(base_config, current_path, u"厂区路线一")
+
+        self.assertEqual(saved["taskName"], u"厂区路线一")
+        self.assertEqual(saved["taskList"], [first_task])
+        self.assertEqual(saved["startLat"], 32.0364)
+        self.assertEqual(saved["startLon"], 118.1234)
+        self.assertEqual(saved["originHeading"], 0)
+        self.assertEqual(saved["heading"], 0)
+        self.assertEqual(saved["goBackLen"], 10)
+
+    def test_rejects_unsafe_task_names_and_unready_paths(self):
+        with self.assertRaises(ModelingTaskPersistenceError):
+            normalize_task_name(None)
+        with self.assertRaises(ModelingTaskPersistenceError):
+            normalize_task_name("../bad")
+        with self.assertRaises(ModelingTaskPersistenceError):
+            normalize_task_name("CON")
+        with self.assertRaises(ModelingTaskPersistenceError):
+            build_named_task({}, {"taskPlan": {"status": "draft"}}, "route-1")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -265,6 +265,36 @@ class VehicleControllerAdapter(object):
     def set_current_task(self, task_name):
         return self._call('/vehicle/setCurrentTask', params={'taskName': task_name})
 
+    def save_modeling_task(self, task_name):
+        return self._normalize_modeling_response(
+            self._call(
+                '/modeling/session/save-task',
+                json_data={'taskName': str(task_name)},
+            ),
+            'modeling task saved',
+        )
+
+    def get_task_names(self):
+        response = self._call('/vehicle/selectTaskName')
+        if not isinstance(response, dict) or response.get('success') is False:
+            return {
+                'success': False,
+                'message': (
+                    response.get('msg') or response.get('message')
+                    if isinstance(response, dict)
+                    else 'task list response is invalid'
+                ),
+            }
+        data = response.get('data') if isinstance(response.get('data'), dict) else {}
+        return {
+            'success': True,
+            'message': 'task names fetched',
+            'data': {
+                'taskNames': data.get('taskNames') or [],
+                'currentTaskName': data.get('currentTaskName'),
+            },
+        }
+
     def save_params(self, params):
         return self._call('/vehicle/saveParams', json_data=params or {})
 

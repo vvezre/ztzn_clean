@@ -32,6 +32,10 @@ class MQTTCommandHandler(object):
             'selectTask': self._handle_select_task,
             'saveTask': self._handle_save_task,
             'setCurrentTask': self._handle_set_current_task,
+            'saveModelingTask': self._handle_save_modeling_task,
+            'save_modeling_task': self._handle_save_modeling_task,
+            'getTaskNames': self._handle_get_task_names,
+            'get_task_names': self._handle_get_task_names,
             'saveParams': self._handle_save_params,
             'setGarageEntry': self._handle_set_garage_entry,
             'getStatus': self._handle_get_status,
@@ -95,6 +99,8 @@ class MQTTCommandHandler(object):
             'select_task': self._handle_select_task,
             'save_task': self._handle_save_task,
             'set_current_task': self._handle_set_current_task,
+            'save_modeling_task': self._handle_save_modeling_task,
+            'get_task_names': self._handle_get_task_names,
             'save_params': self._handle_save_params,
             'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
@@ -302,6 +308,22 @@ class MQTTCommandHandler(object):
         if not task_name:
             return {'success': False, 'message': 'taskName不能为空'}
         return self._call_controller('set_current_task', '任务已设置为当前任务', task_name)
+
+    def _handle_save_modeling_task(self, params):
+        task_name = self._extract_task_name(params)
+        if not task_name:
+            return {'success': False, 'message': 'taskName is required'}
+        return self._call_controller(
+            'save_modeling_task',
+            'modeling task saved',
+            task_name,
+        )
+
+    def _handle_get_task_names(self, params):
+        return self._call_controller(
+            'get_task_names',
+            'task names fetched',
+        )
 
     def _handle_sample_modeling_point(self, params):
         model_id = self._extract_model_id(params)

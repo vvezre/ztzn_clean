@@ -115,6 +115,11 @@ from dev_console.state_readers import (
 )
 from modeling_routes import register_modeling_routes
 from modeling_sampler import sample_current_point
+from modeling_task_persistence import (
+    ModelingTaskPersistenceError,
+    build_named_task,
+    normalize_task_name,
+)
 from modeling_execution import (
     ModelingExecutionError,
     build_execution_plan,
@@ -3039,12 +3044,63 @@ def _modelingTaskThread(task_token=None, execution_plan=None):
 
 
 MODELING_STORE_DIR = os.environ.get("MODELING_STORE_DIR", os.path.join(os.getcwd(), "modeling_models"))
+
+
+def _save_modeling_task(task_name, current_path):
+    global taskList
+    task_name = normalize_task_name(task_name)
+    file_name = task_name + ".json"
+
+    with TASK_SWITCH_LOCK:
+        if os.path.exists(file_name):
+            raise ModelingTaskPersistenceError(
+                "TASK_NAME_EXISTS",
+                "taskName already exists",
+            )
+
+        task_config = build_named_task(
+            _load_json_config("config.json"),
+            current_path,
+            task_name,
+        )
+        _write_json_config(file_name, task_config)
+        try:
+            redis_cli.sadd("taskNameSet", task_name)
+            redis_cli.hset(
+                "loc_start_lat_lon",
+                task_name,
+                json.dumps({
+                    "startLat": task_config.get("startLat"),
+                    "startLon": task_config.get("startLon"),
+                }),
+            )
+        except Exception:
+            try:
+                redis_cli.srem("taskNameSet", task_name)
+                redis_cli.hdel("loc_start_lat_lon", task_name)
+            except Exception:
+                pass
+            try:
+                os.remove(file_name)
+            except Exception:
+                pass
+            raise
+        taskList = []
+
+    return {
+        "taskName": task_name,
+        "taskCount": len(task_config.get("taskList") or []),
+        "modelId": current_path.get("modelId"),
+    }
+
+
 register_modeling_routes(app,
     storage_dir=MODELING_STORE_DIR,
     sample_point_provider=_sample_modeling_current_point,
     task_execution_starter=_start_modeling_task_runtime,
     task_progress_reader=_read_modeling_task_progress,
     task_stop_handler=_stop_modeling_task_runtime,
+    task_save_handler=_save_modeling_task,
 )
 
 
@@ -4648,7 +4704,10 @@ def setCharginPileInfo():
 
 def _set_current_task(task_name):
     global taskList
-    taskName = _normalize_task_name(task_name)
+    try:
+        taskName = normalize_task_name(task_name)
+    except ModelingTaskPersistenceError as error:
+        return {"success": False, "msg": error.message, "data": {"code": error.code}}
     if not taskName:
         return {"success": False, "msg": "taskName不能为空"}
 
@@ -4958,10 +5017,17 @@ def selectTask():
 @app.route("/vehicle/selectTaskName", methods=['GET'])
 def selectTaskName():
     # 获取所有任务
-    taskNames = redis_cli.smembers('taskNameSet')
+    taskNames = sorted(
+        _normalize_task_name(task_name)
+        for task_name in redis_cli.smembers('taskNameSet')
+        if _normalize_task_name(task_name)
+    )
     # 获取当前任务
     currentTaskName = redis_cli.get('currentTaskName')
-    data = {'taskNames': list(taskNames), 'currentTaskName': currentTaskName}
+    data = {
+        'taskNames': list(taskNames),
+        'currentTaskName': _normalize_task_name(currentTaskName) or None,
+    }
 
     if len(taskNames) == 0:
         result = {"success": True, "msg": "数据为空"}

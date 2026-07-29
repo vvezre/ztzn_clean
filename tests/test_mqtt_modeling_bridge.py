@@ -133,6 +133,26 @@ class _FakeController(object):
             },
         }
 
+    def save_modeling_task(self, task_name):
+        return {
+            "success": True,
+            "message": "modeling task saved",
+            "data": {
+                "taskName": task_name,
+                "taskCount": 30,
+            },
+        }
+
+    def get_task_names(self):
+        return {
+            "success": True,
+            "message": "task names fetched",
+            "data": {
+                "taskNames": ["route-a", "route-b"],
+                "currentTaskName": "route-a",
+            },
+        }
+
 
 class _StubAdapter(object):
     def _normalize_modeling_response(self, response, default_message):
@@ -261,6 +281,31 @@ class _StubAdapter(object):
 
 
 class MqttModelingBridgeTest(unittest.TestCase):
+    def test_handler_saves_named_modeling_task_and_lists_robot_tasks(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        handler = MQTTCommandHandler(_FakeController())
+        saved = handler.handle({
+            "command": "save_modeling_task",
+            "params": {"taskName": "route-a"},
+        })
+        listed = handler.handle({
+            "command": "get_task_names",
+            "params": {},
+        })
+
+        self.assertTrue(saved["success"])
+        self.assertEqual(saved["data"]["taskName"], "route-a")
+        self.assertEqual(saved["data"]["taskCount"], 30)
+        self.assertEqual(listed["data"]["taskNames"], ["route-a", "route-b"])
+        self.assertEqual(listed["data"]["currentTaskName"], "route-a")
+
+        invalid = handler.handle({
+            "command": "save_modeling_task",
+            "params": {},
+        })
+        self.assertFalse(invalid["success"])
+
     def test_realtime_position_report_contains_only_relative_coordinates(self):
         import sys
         import types

@@ -48,6 +48,9 @@ def _handle_store_error(error):
         return _error("MODEL_NOT_FOUND", "model not found", 404)
     if isinstance(error, (InvalidModelIdError, InvalidModelPayloadError)):
         return _error("INVALID_MODEL_PAYLOAD", str(error), 400)
+    if getattr(error, "code", None) and getattr(error, "message", None):
+        status_code = 409 if error.code == "TASK_NAME_EXISTS" else 400
+        return _error(error.code, error.message, status_code)
     return _error("MODELING_STORE_ERROR", str(error), 500)
 
 
@@ -58,7 +61,7 @@ def _request_model_id(payload=None):
 
 def register_modeling_routes(app, storage_dir=None, store=None, sample_point_provider=None,
                              task_execution_starter=None, task_progress_reader=None,
-                             task_stop_handler=None):
+                             task_stop_handler=None, task_save_handler=None):
     modeling_store = store or ModelingStore(storage_dir or "modeling_models")
     modeling_session = ModelingSession(modeling_store, sample_point_provider)
 
@@ -84,6 +87,28 @@ def register_modeling_routes(app, storage_dir=None, store=None, sample_point_pro
     def modeling_session_path():
         try:
             return _ok(modeling_session.current_path())
+        except Exception as error:
+            return _handle_store_error(error)
+
+    @app.route("/modeling/session/save-task", methods=["POST"])
+    def modeling_session_save_task():
+        payload = request.get_json(silent=True) or {}
+        try:
+            if task_save_handler is None:
+                raise ModelingSessionError(
+                    "MODELING_TASK_SAVE_NOT_CONFIGURED",
+                    "modeling task save handler is not configured",
+                )
+            if modeling_session.current().get("status") != "ready":
+                raise ModelingSessionError(
+                    "MODELING_PATH_NOT_READY",
+                    "finish modeling before saving the route",
+                )
+            current_path = modeling_session.current_path()
+            return _ok(
+                task_save_handler(payload.get("taskName"), current_path),
+                msg="saved",
+            )
         except Exception as error:
             return _handle_store_error(error)
 
