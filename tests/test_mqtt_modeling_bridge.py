@@ -153,6 +153,23 @@ class _FakeController(object):
             },
         }
 
+    def get_saved_routes(self):
+        return {
+            "success": True,
+            "message": "saved routes fetched",
+            "data": {
+                "routes": [{
+                    "taskName": "route-a",
+                    "modelId": "model-a",
+                    "current": True,
+                    "areaPoints": [{"id": "a1"}],
+                    "linkPoints": [{"id": "l1"}],
+                    "pathPoints": [{"id": "p1"}, {"id": "p2"}],
+                }],
+                "currentTaskName": "route-a",
+            },
+        }
+
 
 class _StubAdapter(object):
     def _normalize_modeling_response(self, response, default_message):
@@ -204,6 +221,21 @@ class _StubAdapter(object):
                 "data": {
                     "pointType": json_data["pointType"],
                     "clearedPointCount": 2,
+                },
+            }
+        if path == "/vehicle/selectSavedRoutes":
+            return {
+                "success": True,
+                "data": {
+                    "routes": [{
+                        "taskName": "route-a",
+                        "modelId": "model-a",
+                        "current": True,
+                        "areaPoints": [{"id": "a1"}],
+                        "linkPoints": [{"id": "l1"}],
+                        "pathPoints": [{"id": "p1"}, {"id": "p2"}],
+                    }],
+                    "currentTaskName": "route-a",
                 },
             }
         return {
@@ -293,12 +325,18 @@ class MqttModelingBridgeTest(unittest.TestCase):
             "command": "get_task_names",
             "params": {},
         })
+        routes = handler.handle({
+            "command": "get_saved_routes",
+            "params": {},
+        })
 
         self.assertTrue(saved["success"])
         self.assertEqual(saved["data"]["taskName"], "route-a")
         self.assertEqual(saved["data"]["taskCount"], 30)
         self.assertEqual(listed["data"]["taskNames"], ["route-a", "route-b"])
         self.assertEqual(listed["data"]["currentTaskName"], "route-a")
+        self.assertEqual(routes["data"]["routes"][0]["taskName"], "route-a")
+        self.assertEqual(routes["data"]["routes"][0]["pathPoints"][1]["id"], "p2")
 
         invalid = handler.handle({
             "command": "save_modeling_task",
@@ -576,6 +614,18 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertTrue(adapted["success"])
         self.assertEqual(adapter.path, "/modeling/session/clear-all")
         self.assertEqual(adapter.json_data, {"pointType": "link"})
+
+    def test_adapter_get_saved_routes_uses_vehicle_route(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.get_saved_routes(adapter)
+
+        self.assertEqual(adapter.path, "/vehicle/selectSavedRoutes")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["currentTaskName"], "route-a")
+        self.assertEqual(result["data"]["routes"][0]["modelId"], "model-a")
+        self.assertEqual(len(result["data"]["routes"][0]["pathPoints"]), 2)
 
     def test_handler_routes_sample_modeling_point_to_existing_adapter(self):
         from mqtt_handler import MQTTCommandHandler

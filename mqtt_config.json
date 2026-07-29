@@ -42,6 +42,7 @@
       "save_task",
       "save_modeling_task",
       "get_task_names",
+      "get_saved_routes",
       "set_current_task",
       "save_params",
       "get_status",

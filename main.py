@@ -120,6 +120,7 @@ from modeling_task_persistence import (
     build_named_task,
     normalize_task_name,
 )
+from modeling_saved_routes import build_saved_routes
 from modeling_execution import (
     ModelingExecutionError,
     build_execution_plan,
@@ -3094,7 +3095,7 @@ def _save_modeling_task(task_name, current_path):
     }
 
 
-register_modeling_routes(app,
+modeling_store = register_modeling_routes(app,
     storage_dir=MODELING_STORE_DIR,
     sample_point_provider=_sample_modeling_current_point,
     task_execution_starter=_start_modeling_task_runtime,
@@ -5036,6 +5037,30 @@ def selectTaskName():
         result = {"success": True, "msg": "获取数据成功"}
         result['data'] = data
         return jsonify(result)
+
+
+@app.route("/vehicle/selectSavedRoutes", methods=['GET'])
+def selectSavedRoutes():
+    task_names = redis_cli.smembers('taskNameSet')
+    current_task_name = redis_cli.get('currentTaskName')
+
+    def load_task_config(task_name):
+        return _load_json_config(task_name + '.json')
+
+    def load_model(model_id):
+        return modeling_store.get_model(model_id)
+
+    data = build_saved_routes(
+        task_names,
+        current_task_name,
+        load_task_config,
+        load_model,
+    )
+    return jsonify({
+        "success": True,
+        "msg": "获取已保存路线成功",
+        "data": data,
+    })
 
 
 # 根据任务名称获取任务信息

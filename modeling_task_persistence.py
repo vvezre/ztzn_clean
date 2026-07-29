@@ -78,6 +78,7 @@ def build_named_task(base_config, current_path, task_name):
 
     task_config = copy.deepcopy(base_config if isinstance(base_config, dict) else {})
     task_config["taskName"] = task_name
+    task_config["modelId"] = current_path.get("modelId")
     task_config["taskList"] = copy.deepcopy(tasks)
 
     first_task = tasks[0]

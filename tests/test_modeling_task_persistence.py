@@ -33,6 +33,7 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
         saved = build_named_task(base_config, current_path, u"厂区路线一")
 
         self.assertEqual(saved["taskName"], u"厂区路线一")
+        self.assertEqual(saved["modelId"], "model-1")
         self.assertEqual(saved["taskList"], [first_task])
         self.assertEqual(saved["startLat"], 32.0364)
         self.assertEqual(saved["startLon"], 118.1234)

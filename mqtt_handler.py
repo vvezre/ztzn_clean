@@ -36,6 +36,8 @@ class MQTTCommandHandler(object):
             'save_modeling_task': self._handle_save_modeling_task,
             'getTaskNames': self._handle_get_task_names,
             'get_task_names': self._handle_get_task_names,
+            'getSavedRoutes': self._handle_get_saved_routes,
+            'get_saved_routes': self._handle_get_saved_routes,
             'saveParams': self._handle_save_params,
             'setGarageEntry': self._handle_set_garage_entry,
             'getStatus': self._handle_get_status,
@@ -101,6 +103,7 @@ class MQTTCommandHandler(object):
             'set_current_task': self._handle_set_current_task,
             'save_modeling_task': self._handle_save_modeling_task,
             'get_task_names': self._handle_get_task_names,
+            'get_saved_routes': self._handle_get_saved_routes,
             'save_params': self._handle_save_params,
             'set_garage_entry': self._handle_set_garage_entry,
             'get_status': self._handle_get_status,
@@ -323,6 +326,12 @@ class MQTTCommandHandler(object):
         return self._call_controller(
             'get_task_names',
             'task names fetched',
+        )
+
+    def _handle_get_saved_routes(self, params):
+        return self._call_controller(
+            'get_saved_routes',
+            'saved routes fetched',
         )
 
     def _handle_sample_modeling_point(self, params):
