@@ -3,6 +3,7 @@ import unittest
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
     build_named_task,
+    is_same_named_task,
     normalize_task_name,
 )
 
@@ -50,6 +51,30 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
             normalize_task_name("CON")
         with self.assertRaises(ModelingTaskPersistenceError):
             build_named_task({}, {"taskPlan": {"status": "draft"}}, "route-1")
+
+    def test_detects_idempotent_retry_for_same_modeling_route(self):
+        current_path = {
+            "modelId": "model-1",
+            "taskPlan": {"tasks": [{"id": 1}]},
+        }
+        task_config = {
+            "taskName": u"测试6",
+            "modelId": "model-1",
+            "taskList": [{"id": 1}],
+        }
+
+        self.assertTrue(is_same_named_task(task_config, current_path, u"测试6"))
+        self.assertFalse(is_same_named_task(
+            task_config,
+            {"modelId": "model-2", "taskPlan": {"tasks": [{"id": 1}]}},
+            u"测试6",
+        ))
+        self.assertFalse(is_same_named_task(task_config, current_path, u"测试7"))
+        self.assertFalse(is_same_named_task(
+            task_config,
+            {"modelId": "model-1", "taskPlan": {"tasks": [{"id": 2}]}},
+            u"测试6",
+        ))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,34 @@ def _safe_task_name(value):
         return None
 
 
+def discover_saved_task_names(file_names, load_task_config):
+    names = []
+    for file_name in file_names or []:
+        if not file_name or not file_name.lower().endswith('.json'):
+            continue
+        file_task_name = _safe_task_name(file_name[:-5])
+        if not file_task_name:
+            continue
+        try:
+            task_config = load_task_config(file_name)
+        except Exception:
+            continue
+        if not isinstance(task_config, dict):
+            continue
+        configured_name = _safe_task_name(task_config.get('taskName'))
+        model_id = task_config.get('modelId')
+        task_list = task_config.get('taskList')
+        if (
+            configured_name != file_task_name
+            or not model_id
+            or not isinstance(task_list, list)
+            or not task_list
+        ):
+            continue
+        names.append(configured_name)
+    return sorted(set(names))
+
+
 def build_saved_routes(task_names, current_task_name, load_task_config, load_model):
     current_task_name = _safe_task_name(current_task_name)
     normalized_names = sorted(set(

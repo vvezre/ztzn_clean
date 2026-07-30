@@ -8,9 +8,9 @@ import os
 
 try:
     from urllib import quote, urlencode
-    from urllib2 import Request, URLError, urlopen
+    from urllib2 import HTTPError, Request, URLError, urlopen
 except ImportError:
-    from urllib.error import URLError
+    from urllib.error import HTTPError, URLError
     from urllib.parse import quote, urlencode
     from urllib.request import Request, urlopen
 
@@ -66,6 +66,20 @@ class VehicleControllerAdapter(object):
             request = Request(url, data=payload, headers=headers)
             response = urlopen(request, timeout=self.timeout)
             return self._parse_response(response)
+        except HTTPError as exc:
+            try:
+                response = self._parse_response(exc)
+            except Exception:
+                response = None
+            if isinstance(response, dict):
+                if 'success' not in response:
+                    response['success'] = False
+                return response
+            return {
+                'success': False,
+                'message': 'HTTP {} {}'.format(exc.code, exc.reason),
+                'data': {'httpStatus': exc.code},
+            }
         except URLError as exc:
             raise RuntimeError('MQTT adapter request failed: {}'.format(exc))
 
@@ -157,7 +171,7 @@ class VehicleControllerAdapter(object):
         return self._normalize_modeling_response(
             self._call(
                 '/modeling/session/save-task',
-                json_data={'taskName': str(task_name)},
+                json_data={'taskName': task_name},
             ),
             'modeling task saved',
         )

@@ -92,3 +92,28 @@ def build_named_task(base_config, current_path, task_name):
             task_config["heading"] = first_task.get("heading")
 
     return task_config
+
+
+def is_same_named_task(task_config, current_path, task_name):
+    if not isinstance(task_config, dict) or not isinstance(current_path, dict):
+        return False
+    try:
+        expected_name = normalize_task_name(task_name)
+        configured_name = normalize_task_name(task_config.get("taskName"))
+    except ModelingTaskPersistenceError:
+        return False
+    task_list = task_config.get("taskList")
+    current_task_plan = current_path.get("taskPlan")
+    current_tasks = (
+        current_task_plan.get("tasks")
+        if isinstance(current_task_plan, dict)
+        else None
+    )
+    return (
+        configured_name == expected_name
+        and task_config.get("modelId") == current_path.get("modelId")
+        and isinstance(task_list, list)
+        and bool(task_list)
+        and isinstance(current_tasks, list)
+        and task_list == current_tasks
+    )

@@ -344,6 +344,56 @@ class MqttModelingBridgeTest(unittest.TestCase):
         })
         self.assertFalse(invalid["success"])
 
+    def test_handler_preserves_unicode_modeling_task_name(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        handler = MQTTCommandHandler(_FakeController())
+        result = handler.handle({
+            "command": "save_modeling_task",
+            "params": {"taskName": u"测试6"},
+        })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["taskName"], u"测试6")
+
+    def test_adapter_preserves_unicode_modeling_task_name(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.save_modeling_task(adapter, u"测试6")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/session/save-task")
+        self.assertEqual(adapter.json_data, {"taskName": u"测试6"})
+
+    def test_adapter_preserves_modeling_http_error_payload(self):
+        import io
+        from unittest.mock import patch
+
+        import mqtt_vehicle_adapter as adapter_module
+
+        payload = (
+            b'{"success":false,"code":"TASK_NAME_EXISTS",'
+            b'"msg":"taskName already exists"}'
+        )
+        error = adapter_module.HTTPError(
+            "http://127.0.0.1:7899/modeling/session/save-task",
+            409,
+            "CONFLICT",
+            {},
+            io.BytesIO(payload),
+        )
+        adapter = adapter_module.VehicleControllerAdapter(
+            base_url="http://127.0.0.1:7899",
+        )
+
+        with patch.object(adapter_module, "urlopen", side_effect=error):
+            result = adapter.save_modeling_task("route-a")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["message"], "taskName already exists")
+        self.assertEqual(result["data"]["code"], "TASK_NAME_EXISTS")
+
     def test_realtime_position_report_contains_only_relative_coordinates(self):
         import sys
         import types

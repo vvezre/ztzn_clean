@@ -1,6 +1,6 @@
 import unittest
 
-from modeling_saved_routes import build_saved_routes
+from modeling_saved_routes import build_saved_routes, discover_saved_task_names
 
 
 class ModelingSavedRoutesTest(unittest.TestCase):
@@ -103,6 +103,41 @@ class ModelingSavedRoutesTest(unittest.TestCase):
         self.assertEqual(route["areaPoints"], [])
         self.assertEqual(route["linkPoints"], [])
         self.assertEqual(len(route["pathPoints"]), 2)
+
+    def test_discovers_valid_route_files_when_redis_index_is_missing(self):
+        configs = {
+            "test6.json": {
+                "taskName": "test6",
+                "modelId": "model-1",
+                "taskList": [{"id": 1}],
+            },
+            u"测试6.json": {
+                "taskName": u"测试6",
+                "modelId": "model-1",
+                "taskList": [{"id": 1}],
+            },
+            "legacy.json": {
+                "taskName": "legacy",
+                "taskList": [{"id": 1}],
+            },
+            "config.json": {
+                "taskName": "test6",
+                "modelId": "model-1",
+                "taskList": [{"id": 1}],
+            },
+            "mqtt_config.json": {"mqtt": {}},
+            "empty.json": {
+                "taskName": "empty",
+                "taskList": [],
+            },
+        }
+
+        names = discover_saved_task_names(
+            list(configs.keys()),
+            lambda file_name: configs[file_name],
+        )
+
+        self.assertEqual(names, ["test6", u"测试6"])
 
 
 if __name__ == "__main__":

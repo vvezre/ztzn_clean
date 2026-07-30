@@ -8,6 +8,27 @@ import time
 from AppLogger import logger
 
 
+try:
+    text_type = unicode
+    binary_type = str
+except NameError:
+    text_type = str
+    binary_type = bytes
+
+
+def _as_text(value):
+    if value is None:
+        return ''
+    if isinstance(value, text_type):
+        return value.strip()
+    if isinstance(value, binary_type):
+        try:
+            return value.decode('utf-8').strip()
+        except Exception:
+            return value.decode('utf-8', 'replace').strip()
+    return text_type(value).strip()
+
+
 class MQTTCommandHandler(object):
     def __init__(self, vehicle_controller):
         self.vehicle_controller = vehicle_controller
@@ -176,34 +197,22 @@ class MQTTCommandHandler(object):
     def _extract_task_name(self, params):
         if not isinstance(params, dict):
             return ''
-        task_name = params.get('taskName')
-        if task_name is None:
-            return ''
-        return str(task_name).strip()
+        return _as_text(params.get('taskName'))
 
     def _extract_model_id(self, params):
         if not isinstance(params, dict):
             return ''
-        model_id = params.get('modelId')
-        if model_id is None:
-            return ''
-        return str(model_id).strip()
+        return _as_text(params.get('modelId'))
 
     def _extract_group_id(self, params):
         if not isinstance(params, dict):
             return ''
-        group_id = params.get('groupId')
-        if group_id is None:
-            return ''
-        return str(group_id).strip()
+        return _as_text(params.get('groupId'))
 
     def _extract_link_id(self, params):
         if not isinstance(params, dict):
             return ''
-        link_id = params.get('linkId')
-        if link_id is None:
-            return ''
-        return str(link_id).strip()
+        return _as_text(params.get('linkId'))
 
     def _handle_drive(self, params):
         return self._call_controller('drive', '前进命令已执行', params.get('distance', 0), params.get('speed'))

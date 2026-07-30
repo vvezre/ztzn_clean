@@ -118,9 +118,10 @@ from modeling_sampler import sample_current_point
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
     build_named_task,
+    is_same_named_task,
     normalize_task_name,
 )
-from modeling_saved_routes import build_saved_routes
+from modeling_saved_routes import build_saved_routes, discover_saved_task_names
 from modeling_execution import (
     ModelingExecutionError,
     build_execution_plan,
@@ -444,10 +445,10 @@ def _decode_redis_value(value):
 
 
 def _normalize_task_name(task_name):
-    value = _decode_redis_value(task_name)
-    if value is None:
+    try:
+        return normalize_task_name(_decode_redis_value(task_name))
+    except ModelingTaskPersistenceError:
         return ''
-    return str(value).strip()
 
 
 def _coerce_float(value, default=None):
@@ -3052,8 +3053,29 @@ def _save_modeling_task(task_name, current_path):
     task_name = normalize_task_name(task_name)
     file_name = task_name + ".json"
 
+    def register_task(task_config):
+        redis_cli.sadd("taskNameSet", task_name)
+        redis_cli.hset(
+            "loc_start_lat_lon",
+            task_name,
+            json.dumps({
+                "startLat": task_config.get("startLat"),
+                "startLon": task_config.get("startLon"),
+            }),
+        )
+
     with TASK_SWITCH_LOCK:
         if os.path.exists(file_name):
+            existing_config = _load_json_config(file_name)
+            if is_same_named_task(existing_config, current_path, task_name):
+                register_task(existing_config)
+                taskList = []
+                return {
+                    "taskName": task_name,
+                    "taskCount": len(existing_config.get("taskList") or []),
+                    "modelId": existing_config.get("modelId"),
+                    "recovered": True,
+                }
             raise ModelingTaskPersistenceError(
                 "TASK_NAME_EXISTS",
                 "taskName already exists",
@@ -3066,16 +3088,15 @@ def _save_modeling_task(task_name, current_path):
         )
         _write_json_config(file_name, task_config)
         try:
-            redis_cli.sadd("taskNameSet", task_name)
-            redis_cli.hset(
-                "loc_start_lat_lon",
-                task_name,
-                json.dumps({
-                    "startLat": task_config.get("startLat"),
-                    "startLon": task_config.get("startLon"),
-                }),
+            register_task(task_config)
+        except Exception as error:
+            logger.error(
+                "register saved modeling task failed: taskName={}, error={}".format(
+                    repr(task_name),
+                    error,
+                ),
+                exc_info=True,
             )
-        except Exception:
             try:
                 redis_cli.srem("taskNameSet", task_name)
                 redis_cli.hdel("loc_start_lat_lon", task_name)
@@ -3083,8 +3104,14 @@ def _save_modeling_task(task_name, current_path):
                 pass
             try:
                 os.remove(file_name)
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                logger.error(
+                    "remove incomplete modeling task failed: file={}, error={}".format(
+                        repr(file_name),
+                        cleanup_error,
+                    ),
+                    exc_info=True,
+                )
             raise
         taskList = []
 
@@ -5015,14 +5042,37 @@ def selectTask():
 
 
 # 获取所有任务名称
-@app.route("/vehicle/selectTaskName", methods=['GET'])
-def selectTaskName():
-    # 获取所有任务
-    taskNames = sorted(
+def _reconcile_saved_task_index():
+    discovered_names = discover_saved_task_names(
+        os.listdir(os.getcwd()),
+        lambda file_name: _load_json_config(file_name),
+    )
+    discovered_set = set(discovered_names)
+    indexed_names = set(
         _normalize_task_name(task_name)
         for task_name in redis_cli.smembers('taskNameSet')
         if _normalize_task_name(task_name)
     )
+
+    for task_name in sorted(discovered_set - indexed_names):
+        task_config = _load_json_config(task_name + '.json')
+        redis_cli.sadd('taskNameSet', task_name)
+        redis_cli.hset(
+            'loc_start_lat_lon',
+            task_name,
+            json.dumps({
+                'startLat': task_config.get('startLat'),
+                'startLon': task_config.get('startLon'),
+            }),
+        )
+
+    return sorted(discovered_set | indexed_names)
+
+
+@app.route("/vehicle/selectTaskName", methods=['GET'])
+def selectTaskName():
+    # 获取所有任务
+    taskNames = _reconcile_saved_task_index()
     # 获取当前任务
     currentTaskName = redis_cli.get('currentTaskName')
     data = {
@@ -5041,7 +5091,7 @@ def selectTaskName():
 
 @app.route("/vehicle/selectSavedRoutes", methods=['GET'])
 def selectSavedRoutes():
-    task_names = redis_cli.smembers('taskNameSet')
+    task_names = _reconcile_saved_task_index()
     current_task_name = redis_cli.get('currentTaskName')
 
     def load_task_config(task_name):

@@ -250,7 +250,9 @@ class MQTTClient:
         try:
             payload = msg.payload.decode('utf-8')
             self._mark_activity(receive=True)
-            logger.info("收到MQTT消息 - Topic: {}, Payload: {}".format(msg.topic,payload))
+            # Do not interpolate a unicode payload into a byte string on Python 2.
+            # That raises UnicodeEncodeError before the command can be parsed or ACKed.
+            logger.info("MQTT message received - Topic: {}".format(msg.topic))
 
             # 解析消息
             message_data = self._parse_message(payload)

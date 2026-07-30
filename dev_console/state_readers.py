@@ -1,5 +1,6 @@
 # coding=utf-8
 
+import io
 import json
 import os
 import time
@@ -176,7 +177,7 @@ def read_log_lines(log_path="app.log", query="", limit=200):
             "exists": False,
         }
 
-    with open(log_path, "r", errors="replace") as fp:
+    with io.open(log_path, "r", encoding="utf-8", errors="replace") as fp:
         lines = [line.rstrip("\r\n") for line in fp.readlines()]
     if query:
         needle = query.lower()
