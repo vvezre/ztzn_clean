@@ -127,6 +127,8 @@ from modeling_execution import (
     build_execution_plan,
     execute_modeling_plan,
 )
+from route_segment_execution import run_route_segment
+from route_start_guard import RouteStartGuardError, validate_route_start
 
 app = Flask(__name__)
 CORS(app)
@@ -340,8 +342,8 @@ drive_thread = None
 loop_auto_clean_thread = None
 LOOP_AUTO_CLEAN_LOCK = threading.RLock()
 global_last_cte = 0.0
-START_POSITION_TOLERANCE_METERS = 2.0
-TASK_ORIGIN_TOLERANCE_METERS = START_POSITION_TOLERANCE_METERS
+TASK_ORIGIN_TOLERANCE_METERS = 0.20
+START_POSITION_TOLERANCE_METERS = TASK_ORIGIN_TOLERANCE_METERS
 EDGE_TARGET_TOLERANCE_M = DEFAULT_EDGE_TARGET_TOLERANCE_M
 EDGE_RECOVERY_BACK_CM = 5
 EDGE_RECOVERY_MAX_ATTEMPTS = 3
@@ -2893,12 +2895,26 @@ def _validate_modeling_task_start(execution_plan):
     segments = execution_plan.get('segments') if isinstance(execution_plan, dict) else None
     if not isinstance(segments, list) or not segments:
         raise ModelingExecutionError('modeling execution plan has no segments')
-    return {
+    first_segment = segments[0]
+    try:
+        origin_check = validate_route_start(
+            global_cur_rtk_lat,
+            global_cur_rtk_lon,
+            first_segment.get('startLat'),
+            first_segment.get('startLon'),
+            TASK_ORIGIN_TOLERANCE_METERS,
+            util.get_distance_angle,
+        )
+    except RouteStartGuardError as error:
+        raise ModelingExecutionError('{}: {}'.format(error.code, error.message))
+    result = {
         'rtkFixAvailable': True,
         'rtkFixState': rtk_detail.get('rtkFixState'),
         'rtkQuality': rtk_detail.get('rtkQuality'),
         'rtkGgaAgeSec': rtk_detail.get('rtkGgaAgeSec'),
     }
+    result.update(origin_check)
+    return result
 
 
 def _modeling_execution_speed(payload):
@@ -2964,37 +2980,64 @@ def _stop_modeling_task_runtime(payload=None):
     return stop_state
 
 
-def _run_modeling_task_segment(segment):
-    heading = float(segment.get('heading'))
-    speed = int(segment.get('speed'))
-    task_id = segment.get('id')
-    index = int(segment.get('index') or 0)
-    turn_result = turn(
-        ser,
-        heading * 10,
-        target_heading=heading,
-        source='modeling_task',
-        segment_index=index + 1,
-        task_id=task_id,
-    )
-    if turn_result != 1:
+def _run_task_segment_by_point_navigation(segment, speed, source, segment_index):
+    """
+    使用原有点位导航执行一段规划路线。
+
+    保存任务里的 heading 只作为展示数据，不直接用于控制转向。每一段都读取此刻的
+    RTK 位置，再由 pointToPointByRTKAutoHeading 计算到终点的真实方向。转向阶段关闭
+    清扫，到达正确朝向后才根据 mode 决定是否开启清扫；到点后停车并关闭清扫。
+    """
+    def read_position():
+        return global_cur_rtk_lat, global_cur_rtk_lon
+
+    def navigate(current_lat, current_lon, end_lat, end_lon, runtime_speed, before_drive):
+        return pointToPointByRTKAutoHeading(
+            current_lat,
+            current_lon,
+            end_lat,
+            end_lon,
+            runtime_speed,
+            before_drive=before_drive,
+            source=source,
+            segment_index=segment_index,
+            task_id=segment.get('id'),
+        )
+
+    def set_cleaning(enabled):
+        if enabled:
+            switch_on_clean_mode(ser)
+        else:
+            switch_off_clean_mode(ser)
+
+    def stop_vehicle():
         sendBraking()
-        return False
 
-    if int(segment.get('mode') or 0) == 1:
-        switch_on_clean_mode(ser)
-    else:
-        switch_off_clean_mode(ser)
+    def report_error(error):
+        logger.warn('[{}] task segment failed: taskId={}, error={}'.format(
+            source,
+            segment.get('id'),
+            error,
+        ))
 
-    result = pointToPointByRTK(
-        segment.get('startLat'),
-        segment.get('startLon'),
-        segment.get('endLat'),
-        segment.get('endLon'),
-        heading,
+    return run_route_segment(
+        segment,
         speed,
+        read_position,
+        navigate,
+        set_cleaning,
+        stop_vehicle,
+        on_error=report_error,
     )
-    return result == 1
+
+
+def _run_modeling_task_segment(segment):
+    return _run_task_segment_by_point_navigation(
+        segment,
+        int(segment.get('speed')),
+        'modeling_task',
+        int(segment.get('index') or 0) + 1,
+    )
 
 
 def _modelingTaskThread(task_token=None, execution_plan=None):
@@ -4192,6 +4235,26 @@ def log_task_turn_command(task, index, source):
     )
 
 def autoDriveByRTKThread(task_token=None):
+    """
+    执行前端 auto_drive 命令对应的 RTK 自动清扫流程。
+
+    任务数据来源：
+    - currentTaskName：Redis 中当前真正选中的路线名。
+    - config.json：当前选中路线的完整配置。
+    - taskParams：从 config.json 同步到 Redis 的起点、起始航向、车库等参数。
+    - taskList：按顺序执行的分段路径，mode=1 为清扫段，mode=2 为移动/换行段。
+
+    执行顺序：
+    1. 登记运行任务 token，拒绝重复启动或已过期线程。
+    2. 判断车辆是否在车库，必要时先执行出库。
+    3. 校验 currentTaskName 与 config.json.taskName 完全一致。
+    4. 读取 taskList，将待执行任务写入 Redis，供续扫和前端进度展示。
+    5. 每一段都读取实时 RTK 位置，并复用点位导航自动计算目标方向。
+    6. 按 taskList 顺序执行“自动转向 -> RTK 点到点直行 -> 到点停车”。
+    7. 每完成一段从 Redis 弹出一段；全部完成后停车并根据配置回库。
+
+    任何阶段收到停止信号、转向失败或配置不一致都会停止执行，不继续直行。
+    """
     global global_status
     global taskList  # 申明使用全局变量
     global global_pointToPoint_flag,global_doCleanThreadStop,global_go,global_originLat,global_originLon
@@ -4216,14 +4279,9 @@ def autoDriveByRTKThread(task_token=None):
     chargingPileLat = float(taskParams.get('chargingPileLat'))
     chargingPileLon = float(taskParams.get('chargingPileLon'))
     backLength = _coerce_int(taskParams.get('startToChargingPilePointLength'), 0)
-    lastTaskBackLength = _coerce_int(taskParams.get('lastTaskBackLength'), 0)
     # 起始点经纬度
     global_originLat = float(taskParams.get('startLat'))
     global_originLon = float(taskParams.get('startLon'))
-    # 初始航向角
-    # initHeading = taskObj['heading']
-    # 起始点航向角,用于位置转正
-    originHeading = float(taskParams.get('originHeading'))
 
     # 舱内/舱外状态判断：决定自动清扫前是否需要先执行出舱。
     exit_decision = decide_auto_exit_garage(get_garage_state(), backLength)
@@ -4280,6 +4338,7 @@ def autoDriveByRTKThread(task_token=None):
         # 将当前任务文件中的参数信息同步到redis中
         syncCurTaskFileToRedis()
     # 自动清扫必须先选择当前任务，currentTaskName 用来和 config.json 中的 taskName 做一致性校验。
+    # 页面高亮不等于小车已选中；只有 /tasks/current 成功后 Redis 才存在 currentTaskName。
     current_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
     if not current_task_name:
         _mark_runtime_blocked('CURRENT_TASK_NOT_SET', '未设置当前任务，请先设置当前任务后再启动')
@@ -4294,6 +4353,7 @@ def autoDriveByRTKThread(task_token=None):
         return
 
     # 防止 Redis 里选中的任务和实际执行文件不一致。
+    # 双重校验避免“前端选中 A，但小车 config.json 仍是 B”时误启动其他路线。
     config_task_name = _normalize_task_name(taskObj.get('taskName'))
     if config_task_name != current_task_name:
         _mark_runtime_blocked('CURRENT_TASK_MISMATCH', '当前任务与执行配置不一致，请重新设置当前任务')
@@ -4317,7 +4377,7 @@ def autoDriveByRTKThread(task_token=None):
         taskList = taskObj['taskList']
     else:
         taskList = resultTask
-    # 清除下位机当前记录的清扫航向，为后续起始姿态校验和清扫模式重新建基准。
+    # 清除下位机当前记录的清扫航向；每一段都会根据实时位置重新计算目标方向。
     reset_clean_mode(ser)
     time.sleep(0.02)
     # 将当前任务段写入 Redis taskList，便于中断续扫、低电回充、前端进度展示。
@@ -4328,16 +4388,11 @@ def autoDriveByRTKThread(task_token=None):
         redis_cli.rpush('taskList', json.dumps(item))
 
 
-    # 起始姿态校验：确认车辆当前朝向和任务原点朝向一致，避免方向不对就开始直行。
-    if turnCheckPoint(originHeading) == 0:
-        _mark_runtime_blocked('START_HEADING_CHECK_FAILED', '起始姿态校验失败，自动清扫未启动')
-        doParking(update_runtime=False)
-        return
-    time.sleep(0.02)
-    # 进入清扫模式，同时记录当前航向角，后续转向/直行以此为参考。
-    switch_on_clean_mode(ser)
     # 点到点直线行走是否停止标识
     global_pointToPoint_flag = 0
+    runtime_speed = _coerce_int(redis_cli.get('forwardSpeed'), 350)
+    if runtime_speed is None or runtime_speed <= 0:
+        runtime_speed = 350
     # 执行任务
     for index,task in enumerate(taskList):
         # 每段开始前都检查一次停止信号，保证急停或任务切换能尽快生效。
@@ -4345,69 +4400,36 @@ def autoDriveByRTKThread(task_token=None):
             global_doCleanThreadStop = 1
             break
         logger.warn("执行任务{}".format(index + 1))
-        turn_back_len = task['turn_back_len']
-        back_len = task['back_len']
-        angle = task['angle']
-        startLat, startLon = task['startLat'], task['startLon']
-        heading = task['heading']
-        endLat = task['endLat']
-        endLon = task['endLon']
-        mode = task['mode']
-
-        if index == 0:
-            # 第一段已经在起始姿态校验时对齐过，不重复发送转向命令。
-            logger.warn(
-                u"[auto_drive] 第{}段为起始段，不发送转向命令: taskId={}, 目标角度={}°, 目标航向={}°".format(
-                    index + 1,
-                    task.get('id', index + 1),
-                    round(float(angle), 2),
-                    round(float(heading), 2),
-                )
-            )
-        else:
-            # 非第一段先执行转向，确认下位机完成后再进入该段点到点直行。
-            log_task_turn_command(task, index, 'auto_drive')
-            turn_result = turn(ser, angle * 10, target_heading=heading, source='auto_drive', segment_index=index + 1, task_id=task.get('id', index + 1))
-            if turn_result != 1:
-                logger.warn("[auto_drive] 第{}段转向未确认完成，停止自动清扫，避免航向错误后继续直行".format(index + 1))
-                sendBraking()
-                global_doCleanThreadStop = 1
-                break
-            if _runtime_task_should_stop(task_token, 'auto_drive'):
-                global_doCleanThreadStop = 1
-                break
-            if mode == 1:
-                # moveBack(ser, turn_back_len)
-                if _runtime_task_should_stop(task_token, 'auto_drive'):
-                    global_doCleanThreadStop = 1
-                    break
-        speed = 350
-        if angle == 180:
-            speed = 200
-        # 执行当前路径段：内部会设置 global_cur_taskPoint、打开 global_go，并由 RTK 回调持续纠偏。
-        result = pointToPointByRTK(startLat,startLon,endLat,endLon,heading,speed)
+        # 第一段和后续各段使用完全相同的点位导航：实时位置 -> 自动转向 -> 直行到终点。
+        segment_speed = _coerce_int(task.get('speed'), runtime_speed)
+        result = _run_task_segment_by_point_navigation(
+            task,
+            segment_speed,
+            'auto_drive',
+            index + 1,
+        )
         if _runtime_task_should_stop(task_token, 'auto_drive'):
             global_go = 0
             # 表示自动清扫线程停止
             global_doCleanThreadStop = 1
             break
+        if not result:
+            global_doCleanThreadStop = 1
+            _mark_runtime_blocked(
+                'AUTO_DRIVE_SEGMENT_FAILED',
+                '第{}段点位导航失败，自动清扫已停止'.format(index + 1),
+                {'taskId': task.get('id', index + 1), 'segmentIndex': index + 1},
+            )
+            break
+
+        # 倒数第二段完成后，下一段就是最后一段；RTK纠偏回调会据此在接近终点时降速。
+        if index == len(taskList) - 2:
+            redis_cli.set("lastTask", 1)
         else:
-            if mode == 1 and index != len(taskList)-1:
-                # moveBack(ser,back_len)
-                if _runtime_task_should_stop(task_token, 'auto_drive'):
-                    global_doCleanThreadStop = 1
-                    break
-            if mode == 1 and index == len(taskList)-1:
-                if lastTaskBackLength != 0:
-                    moveBack(ser, lastTaskBackLength)
-            # 倒数第二段完成后，下一段就是最后一段；RTK纠偏回调会据此在接近终点时降速。
-            if index == len(taskList) - 2:
-                redis_cli.set("lastTask", 1)
-            else:
-                redis_cli.set("lastTask",0)
-            # 当前段完成后从 Redis 缓存中弹出，剩余列表用于续扫和状态展示。
-            logger.warn("删除任务{}".format(index + 1))
-            redis_cli.lpop("taskList")
+            redis_cli.set("lastTask", 0)
+        # 只有导航真正成功后才弹出任务，失败段保留给状态查询和故障排查。
+        logger.warn("删除任务{}".format(index + 1))
+        redis_cli.lpop("taskList")
     logger.warn("自动行驶结束")
     redis_cli.incr("doTaskCounter")
     if not _is_current_runtime_task(task_token):
@@ -4421,7 +4443,6 @@ def autoDriveByRTKThread(task_token=None):
         redis_cli.delete('taskList')
         _set_auto_resume_allowed(False, 'auto_drive_completed')
         if backLength != 0:
-            # intoGarage(chargingPileLat,chargingPileLon,originHeading)
             intoGarage(backLength)
         _mark_runtime_complete('RTK自动清扫任务结束', {'action': 'auto_drive'})
     else:
@@ -5381,18 +5402,32 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
     return result
 
 
-def pointToPointByRTKAutoHeading(current_start_lat, current_start_lon, endLat, endLon, speed=200):
+def pointToPointByRTKAutoHeading(
+        current_start_lat,
+        current_start_lon,
+        endLat,
+        endLon,
+        speed=200,
+        before_drive=None,
+        source='point_to_point_auto_heading',
+        segment_index=None,
+        task_id=None):
+    """按实时起点计算目标方向，完成转向后再执行点到点直行。"""
     distance, heading = util.get_distance_angle(current_start_lat, current_start_lon, endLat, endLon)
     logger.warn("go to point auto heading: distance={:.3f}, heading={:.3f}".format(float(distance), float(heading)))
     turn_result = turn(
         ser,
         heading * 10,
         target_heading=heading,
-        source='point_to_point_auto_heading',
+        source=source,
+        segment_index=segment_index,
+        task_id=task_id,
     )
     if turn_result != 1:
         sendBraking()
         return 0
+    if callable(before_drive):
+        before_drive()
     return pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)
 
 

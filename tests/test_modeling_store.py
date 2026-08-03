@@ -303,7 +303,9 @@ class ModelingStoreTest(unittest.TestCase):
         self.assertGreater(saved["taskPlan"]["summary"]["taskCount"], 1)
         self.assertEqual(saved["draft"]["taskPlan"]["generatedAt"], 1030)
         first = saved["taskPlan"]["tasks"][0]
-        self.assertEqual(first["mode"], 1)
+        self.assertEqual(first["mode"], 2)
+        self.assertEqual((first["startX"], first["startY"]), (0, 0))
+        self.assertEqual((first["endX"], first["endY"]), (1000, 0))
         self.assertIn("startLat", first)
         self.assertIn("endLon", first)
 

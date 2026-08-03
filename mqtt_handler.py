@@ -30,7 +30,29 @@ def _as_text(value):
 
 
 class MQTTCommandHandler(object):
+    """
+    MQTT 命令入口。
+
+    云平台发来的 command 在这里映射到小车控制器方法，处理结果再交由 MQTT 客户端回传。
+
+    典型请求数据：
+        {
+            "command": "sample_modeling_point",
+            "params": {}
+        }
+
+    统一处理结果：
+        {
+            "success": true,
+            "message": "modeling point recorded",
+            "data": {...}
+        }
+
+    该层只负责命令路由、基础参数校验和返回格式统一，
+    不在这里采集 RTK，也不在这里计算清扫路径。
+    """
     def __init__(self, vehicle_controller):
+        # command_map 将云平台命令名与对应处理函数建立一对一关系。
         self.vehicle_controller = vehicle_controller
         self.command_map = self._init_command_map()
         self.command_map.update({
@@ -78,6 +100,8 @@ class MQTTCommandHandler(object):
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
             'startModeling': self._handle_start_modeling,
             'start_modeling': self._handle_start_modeling,
+            'newModelingArea': self._handle_new_modeling_area,
+            'new_modeling_area': self._handle_new_modeling_area,
             'finishModeling': self._handle_finish_modeling,
             'finish_modeling': self._handle_finish_modeling,
             'getModelingState': self._handle_get_modeling_state,
@@ -135,6 +159,7 @@ class MQTTCommandHandler(object):
             'sample_modeling_point': self._handle_sample_modeling_point,
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
             'start_modeling': self._handle_start_modeling,
+            'new_modeling_area': self._handle_new_modeling_area,
             'finish_modeling': self._handle_finish_modeling,
             'get_modeling_state': self._handle_get_modeling_state,
             'undo_modeling_point': self._handle_undo_modeling_point,
@@ -146,6 +171,15 @@ class MQTTCommandHandler(object):
         }
 
     def handle(self, message_data):
+        """
+        MQTT 命令的统一处理流程。
+
+        1. 读取 command 和 params。
+        2. 根据 command_map 定位处理函数。
+        3. 调用适配器，进入小车本地 HTTP/FSM 功能。
+        4. 统一返回 success/message/data。
+        5. 任何未捕获异常转为 success=false，避免 MQTT 回调线程退出。
+        """
         try:
             command = message_data.get('command')
             params = message_data.get('params')
@@ -169,6 +203,13 @@ class MQTTCommandHandler(object):
             return {'success': False, 'message': '命令处理异常: {}'.format(exc)}
 
     def _normalize_controller_result(self, result, default_message):
+        """
+        将小车不同本地接口的返回值整理为统一 MQTT 结果。
+
+        - dict 且含 success 时，保留其 success/message/data。
+        - 普通数据时认为成功，并放入 data。
+        - None、空字符串或 '1' 视为只有成功状态，使用 default_message。
+        """
         if isinstance(result, dict):
             success = result.get('success')
             message = result.get('message') or default_message
@@ -189,6 +230,12 @@ class MQTTCommandHandler(object):
         return response
 
     def _call_controller(self, method_name, default_message, *args):
+        """
+        调用 VehicleControllerAdapter 中的指定方法。
+
+        调用前先检查适配器是否真正实现该方法，
+        防止云平台发来一个小车当前版本不支持的命令时直接崩溃。
+        """
         if not hasattr(self.vehicle_controller, method_name):
             return {'success': False, 'message': '车辆控制器不支持 {} 方法'.format(method_name)}
         result = getattr(self.vehicle_controller, method_name)(*args)
@@ -322,6 +369,7 @@ class MQTTCommandHandler(object):
         return self._call_controller('set_current_task', '任务已设置为当前任务', task_name)
 
     def _handle_save_modeling_task(self, params):
+        # 仅在 finish_modeling 已生成可执行路径后，才能用 taskName 将其保存。
         task_name = self._extract_task_name(params)
         if not task_name:
             return {'success': False, 'message': 'taskName is required'}
@@ -338,12 +386,15 @@ class MQTTCommandHandler(object):
         )
 
     def _handle_get_saved_routes(self, params):
+        # 返回的不是单纯名称列表，而是每条已保存路线的区域点、连接点和规划点。
         return self._call_controller(
             'get_saved_routes',
             'saved routes fetched',
         )
 
     def _handle_sample_modeling_point(self, params):
+        # “记录区域点”按钮对应该命令，实际坐标由小车当前 RTK 位置采样得到。
+        # params 为空时写入当前活动建模会话；显式传入标识时，modelId 和 groupId 必须成对出现。
         model_id = self._extract_model_id(params)
         group_id = self._extract_group_id(params)
         try:
@@ -367,6 +418,8 @@ class MQTTCommandHandler(object):
             return {'success': False, 'message': 'modeling point recording failed: {}'.format(exc)}
 
     def _handle_sample_modeling_link_point(self, params):
+        # “记录连接点”与区域点分开存储，后续用于生成跨区域移动段。
+        # 一条连接桥可连续记录多个点，每次点击只追加一个点，这里不强制“两次点击即完成”。
         model_id = self._extract_model_id(params)
         link_id = self._extract_link_id(params)
         try:
@@ -409,6 +462,8 @@ class MQTTCommandHandler(object):
             return {'success': False, 'message': 'modeling path fetch failed: {}'.format(exc)}
 
     def _handle_get_modeling_result(self, params):
+        # 一次返回 areaPoints、linkPoints 和 pathPoints，供前端按顺序直接绘图。
+        # 该命令只查询 FSM 已生成的结果，不会再次计算或改变任务。
         model_id = self._extract_model_id(params)
         try:
             if not model_id:
@@ -466,11 +521,19 @@ class MQTTCommandHandler(object):
             return {'success': False, 'message': 'modeling link points fetch failed: {}'.format(exc)}
 
     def _handle_start_modeling(self, params):
+        # 创建新的建模会话，后续的打点命令都写入该会话。
+        # restart=false 时若已有活动会话则保护现有数据；restart=true 才明确重新开始。
         name = str(params.get('name') or '').strip() if isinstance(params, dict) else ''
         restart = bool(params.get('restart', False)) if isinstance(params, dict) else False
         return self._call_controller('start_modeling', 'modeling started', name or None, restart)
 
+    def _handle_new_modeling_area(self, params):
+        # 连接点记录完成后显式创建下一区域；区域编号由 FSM 自动递增。
+        return self._call_controller('new_modeling_area', 'new modeling area created')
+
     def _handle_finish_modeling(self, params):
+        # 完成打点后依次执行：区域识别 -> 清扫线预览 -> 机器人 taskPlan 生成。
+        # 返回成功只表示规划完成；此时还没有路线名，必须再调用 save_modeling_task 才会保存。
         return self._call_controller('finish_modeling', 'modeling path generated')
 
     def _handle_get_modeling_state(self, params):
@@ -489,6 +552,7 @@ class MQTTCommandHandler(object):
         return self._call_controller('undo_modeling_point', 'modeling point undone', point_type)
 
     def _handle_delete_modeling_point(self, params):
+        # id 是点位的唯一标识，删除后下次查询区域点列表将不再包含该点。
         point_id = str(params.get('id') or '').strip() if isinstance(params, dict) else ''
         if not point_id or re.match(r'^[A-Za-z0-9_-]+$', point_id) is None:
             return {'success': False, 'message': 'valid point id is required'}
@@ -499,6 +563,7 @@ class MQTTCommandHandler(object):
         )
 
     def _handle_delete_modeling_link_point(self, params):
+        # 连接点使用独立命令删除，避免与区域点列表混淆。
         point_id = str(params.get('id') or '').strip() if isinstance(params, dict) else ''
         if not point_id or re.match(r'^[A-Za-z0-9_-]+$', point_id) is None:
             return {'success': False, 'message': 'valid connection point id is required'}
@@ -515,6 +580,7 @@ class MQTTCommandHandler(object):
         return self._call_controller('clear_modeling_points', 'modeling points cleared', point_type)
 
     def _handle_clear_modeling_area_points(self, params):
+        # 只清空当前建模会话的区域点，不删除连接点。
         return self._call_controller(
             'clear_all_modeling_points',
             'all modeling area points cleared',
@@ -522,6 +588,7 @@ class MQTTCommandHandler(object):
         )
 
     def _handle_clear_modeling_link_points(self, params):
+        # 只清空当前建模会话的连接点，不删除区域点。
         return self._call_controller(
             'clear_all_modeling_points',
             'all modeling link points cleared',

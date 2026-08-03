@@ -1,7 +1,9 @@
 # coding=utf-8
 """
-?????????? MQTT ??????? Flask HTTP ???
-????? requests??????? Python 2 ???????????
+MQTT 命令处理器与小车本地 Flask HTTP 接口之间的适配层。
+
+该文件不计算清扫路径，只把 MQTT 命令转成本地接口调用，再将结果整理为 MQTT 回复。
+实现仅使用标准库 HTTP 客户端，保持与小车 Python 2.7 环境兼容。
 """
 import json
 import os
@@ -28,6 +30,7 @@ _frontend_path_points = frontend_path_points
 
 
 class VehicleControllerAdapter(object):
+    """封装小车 127.0.0.1:7899 本地接口，供 MQTTCommandHandler 统一调用。"""
     def __init__(self, base_url=None, timeout=10):
         self.base_url = (base_url or os.environ.get('CLEANER_HTTP_BASE_URL') or 'http://127.0.0.1:7899').rstrip('/')
         self.timeout = timeout
@@ -53,6 +56,16 @@ class VehicleControllerAdapter(object):
             return body
 
     def _call(self, path, params=None, json_data=None):
+        """
+        调用小车本机 Flask 接口。
+
+        - path：本地接口路径，默认基址为 http://127.0.0.1:7899。
+        - params：编码到 URL query string。
+        - json_data：编码成 UTF-8 JSON 请求体。
+
+        HTTP 4xx/5xx 如果已包含业务 JSON，则尽量保留原错误码和错误数据；
+        连接失败则抛出 RuntimeError，由上层 MQTT 处理器转成失败回复。
+        """
         url = self.base_url + path
         if params:
             url = url + '?' + urlencode(params)
@@ -165,9 +178,11 @@ class VehicleControllerAdapter(object):
         return self.set_current_task(task_name)
 
     def set_current_task(self, task_name):
+        """将一条已保存路线设为当前任务；只有完成此操作，auto_drive 才会执行该路线。"""
         return self._call('/vehicle/setCurrentTask', params={'taskName': task_name})
 
     def save_modeling_task(self, task_name):
+        """把当前已规划路径以 taskName 命名保存。"""
         return self._normalize_modeling_response(
             self._call(
                 '/modeling/session/save-task',
@@ -198,6 +213,12 @@ class VehicleControllerAdapter(object):
         }
 
     def get_saved_routes(self):
+        """
+        查询小车中已命名保存的所有路线。
+
+        routes 中每一项包含路线名称以及 areaPoints/linkPoints/pathPoints，
+        currentTaskName 表示当前真正被小车选中的路线。
+        """
         response = self._call('/vehicle/selectSavedRoutes')
         if not isinstance(response, dict) or response.get('success') is False:
             return {
@@ -231,6 +252,12 @@ class VehicleControllerAdapter(object):
         return self._call('/vehicle/getTaskPath')
 
     def _normalize_modeling_response(self, response, default_message):
+        """
+        统一小车建模 HTTP 接口的返回格式。
+
+        本地 Flask 接口可能使用 msg 或 message，该方法统一转为
+        success/message/data，同时保留 code，供云平台和前端判断具体错误。
+        """
         if not isinstance(response, dict):
             return {
                 'success': False,
@@ -255,6 +282,12 @@ class VehicleControllerAdapter(object):
         }
 
     def start_modeling(self, name=None, restart=False):
+        """
+        启动小车本地建模会话。
+
+        name 可以作为建模阶段的临时名称；
+        restart 明确表示是否丢弃现有未完成会话并重新开始。
+        """
         payload = {'restart': bool(restart)}
         if name:
             payload['name'] = str(name)
@@ -267,6 +300,13 @@ class VehicleControllerAdapter(object):
         return self._normalize_modeling_response(
             self._call('/modeling/session/current'),
             'modeling state fetched',
+        )
+
+    def new_modeling_area(self):
+        """Create the next area and bind the connection points just recorded."""
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/new-area', json_data={}),
+            'new modeling area created',
         )
 
     def undo_modeling_point(self, point_type=None):
@@ -315,12 +355,20 @@ class VehicleControllerAdapter(object):
         )
 
     def finish_modeling(self):
+        """调用本地 finish 流程，触发区域识别、清扫线计算和 taskPlan 生成。"""
         return self._normalize_modeling_response(
             self._call('/modeling/session/finish', json_data={}),
             'modeling path generated',
         )
 
     def sample_modeling_point(self, model_id=None, group_id=None):
+        """
+        采样一个区域边界点。
+
+        正常小程序流程不传 ID，直接将小车当前 RTK 位置写入活动会话。
+        显式传入 model_id/group_id 时，可将点写入指定建模和区域，主要用于精确调试。
+        成功返回的 point 包含唯一 id、记录顺序、x/y 和 lat/lon。
+        """
         if model_id is None and group_id is None:
             return self._normalize_modeling_response(
                 self._call('/modeling/session/record-area-point', json_data={}),
@@ -368,6 +416,12 @@ class VehicleControllerAdapter(object):
         }
 
     def sample_modeling_link_point(self, model_id=None, link_id=None):
+        """
+        采样一个跨区域连接点。
+
+        该点与区域点分开存储，同一个 linkId 可以连续追加多个过渡点，
+        路径生成时会按记录顺序拆成多段 mode=2 连接桥任务。
+        """
         if model_id is None and link_id is None:
             return self._normalize_modeling_response(
                 self._call('/modeling/session/record-link-point', json_data={}),
@@ -415,6 +469,12 @@ class VehicleControllerAdapter(object):
         }
 
     def get_modeling_points(self, model_id=None):
+        """
+        读取指定或当前建模草稿，只返回前端需要的区域点列表。
+
+        frontend_area_points 负责将内部 group/subArea 结构展平为 points[]，
+        每个点保留 id/name/sequence/x/y/lat/lon，供前端列表展示和按 id 删除。
+        """
         if model_id is None:
             current_response = self._call('/modeling/session/current')
             if not isinstance(current_response, dict):
@@ -464,6 +524,12 @@ class VehicleControllerAdapter(object):
         }
 
     def get_modeling_link_points(self, model_id=None):
+        """
+        读取指定或当前建模草稿，只返回前端需要的连接点列表。
+
+        返回 points[] 的字段与区域点保持一致，但数据来源是 groupLinks，
+        前端可以使用独立页签展示和删除。
+        """
         if model_id is None:
             current_response = self._call('/modeling/session/current')
             if not isinstance(current_response, dict):
@@ -513,6 +579,12 @@ class VehicleControllerAdapter(object):
         }
 
     def get_modeling_path(self, model_id=None):
+        """
+        返回 FSM 生成的完整 taskPreview 和 taskPlan，不在适配层重新规划。
+
+        taskPreview 是区域、连接桥和清扫线的预览结构；
+        taskPlan.tasks 是机器人真正执行的有序分段列表。
+        """
         if model_id is None:
             return self._normalize_modeling_response(
                 self._call('/modeling/session/path'),
@@ -552,6 +624,15 @@ class VehicleControllerAdapter(object):
         }
 
     def get_modeling_result(self, model_id=None):
+        """
+        把建模草稿整理为前端统一绘图数据：
+
+        - areaPoints：用户记录的全部区域边界点。
+        - linkPoints：用户记录的全部跨区域连接点。
+        - pathPoints：从 taskPlan.tasks 中按执行顺序展开的路径点。
+
+        前端只需要按 sequence 连接 pathPoints，无需理解内部 lane 和 task 结构。
+        """
         if model_id is None:
             current_response = self._call('/modeling/session/current')
             if not isinstance(current_response, dict):

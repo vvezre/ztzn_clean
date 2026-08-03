@@ -23,7 +23,7 @@ try:
 except Exception:
     get_shared_runtime = None
 
-DEFAULT_TASK_ORIGIN_TOLERANCE_METERS = 0.02
+DEFAULT_TASK_ORIGIN_TOLERANCE_METERS = 0.20
 RTK_FIXED_QUALITY = '4'
 RTK_FIXED_GGA_MAX_AGE_SECONDS = 2.0
 RTK_FIX_RECOVERY_TIMEOUT_SECONDS = 300.0
@@ -123,6 +123,23 @@ class MQTTIntegration:
             logger.error("发布命令结果失败: {}".format(str(e)), exc_info=True)
 
     def _get_vehicle_status_from_redis(self):
+        """
+        从 Redis 汇总云平台需要的完整设备状态。
+
+        数据来源分为四类：
+        1. currentLocation：RTK 经纬度和当前航向。
+        2. taskParams/config.json：当前路线名、起点、起始航向和任务段数量。
+        3. runtimeState：当前动作、运行阶段、停止原因和故障状态。
+        4. 下位机实时上报：行走速度、滚刷速度、电压和电量。
+
+        重要字段：
+        - speed/brush_speed：最新硬件实测值，过期时不冒充实时值。
+        - command_speed/command_brush_speed：下发的目标值。
+        - lat/lon/heading：绝对 RTK 位置和航向。
+        - local_x/local_y：相对当前路线原点的厘米坐标。
+        - task_name/cur_task_index/task_count：当前路线执行进度。
+        - control_state/health_state/fault_state：前端按钮和故障提示的判断依据。
+        """
         if not self.redis_client:
             return {}
 
@@ -164,6 +181,7 @@ class MQTTIntegration:
                 'lat': lat,
                 'lon': lon,
                 'heading': heading,
+                # local_x/local_y 是相对当前建模原点的厘米坐标，前端用它绘制机器人在路线中的实时位置。
                 'local_x': local_x,
                 'local_y': local_y,
                 'taskOrigin': task_origin_fields.get('taskOrigin'),
@@ -195,7 +213,7 @@ class MQTTIntegration:
                 'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
                 'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
                 'supported_actions': [
-                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path', 'get_modeling_points'
+                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path', 'get_modeling_points', 'new_modeling_area'
                 ],
                 'supported_params': ['taskName', 'modelId', 'speed', 'tracking', 'path'],
                 'supported_status_fields': [
@@ -216,6 +234,17 @@ class MQTTIntegration:
             return {}
 
     def _modeling_local_xy_cm(self, lat, lon, runtime_state, current_action=None):
+        """
+        计算“建模任务执行期间”的实时相对位置。
+
+        建模任务的第一段同时保存了 startLat/startLon 和 startX/startY。
+        程序以该点作为锚点：
+        1. 将当前 RTK lat/lon 换算为相对锚点的米制 x/y。
+        2. 转为厘米后加上锚点本身的 startX/startY。
+
+        这样前端收到的实时位置与 pathPoints 使用同一套相对坐标系。
+        非 modeling_task 运行状态时返回 None，交给通用路线原点算法处理。
+        """
         runtime_state = runtime_state if isinstance(runtime_state, dict) else {}
         action = runtime_state.get('action') or current_action
         if action != 'modeling_task':
@@ -246,6 +275,16 @@ class MQTTIntegration:
         )
 
     def _compute_local_xy_cm(self, lat, lon, runtime_state=None, current_action=None):
+        """
+        统一计算前端使用的 local_x/local_y，单位厘米。
+
+        优先级：
+        1. 正在执行建模任务时，使用 modelingTask 第一段作为坐标锚点。
+        2. 执行已保存路线时，使用 taskParams.startLat/startLon/originHeading 建立路线坐标系。
+
+        latlon_to_local_rotated_xy_precise 先计算米制东北位移，再根据 originHeading 旋转到路线坐标系。
+        缺少 RTK 位置或路线原点参数时返回 (None, None)，不向前端上报伪造的 0,0。
+        """
         if lat is None or lon is None:
             return None, None
         try:
@@ -668,6 +707,13 @@ class MQTTIntegration:
             return json.load(fp)
 
     def publish_vehicle_status(self):
+        """
+        周期性发布完整设备状态。
+
+        MQTT 消息 type=vehicle_status，data 为 _get_vehicle_status_from_redis 组装的完整字段。
+        云平台用它更新设备在线状态、电量、速度、当前任务和故障信息。
+        该上报包含字段多，因此保持原有较低频率。
+        """
         try:
             status = self._get_vehicle_status_from_redis()
 
@@ -688,6 +734,12 @@ class MQTTIntegration:
             logger.error("发布车辆状态失败: {}".format(str(e)), exc_info=True)
 
     def _get_vehicle_position_from_redis(self):
+        """
+        读取最新 RTK 位置，并换算为前端路线图使用的相对坐标。
+
+        这是高频实时位置消息的最小数据集，只包含 local_x/local_y，
+        不重复上报电量、任务列表等大量低频字段。
+        """
         if not self.redis_client:
             return {}
 
@@ -713,6 +765,12 @@ class MQTTIntegration:
             return {}
 
     def publish_vehicle_position(self):
+        """
+        独立高频发布小车相对位置，不改变原有完整状态上报频率。
+
+        MQTT 消息 type=vehicle_position，data 中只有 local_x/local_y。
+        前端每次收到后更新路线图上的机器人图标，实现清扫进度动画。
+        """
         try:
             position = self._get_vehicle_position_from_redis()
             if position:
@@ -739,6 +797,7 @@ class MQTTIntegration:
                 time.sleep(1)
 
     def _position_publish_loop(self):
+        """实时位置独立线程：断线时尝试重连，连接正常时按 position_interval 循环上报。"""
         logger.info("实时相对位置上报线程已启动，间隔 {} 秒".format(self.position_interval))
 
         while self.running:

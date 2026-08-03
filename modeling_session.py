@@ -155,22 +155,65 @@ class ModelingSession(object):
             state = self._read_state()
             return self._summary(state) if state else self._summary(None)
 
+    def new_area(self):
+        """Create and select the next area after its connection was recorded."""
+        with self._lock:
+            state = self._require_state()
+            model_id = state["modelId"]
+            draft = self.store.get_draft(model_id)
+            current_group = self._find_group(draft, state.get("currentGroupId"))
+            if current_group is None:
+                raise ModelingSessionError("MODELING_GROUP_MISSING", "current modeling area is missing")
+            if len(current_group.get("points") or []) < 4:
+                raise ModelingSessionError(
+                    "MODELING_AREA_INCOMPLETE",
+                    "record at least four points before creating the next area",
+                )
+
+            current_link = self._find_link(draft, state.get("currentLinkId"))
+            if current_link is None:
+                raise ModelingSessionError(
+                    "MODELING_LINK_MISSING",
+                    "record connection points before creating the next area",
+                )
+            if current_link.get("endGroupId"):
+                raise ModelingSessionError("MODELING_LINK_ALREADY_BOUND", "connection already has a destination area")
+            if len(current_link.get("points") or []) != 2:
+                raise ModelingSessionError(
+                    "MODELING_LINK_INCOMPLETE",
+                    "record both connection points before creating the next area",
+                )
+
+            created = self.store.create_group_from_pending_link(
+                model_id,
+                current_link.get("id"),
+                now=self._timestamp(),
+            )
+            next_group = created["group"]
+            state["previousGroupId"] = current_group.get("id")
+            state["currentGroupId"] = next_group.get("id")
+            state["currentLinkId"] = None
+            state["pendingGroupId"] = None
+            state["captureMode"] = None
+            state["currentPointType"] = "area"
+            state = self._write_state(state)
+            summary = self._summary(state, created["draft"])
+            return {
+                "areaNumber": next_group.get("areaNumber"),
+                "groupCount": summary.get("groupCount"),
+            }
+
     def record_area_point(self):
         with self._lock:
             state = self._require_state()
             model_id = state["modelId"]
             draft = self.store.get_draft(model_id)
             active_link = self._find_link(draft, state.get("currentLinkId"))
-            if active_link is not None:
-                if active_link.get("status") != "ready":
-                    raise ModelingSessionError(
-                        "MODELING_LINK_INCOMPLETE",
-                        "record both connection points before recording the next area",
-                    )
-                if state.get("captureMode") != "mixed_boundary":
-                    state["currentGroupId"] = state.get("pendingGroupId")
-                    state["currentLinkId"] = None
-                    state["pendingGroupId"] = None
+            if active_link is not None and (active_link.get("points") or []):
+                raise ModelingSessionError(
+                    "MODELING_NEW_AREA_REQUIRED",
+                    "create the next area before recording more area points",
+                )
 
             group_id = state.get("currentGroupId")
             if not group_id:
@@ -182,14 +225,15 @@ class ModelingSession(object):
                 "area",
                 result["point"],
             )
+            public_point = dict(result["point"])
+            public_point["areaNumber"] = result["group"].get("areaNumber")
             state["currentPointType"] = "area"
             state = self._write_state(state)
             return {
                 "modelId": model_id,
-                "groupId": group_id,
                 "pointType": "area",
                 "pointNo": result["point"].get("sequence"),
-                "point": result["point"],
+                "point": public_point,
                 "session": self._summary(state, saved),
             }
 
@@ -205,15 +249,17 @@ class ModelingSession(object):
             link_id = state.get("currentLinkId")
             if not link_id:
                 if len(current_group.get("points") or []) < 4:
-                    state["captureMode"] = "mixed_boundary"
-                next_group = self.store.create_group(model_id, None)["group"]
-                created = self.store.create_group_link(model_id, {
-                    "startGroupId": current_group["id"],
-                    "endGroupId": next_group["id"],
-                })
+                    raise ModelingSessionError(
+                        "MODELING_AREA_INCOMPLETE",
+                        "record at least four area points before recording connection points",
+                    )
+                created = self.store.create_pending_group_link(
+                    model_id,
+                    current_group["id"],
+                    now=self._timestamp(),
+                )
                 link_id = created["groupLink"]["id"]
                 state["currentLinkId"] = link_id
-                state["pendingGroupId"] = next_group["id"]
                 draft = created["draft"]
 
             result = self.store.append_group_link_point(model_id, link_id, self._sample())
@@ -409,7 +455,12 @@ class ModelingSession(object):
                     raise ModelingSessionError(error.code, error.message)
                 draft = self.store.save_draft(model_id, draft)
             links = list(draft.get("groupLinks") or [])
-            incomplete_links = [link for link in links if len(link.get("points") or []) != 2]
+            incomplete_links = [
+                link for link in links
+                if len(link.get("points") or []) != 2
+                or not link.get("startGroupId")
+                or not link.get("endGroupId")
+            ]
             if incomplete_links:
                 raise ModelingSessionError(
                     "MODELING_LINK_INCOMPLETE",

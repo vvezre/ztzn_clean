@@ -370,6 +370,73 @@ class ModelingStore(object):
             "groupLink": saved["groupLinks"][saved_index],
         }
 
+    def create_pending_group_link(self, model_id, start_group_id, now=None):
+        """Create a connection whose destination will be the next explicit area."""
+        current_time = self._timestamp(now)
+        draft = self.get_draft(model_id)
+        groups = draft.get("groups") or []
+        start_index = self._find_group_index(draft, start_group_id)
+        start_group = groups[start_index]
+        link = {
+            "id": self._new_group_link_id(),
+            "type": "group_connector",
+            "name": _text(u"{} -> 待新增区域".format(start_group.get("name"))),
+            "startGroupId": start_group.get("id"),
+            "endGroupId": None,
+            "points": [],
+            "status": "draft",
+            "createdAt": current_time,
+            "updatedAt": current_time,
+        }
+        links = list(draft.get("groupLinks") or [])
+        links.append(link)
+        draft["groupLinks"] = links
+        self._clear_task_outputs(draft)
+        saved = self.save_draft(model_id, draft, now=current_time)
+        saved_index = self._find_group_link_index(saved, link["id"])
+        return {
+            "draft": saved,
+            "groupLink": saved["groupLinks"][saved_index],
+        }
+
+    def create_group_from_pending_link(self, model_id, link_id, name=None, now=None):
+        """Atomically create the next area and bind the pending connection."""
+        current_time = self._timestamp(now)
+        draft = self.get_draft(model_id)
+        link_index = self._find_group_link_index(draft, link_id)
+        link = dict(draft["groupLinks"][link_index])
+        start_group_index = self._find_group_index(draft, link.get("startGroupId"))
+        start_group = draft["groups"][start_group_index]
+
+        if link.get("endGroupId"):
+            raise InvalidModelPayloadError("group link is already bound")
+        if len(link.get("points") or []) != 2:
+            raise InvalidModelPayloadError("record both connection points before creating the next area")
+
+        groups = list(draft.get("groups") or [])
+        end_group = self._normalize_group(
+            {"name": name},
+            area_number=self._next_area_number(groups),
+            now=current_time,
+        )
+        groups.append(end_group)
+        draft["groups"] = groups
+
+        link["endGroupId"] = end_group.get("id")
+        link["name"] = _text(u"{} -> {}".format(start_group.get("name"), end_group.get("name")))
+        link["status"] = "ready"
+        link["updatedAt"] = current_time
+        draft["groupLinks"][link_index] = link
+        self._clear_task_outputs(draft)
+        saved = self.save_draft(model_id, draft, now=current_time)
+        saved_link_index = self._find_group_link_index(saved, link_id)
+        saved_group_index = self._find_group_index(saved, end_group.get("id"))
+        return {
+            "draft": saved,
+            "groupLink": saved["groupLinks"][saved_link_index],
+            "group": saved["groups"][saved_group_index],
+        }
+
     def append_group_link_point(self, model_id, link_id, point, now=None):
         if not isinstance(point, dict):
             raise InvalidModelPayloadError("point payload must be an object")
@@ -397,7 +464,7 @@ class ModelingStore(object):
 
         points.append(normalized)
         link["points"] = points
-        link["status"] = "ready" if len(points) == 2 else "draft"
+        link["status"] = "ready" if len(points) == 2 and link.get("endGroupId") else "draft"
         link["updatedAt"] = current_time
         draft["groupLinks"][index] = link
         self._clear_task_outputs(draft)
@@ -429,7 +496,7 @@ class ModelingStore(object):
             point["updatedAt"] = current_time
 
         link["points"] = next_points
-        link["status"] = "ready" if len(next_points) == 2 else "draft"
+        link["status"] = "ready" if len(next_points) == 2 and link.get("endGroupId") else "draft"
         link["updatedAt"] = current_time
         draft["groupLinks"][index] = link
         self._clear_task_outputs(draft)
@@ -491,6 +558,7 @@ class ModelingStore(object):
         normalized["x"] = self._normalize_optional_float(normalized.get("x"))
         normalized["y"] = self._normalize_optional_float(normalized.get("y"))
         normalized["source"] = str(normalized.get("source") or "rtk_mean")
+        normalized["areaNumber"] = int(group.get("areaNumber") or 1)
         normalized.setdefault("role", "unknown")
         normalized.setdefault("roles", [])
         normalized["createdAt"] = int(normalized.get("createdAt") or current_time)

@@ -220,6 +220,9 @@ class ModelingRoutesTest(unittest.TestCase):
             self.client.post("/modeling/session/record-area-point", json={})
         self.client.post("/modeling/session/record-link-point", json={})
         self.client.post("/modeling/session/record-link-point", json={})
+        created_area = self.client.post("/modeling/session/new-area", json={})
+        self.assertEqual(created_area.status_code, 200)
+        self.assertEqual(created_area.get_json()["data"], {"areaNumber": 2, "groupCount": 2})
         for _ in range(2):
             self.client.post("/modeling/session/record-area-point", json={})
 

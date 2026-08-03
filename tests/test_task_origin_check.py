@@ -34,6 +34,11 @@ class TaskOriginCheckTest(unittest.TestCase):
         source = read_file(MAIN_PATH)
 
         self.assertIn("TASK_ORIGIN_TOLERANCE_METERS", source)
+        self.assertIn("TASK_ORIGIN_TOLERANCE_METERS = 0.20", source)
+        self.assertIn(
+            "START_POSITION_TOLERANCE_METERS = TASK_ORIGIN_TOLERANCE_METERS",
+            source,
+        )
         self.assertIn("def _build_task_origin_check_result(", source)
         self.assertIn("def _build_task_origin_status_fields(", source)
         self.assertIn('@app.route("/vehicle/isAtTaskOrigin"', source)
@@ -71,6 +76,25 @@ class TaskOriginCheckTest(unittest.TestCase):
         self.assertIn("def _build_task_origin_status_fields(", mqtt_source)
         self.assertIn("taskOrigin", mqtt_source)
         self.assertIn("currentLocation", mqtt_source)
+
+    def test_saved_and_direct_modeling_tasks_share_live_point_navigation(self):
+        source = read_file(MAIN_PATH)
+
+        shared_body = function_body(source, "_run_task_segment_by_point_navigation")
+        self.assertIn("global_cur_rtk_lat", shared_body)
+        self.assertIn("global_cur_rtk_lon", shared_body)
+        self.assertIn("pointToPointByRTKAutoHeading", shared_body)
+        self.assertIn("switch_off_clean_mode", shared_body)
+        self.assertIn("switch_on_clean_mode", shared_body)
+        self.assertIn("sendBraking", shared_body)
+
+        modeling_body = function_body(source, "_run_modeling_task_segment")
+        self.assertIn("_run_task_segment_by_point_navigation", modeling_body)
+
+        auto_drive_body = function_body(source, "autoDriveByRTKThread")
+        self.assertIn("_run_task_segment_by_point_navigation", auto_drive_body)
+        self.assertNotIn("turnCheckPoint(originHeading)", auto_drive_body)
+        self.assertNotIn("pointToPointByRTK(startLat", auto_drive_body)
 
 
 if __name__ == "__main__":

@@ -87,6 +87,34 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(preview["config"]["laneSpacingCm"], 63.0)
         self.assertEqual(preview["groups"][0]["subAreas"][0]["laneCount"], 4)
 
+    def test_default_policy_uses_nearest_even_lane_count(self):
+        from modeling_preview import build_model_preview
+
+        points = [
+            _point("p1", 0, 0),
+            _point("p2", 0, 139),
+            _point("p3", 300, 139),
+            _point("p4", 300, 0),
+        ]
+        draft = {
+            "id": "default-even-route",
+            "recognition": {"confirmed": True, "groupId": "g1"},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{"id": "sa1", "pointIds": [point["id"] for point in points]}],
+                "connectors": [],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+
+        self.assertTrue(preview["config"]["forceEvenLanes"])
+        self.assertEqual(preview["groups"][0]["subAreas"][0]["laneCount"], 4)
+
     def test_round_trip_policy_chooses_nearest_even_lane_count_per_area(self):
         from modeling_preview import build_model_preview
 
@@ -179,6 +207,10 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(len(preview["groupLinks"]), 1)
         self.assertEqual(preview["groupLinks"][0]["startPoint"]["id"], "lp1")
         self.assertEqual(preview["groupLinks"][0]["endPoint"]["id"], "lp2")
+        self.assertEqual(
+            [point["id"] for point in preview["groupLinks"][0]["points"]],
+            ["lp1", "lp2"],
+        )
 
 
 if __name__ == "__main__":

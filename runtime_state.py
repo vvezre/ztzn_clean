@@ -1,6 +1,22 @@
 # coding=utf-8
 
+"""把机器人内部的多组运行字段整理成统一的前端状态快照。
+
+旧程序同时存在 controlState、mission、parking、currentAction 等字段，不同页面各自判断，
+容易出现同一时刻显示不一致。本模块集中完成兼容、状态推导、中文名称和行为能力计算，
+最终生成 runtimeState。它只解释状态，不发送控制命令，也不改变小车运行状态。
+"""
+
 import time
+
+
+try:
+    # 同时兼容小车 Python 2 与开发机 Python 3，避免中文状态标签被错误地按 ASCII 转换。
+    text_type = unicode
+    binary_type = str
+except NameError:
+    text_type = str
+    binary_type = bytes
 
 
 RUNTIME_STATE_KEY = "runtimeState"
@@ -68,16 +84,26 @@ EFFECT_LABELS = {
 
 
 def _text(value):
+    """安全地把 str/unicode/bytes 转成 Unicode 文本，供全部状态字段统一使用。"""
     if value is None:
         return ""
-    return str(value).strip()
+    if isinstance(value, text_type):
+        return value.strip()
+    if isinstance(value, binary_type):
+        try:
+            return value.decode("utf-8").strip()
+        except Exception:
+            return value.decode("utf-8", "replace").strip()
+    return text_type(value).strip()
 
 
 def _upper(value):
+    """标准化状态码；状态枚举统一用大写比较。"""
     return _text(value).upper()
 
 
 def _bool(value):
+    """解析 Redis/JSON 中常见的布尔表达，包括 0/1、true/false 和 working。"""
     if isinstance(value, bool):
         return value
     text = _text(value).lower()
@@ -92,6 +118,7 @@ def _bool(value):
 
 
 def _int_or_none(value):
+    """把任务序号等数值转换为整数；无效值返回 None，避免状态接口异常。"""
     if value in (None, ""):
         return None
     try:
@@ -101,6 +128,7 @@ def _int_or_none(value):
 
 
 def _rtk_state(detail):
+    """从运行 detail 中提取 RTK 状态，优先使用明确状态码，再兼容旧布尔字段。"""
     detail = detail if isinstance(detail, dict) else {}
     if detail.get("rtkFixState"):
         return _text(detail.get("rtkFixState"))
@@ -112,13 +140,21 @@ def _rtk_state(detail):
 
 
 def _lifecycle_state(control_state, mission, parking, action, fault_state):
+    """确定前端最终展示的生命周期状态。
+
+    新版 controlState 优先级最高；只有它缺失或是旧的 IDLE 时，才结合 mission、parking、
+    action 和 faultState 推导。这保证新状态机上线后不会被旧字段覆盖，同时仍能展示旧版本
+    小车的状态。
+    """
     control = _upper(control_state)
     mission_value = _text(mission).lower()
     is_parking = _bool(parking)
     action_value = _text(action)
 
+    # 新状态机已经给出明确值时直接采用，不再用旧字段二次猜测。
     if control in ("INITIALIZING", "READY", "RUNNING", "PAUSED", "STOPPING", "STOPPED", "COMPLETE", "BLOCKED", "FAULT", "DISABLED", "UNKNOWN"):
         return control
+    # IDLE 是旧程序的模糊状态，需要结合是否停车、任务是否完成进一步区分。
     if control == "IDLE":
         if is_parking:
             return "STOPPED"
@@ -139,6 +175,11 @@ def _lifecycle_state(control_state, mission, parking, action, fault_state):
 
 
 def _effects(state, health, fault):
+    """根据最终状态计算页面和控制逻辑可以直接使用的行为能力标记。
+
+    ``startAllowed`` 仅表示状态层面允许显示/尝试启动；真正启动时仍需通过任务选择、RTK、
+    下位机使能、起点距离等启动检查，不能把这里的 True 当作电机一定会启动。
+    """
     state = _upper(state)
     health = _upper(health)
     has_fault = bool(_text(fault))
@@ -153,26 +194,35 @@ def _effects(state, health, fault):
 
 
 def _label(mapping, value):
+    """把状态码映射为中文；未知值保留原文，便于发现新增状态。"""
     text = _text(value)
     if not text:
         return ""
-    return mapping.get(text, mapping.get(text.upper(), text))
+    return _text(mapping.get(text, mapping.get(text.upper(), text)))
 
 
 def _effect_labels(effects):
-    return [label for key, label in EFFECT_LABELS.items() if effects.get(key)]
+    """把所有为 True 的行为能力转换成中文列表，便于页面和日志展示。"""
+    return [_text(label) for key, label in EFFECT_LABELS.items() if effects.get(key)]
 
 
 def build_runtime_state_snapshot(control_state=None, health_state=None, fault_state=None,
                                  mission=None, parking=None, action=None,
                                  task_name=None, task_index=None, start_ready=None,
                                  message=None, detail=None, now=None):
+    """生成一次完整、可序列化的运行状态快照。
+
+    输出同时包含机器字段（state/action/health/fault）、中文字段（各类 Label）、当前任务、
+    RTK 摘要、启动就绪标志、行为能力 effects 和更新时间。云平台及前端读取这一份结构即可，
+    不需要各自重复推断旧字段。
+    """
     detail = detail if isinstance(detail, dict) else {}
     health = _upper(health_state) or ("WARN" if fault_state else "OK")
     fault = _text(fault_state)
     state = _lifecycle_state(control_state, mission, parking, action, fault)
     effects = _effects(state, health, fault)
     timestamp = int(time.time() if now is None else now)
+    # schemaVersion 为以后扩展字段预留；现有前端可按版本决定兼容策略。
     return {
         "schemaVersion": 1,
         "state": state,

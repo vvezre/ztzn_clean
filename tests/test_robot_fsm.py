@@ -1,4 +1,5 @@
 import unittest
+import json
 
 
 class RobotEventBusTest(unittest.TestCase):
@@ -20,6 +21,21 @@ class RobotEventBusTest(unittest.TestCase):
         self.assertEqual(received[0]["type"], "TASK_STARTED")
         self.assertEqual(received[0]["payload"]["task"], "A")
         self.assertEqual([event["sequence"] for event in bus.recent_events()], [2, 3])
+
+    def test_event_bus_preserves_unicode_message(self):
+        from robot_fsm import RobotEventBus
+
+        bus = RobotEventBus()
+        event = bus.publish(
+            "TASK_STOPPED",
+            source="test",
+            message=u"已执行停车指令",
+            payload={"taskName": u"测试7"},
+            now=100,
+        )
+
+        self.assertEqual(event["message"], u"已执行停车指令")
+        json.dumps(event, ensure_ascii=False)
 
 
 class RobotLifecycleFSMTest(unittest.TestCase):
@@ -72,6 +88,19 @@ class RobotLifecycleFSMTest(unittest.TestCase):
         self.assertEqual(fsm.get_state()["action"], "auto_drive")
         running_state["controlState"] = "BROKEN"
         self.assertEqual(fsm.get_state()["controlState"], "RUNNING")
+
+    def test_lifecycle_fsm_preserves_unicode_message(self):
+        from robot_fsm import EVENT_TASK_STOPPED, RobotLifecycleFSM
+
+        fsm = RobotLifecycleFSM()
+        state = fsm.apply_event(
+            EVENT_TASK_STOPPED,
+            message=u"测试7已停车",
+            payload={"taskName": u"测试7"},
+        )
+
+        self.assertEqual(state["message"], u"测试7已停车")
+        json.dumps(state, ensure_ascii=False)
 
     def test_legacy_redis_fields_are_derived_from_fsm_state(self):
         from robot_fsm import (

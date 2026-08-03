@@ -28,6 +28,7 @@ class _FakeController(object):
                     "id": "p1",
                     "name": "区域点1",
                     "sequence": 1,
+                    "areaNumber": 1,
                     "x": 0,
                     "y": 0,
                     "lat": 32.0364,
@@ -105,6 +106,9 @@ class _FakeController(object):
 
     def start_modeling(self, name=None, restart=False):
         return {"success": True, "data": {"status": "recording", "name": name}}
+
+    def new_modeling_area(self):
+        return {"success": True, "data": {"areaNumber": 2, "groupCount": 2}}
 
     def finish_modeling(self):
         return {"success": True, "data": {"modelId": "active-model", "taskPlan": {"status": "ready"}}}
@@ -185,6 +189,14 @@ class _StubAdapter(object):
                 "data": {
                     "status": "recording",
                     "modelId": "model-1",
+                },
+            }
+        if path == "/modeling/session/new-area":
+            return {
+                "success": True,
+                "data": {
+                    "areaNumber": 2,
+                    "groupCount": 2,
                 },
             }
         if path.endswith("/sample-point"):
@@ -516,6 +528,10 @@ class MqttModelingBridgeTest(unittest.TestCase):
             [point["sequence"] for point in result["data"]["points"]],
             [1, 2],
         )
+        self.assertEqual(
+            [point["areaNumber"] for point in result["data"]["points"]],
+            [1, 2],
+        )
         self.assertEqual(result["data"]["points"][1]["x"], 200)
         self.assertNotIn("groups", result["data"])
         self.assertNotIn("groupLinks", result["data"])
@@ -787,6 +803,9 @@ class MqttModelingBridgeTest(unittest.TestCase):
         handler = MQTTCommandHandler(_FakeController())
 
         self.assertTrue(handler.handle({"command": "start_modeling", "params": {"name": "area-a"}})["success"])
+        created_area = handler.handle({"command": "new_modeling_area", "params": {}})
+        self.assertTrue(created_area["success"])
+        self.assertEqual(created_area["data"], {"areaNumber": 2, "groupCount": 2})
         self.assertTrue(handler.handle({"command": "get_modeling_state", "params": {}})["success"])
         self.assertTrue(handler.handle({"command": "undo_modeling_point", "params": {"pointType": "link"}})["success"])
         self.assertTrue(handler.handle({"command": "clear_modeling_points", "params": {"pointType": "area"}})["success"])
@@ -794,6 +813,17 @@ class MqttModelingBridgeTest(unittest.TestCase):
 
         invalid = handler.handle({"command": "undo_modeling_point", "params": {"pointType": "bad"}})
         self.assertFalse(invalid["success"])
+
+    def test_adapter_calls_explicit_new_area_endpoint(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.new_modeling_area(adapter)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/session/new-area")
+        self.assertEqual(adapter.json_data, {})
+        self.assertEqual(result["data"], {"areaNumber": 2, "groupCount": 2})
 
     def test_modeling_live_position_uses_first_task_segment_as_coordinate_anchor(self):
         import math

@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import unittest
 
@@ -84,6 +85,26 @@ class RuntimeStateModelTest(unittest.TestCase):
         self.assertFalse(state["effects"]["requiresAttention"])
         self.assertIn("允许运动", state["effectLabels"])
         self.assertIn("任务执行中", state["effectLabels"])
+
+    def test_runtime_state_preserves_unicode_task_name_and_message(self):
+        from runtime_state import build_runtime_state_snapshot
+
+        state = build_runtime_state_snapshot(
+            control_state="STOPPED",
+            health_state="OK",
+            mission="complete",
+            parking=True,
+            action="parking",
+            task_name=u"测试7",
+            message=u"已执行停车指令",
+            now=1234,
+        )
+
+        self.assertEqual(state["task"]["name"], u"测试7")
+        self.assertEqual(state["message"], u"已执行停车指令")
+        self.assertEqual(state["stateLabel"], u"已停车")
+        self.assertEqual(state["actionLabel"], u"停车")
+        json.dumps(state, ensure_ascii=False)
 
     def test_blocked_state_disables_motion_and_keeps_fault_reason(self):
         from runtime_state import build_runtime_state_snapshot

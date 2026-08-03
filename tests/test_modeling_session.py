@@ -48,6 +48,8 @@ class ModelingSessionTest(unittest.TestCase):
 
         self.assertEqual(started["status"], "recording")
         self.assertEqual(recorded[-1]["pointNo"], 4)
+        self.assertEqual(recorded[-1]["point"]["areaNumber"], 1)
+        self.assertNotIn("groupId", recorded[-1]["point"])
         self.assertEqual(recorded[-1]["session"]["areaPointCount"], 4)
         self.assertEqual(finished["session"]["status"], "ready")
         self.assertEqual(finished["taskPreview"]["status"], "ready")
@@ -61,7 +63,7 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(current_path["taskPreview"]["status"], "ready")
         self.assertEqual(current_path["taskPlan"]["status"], "ready")
 
-    def test_connection_clicks_keep_original_two_endpoint_rule_and_open_next_area(self):
+    def test_connection_points_wait_for_explicit_new_area_command(self):
         from modeling_session import ModelingSession
         from modeling_store import ModelingStore, InvalidModelPayloadError
 
@@ -93,13 +95,16 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(first_link["point"]["role"], "group_link_start")
         self.assertEqual(second_link["point"]["role"], "group_link_end")
         self.assertEqual(second_link["session"]["linkPointCount"], 2)
-        self.assertEqual(second_link["session"]["groupCount"], 2)
+        self.assertEqual(second_link["session"]["groupCount"], 1)
 
         with self.assertRaises(InvalidModelPayloadError):
             session.record_link_point()
 
+        created_area = session.new_area()
+        self.assertEqual(created_area, {"areaNumber": 2, "groupCount": 2})
         next_area = session.record_area_point()
         self.assertEqual(next_area["point"]["id"], "b1")
+        self.assertEqual(next_area["point"]["areaNumber"], 2)
         self.assertEqual(next_area["session"]["currentAreaNumber"], 2)
         self.assertEqual(next_area["session"]["areaPointCount"], 1)
 
@@ -111,31 +116,65 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(finished["taskPlan"]["status"], "ready")
         self.assertGreater(finished["taskPlan"]["summary"]["transferTaskCount"], 0)
 
-    def test_mixed_boundary_capture_generates_remote_first_round_trip(self):
+    def test_new_area_rejects_missing_or_incomplete_connection(self):
+        from modeling_session import ModelingSession, ModelingSessionError
+        from modeling_store import ModelingStore
+
+        session = ModelingSession(
+            ModelingStore(self.tmpdir, now=lambda: 1000),
+            _PointProvider([
+                _point("a1", 0, 0),
+                _point("a2", 100, 0),
+                _point("a3", 100, 100),
+                _point("a4", 0, 100),
+                _point("l1", 100, 50),
+            ]),
+            now=lambda: 1000,
+        )
+        session.start("new-area-validation")
+        for _ in range(3):
+            session.record_area_point()
+
+        with self.assertRaises(ModelingSessionError) as incomplete_area:
+            session.record_link_point()
+        self.assertEqual(incomplete_area.exception.code, "MODELING_AREA_INCOMPLETE")
+        session.record_area_point()
+
+        with self.assertRaises(ModelingSessionError) as missing_link:
+            session.new_area()
+        self.assertEqual(missing_link.exception.code, "MODELING_LINK_MISSING")
+
+        session.record_link_point()
+        with self.assertRaises(ModelingSessionError) as incomplete_link:
+            session.new_area()
+        self.assertEqual(incomplete_link.exception.code, "MODELING_LINK_INCOMPLETE")
+
+    def test_explicit_two_area_capture_generates_remote_first_round_trip(self):
         from modeling_session import ModelingSession
         from modeling_store import ModelingStore
 
         provider = _PointProvider([
             _point("p1", 0, 0),
             _point("p2", 0, 452),
+            _point("p9", 565, 452),
+            _point("p10", 565, 0),
             _point("p3", 0, 470),
             _point("p4", 0, 534),
             _point("p5", 0, 552),
             _point("p6", 0, 778),
             _point("p7", 452, 778),
             _point("p8", 452, 552),
-            _point("p9", 565, 452),
-            _point("p10", 565, 0),
         ])
         store = ModelingStore(self.tmpdir, now=lambda: 1000)
         session = ModelingSession(store, provider, now=lambda: 1000)
         session.start("confirmed-route")
 
-        session.record_area_point()
-        session.record_area_point()
+        for _ in range(4):
+            session.record_area_point()
         session.record_link_point()
         session.record_link_point()
-        for _ in range(6):
+        session.new_area()
+        for _ in range(4):
             session.record_area_point()
         finished = session.finish()
 
@@ -165,8 +204,9 @@ class ModelingSessionTest(unittest.TestCase):
         )
         self.assertEqual(
             (task_plan["tasks"][0]["endX"], task_plan["tasks"][0]["endY"]),
-            (0, 452),
+            (0, 778),
         )
+        self.assertGreaterEqual(task_plan["tasks"][0].get("mergedSegmentCount", 1), 2)
         clean_tasks = [task for task in task_plan["tasks"] if task["mode"] == 1]
         self.assertEqual([task["areaNumber"] for task in clean_tasks], [2] * 4 + [1] * 8)
         self.assertEqual(
@@ -177,34 +217,39 @@ class ModelingSessionTest(unittest.TestCase):
             (task_plan["tasks"][-1]["endX"], task_plan["tasks"][-1]["endY"]),
             (0, 0),
         )
-        self.assertTrue(any(task["source"] == "modeling_bridge_return" for task in task_plan["tasks"]))
+        self.assertTrue(any(
+            task.get("source") == "modeling_bridge_return"
+            or "modeling_bridge_return" in (task.get("mergedSources") or [])
+            for task in task_plan["tasks"]
+        ))
 
-    def test_mixed_boundary_capture_keeps_extra_home_boundary_points(self):
+    def test_explicit_area_capture_keeps_extra_boundary_points(self):
         from modeling_session import ModelingSession
         from modeling_store import ModelingStore
 
         provider = _PointProvider([
             _point("p1", 0, 0),
             _point("p2", 0, 452),
+            _point("assist1", 10, 452),
+            _point("assist2", 250, 452),
+            _point("p9", 565, 452),
+            _point("p10", 565, 0),
             _point("p3", 0, 470),
             _point("p4", 0, 534),
             _point("p5", 0, 552),
             _point("p6", 0, 778),
             _point("p7", 452, 778),
             _point("p8", 452, 552),
-            _point("assist1", 10, 452),
-            _point("assist2", 250, 452),
-            _point("p9", 565, 452),
-            _point("p10", 565, 0),
         ])
         store = ModelingStore(self.tmpdir, now=lambda: 1000)
         session = ModelingSession(store, provider, now=lambda: 1000)
         session.start("extra-points")
-        session.record_area_point()
-        session.record_area_point()
+        for _ in range(6):
+            session.record_area_point()
         session.record_link_point()
         session.record_link_point()
-        for _ in range(8):
+        session.new_area()
+        for _ in range(4):
             session.record_area_point()
 
         finished = session.finish()
@@ -348,6 +393,7 @@ class ModelingSessionTest(unittest.TestCase):
             session.record_area_point()
         session.record_link_point()
         session.record_link_point()
+        session.new_area()
         for _ in range(4):
             session.record_area_point()
 

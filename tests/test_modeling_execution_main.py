@@ -35,9 +35,12 @@ class ModelingExecutionMainTest(unittest.TestCase):
         source = read_main()
 
         runner_body = function_body(source, "_run_modeling_task_segment")
+        shared_runner_body = function_body(source, "_run_task_segment_by_point_navigation")
         thread_body = function_body(source, "_modelingTaskThread")
-        self.assertIn("pointToPointByRTK", runner_body)
-        self.assertIn("turn(", runner_body)
+        self.assertIn("_run_task_segment_by_point_navigation", runner_body)
+        self.assertIn("pointToPointByRTKAutoHeading", shared_runner_body)
+        self.assertIn("global_cur_rtk_lat", shared_runner_body)
+        self.assertIn("global_cur_rtk_lon", shared_runner_body)
         self.assertIn("_mark_runtime_running", thread_body)
         self.assertIn("_mark_runtime_complete", thread_body)
         self.assertIn("_mark_runtime_blocked", thread_body)
@@ -57,6 +60,8 @@ class ModelingExecutionMainTest(unittest.TestCase):
         self.assertIn("_can_start_runtime_task", preflight_body)
         self.assertIn("_build_rtk_runtime_detail", preflight_body)
         self.assertIn("rtkFixAvailable", preflight_body)
+        self.assertIn("validate_route_start", preflight_body)
+        self.assertIn("TASK_ORIGIN_TOLERANCE_METERS", preflight_body)
 
 
 if __name__ == "__main__":
