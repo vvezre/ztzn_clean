@@ -202,6 +202,124 @@ def _nearest_even_lane_count(span, target_spacing):
     )
 
 
+def _angle_difference(left, right):
+    """返回两个航向之间的最小夹角，单位为度。"""
+    return abs((float(left) - float(right) + 180.0) % 360.0 - 180.0)
+
+
+def _is_convex_quadrilateral(points):
+    """
+    判断四个按边界顺序排列的点是否构成凸四边形。
+
+    凹四边形或存在连续三点共线时继续使用原有多边形扫描算法，避免使用两侧插值后
+    生成越出区域的清扫线。
+    """
+    if len(points) != 4:
+        return False
+    signs = []
+    for index in range(4):
+        previous = points[index]
+        current = points[(index + 1) % 4]
+        following = points[(index + 2) % 4]
+        first = (current[0] - previous[0], current[1] - previous[1])
+        second = (following[0] - current[0], following[1] - current[1])
+        cross = first[0] * second[1] - first[1] * second[0]
+        if abs(cross) <= EPSILON:
+            return False
+        signs.append(cross > 0)
+    return all(sign == signs[0] for sign in signs[1:])
+
+
+def _generate_boundary_interpolated_quadrilateral_lanes(
+        polygon, sweep_angle, lane_spacing_cm, force_even):
+    """
+    为允许倾斜的凸四边形生成边界保留式清扫线。
+
+    建模约定前两个点是区域的一侧边界，因此：
+    - 第一条清扫线使用 point[1] -> point[2]，完整保留远端真实边界；
+    - 最后一条清扫线使用 point[0] -> point[3]，完整保留近端真实边界；
+    - 中间清扫线分别在 point[1] -> point[0] 和 point[2] -> point[3]
+      两条侧边上按相同比例插值。
+
+    这样不要求首尾边界互相平行。梯形、轻微倾斜或带有真实定位误差的四边区域
+    不会再因为最外侧扫描线只接触一个顶点而丢失首尾清扫线。
+
+    只有 sweep_angle 与“前两个点自动确定的方向”一致时才启用该方法；手工指定
+    其他清扫方向以及四点以上的复杂多边形仍走原有通用扫描线算法。
+    """
+    if len(polygon) != 4:
+        return None
+    polygon_xy = [_point_xy(point) for point in polygon]
+    if any(point is None for point in polygon_xy):
+        return None
+    if not _is_convex_quadrilateral(polygon_xy):
+        return None
+
+    automatic_angle = _default_sweep_angle(polygon)
+    if automatic_angle is None or _angle_difference(sweep_angle, automatic_angle) > 1e-4:
+        return None
+
+    radians = math.radians(sweep_angle)
+    direction = (math.sin(radians), math.cos(radians))
+    normal = (math.cos(radians), -math.sin(radians))
+    first, second, third, fourth = polygon_xy
+
+    # 清扫宽度使用两条侧边在清扫线法向量上的投影均值。
+    # 与直接取多边形 min/max 投影相比，它不要求上下边界必须完全平行。
+    left_span = abs(
+        normal[0] * (first[0] - second[0])
+        + normal[1] * (first[1] - second[1])
+    )
+    right_span = abs(
+        normal[0] * (fourth[0] - third[0])
+        + normal[1] * (fourth[1] - third[1])
+    )
+    span = (left_span + right_span) / 2.0
+    if span <= EPSILON:
+        return None
+
+    spacing = max(float(lane_spacing_cm), 1.0)
+    if force_even:
+        lane_count = _nearest_even_lane_count(span, spacing)
+    else:
+        ideal = span / spacing + 1.0
+        lane_count = max(2, int(math.floor(ideal + 0.5)))
+    actual_spacing = span / float(lane_count - 1)
+
+    lanes = []
+    for index in range(lane_count):
+        ratio = index / float(lane_count - 1)
+        # 从远端边界向近端边界逐条插值；ratio=0/1 时精确保留两条真实边界。
+        start = (
+            second[0] + (first[0] - second[0]) * ratio,
+            second[1] + (first[1] - second[1]) * ratio,
+        )
+        end = (
+            third[0] + (fourth[0] - third[0]) * ratio,
+            third[1] + (fourth[1] - third[1]) * ratio,
+        )
+        # 保持每条预览线的 start -> end 与统一清扫方向同向，S形反向由任务生成器处理。
+        projection = direction[0] * (end[0] - start[0]) + direction[1] * (end[1] - start[1])
+        if projection < 0:
+            start, end = end, start
+        if _distance(start, end) <= EPSILON:
+            continue
+        heading = _normalize_heading(
+            math.degrees(math.atan2(end[0] - start[0], end[1] - start[1]))
+        )
+        lanes.append({
+            "id": "lane-{}".format(index + 1),
+            "heading": heading,
+            "startX": round(start[0], 1),
+            "startY": round(start[1], 1),
+            "endX": round(end[0], 1),
+            "endY": round(end[1], 1),
+            "lengthCm": round(_distance(start, end), 1),
+            "laneSpacingCm": round(actual_spacing, 1),
+        })
+    return lanes
+
+
 def _generate_lanes(polygon, sweep_angle, lane_spacing_cm, force_even=False):
     """
     使用一组平行扫描线与区域多边形求交，得到每条真正位于区域内的清扫线段。
@@ -219,6 +337,15 @@ def _generate_lanes(polygon, sweep_angle, lane_spacing_cm, force_even=False):
     polygon_xy = [xy for xy in polygon_xy if xy is not None]
     if len(polygon_xy) < 3 or sweep_angle is None:
         return []
+
+    quadrilateral_lanes = _generate_boundary_interpolated_quadrilateral_lanes(
+        polygon,
+        sweep_angle,
+        lane_spacing_cm,
+        force_even,
+    )
+    if quadrilateral_lanes is not None:
+        return quadrilateral_lanes
 
     radians = math.radians(sweep_angle)
     # direction 是小车沿清扫线行驶的方向，normal 用于沿扫宽方向平移清扫线。

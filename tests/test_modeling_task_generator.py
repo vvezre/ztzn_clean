@@ -2,6 +2,14 @@ import unittest
 
 
 class ModelingTaskGeneratorTest(unittest.TestCase):
+    def test_round_int_uses_same_half_away_from_zero_rule_on_python2_and_python3(self):
+        from modeling_task_generator import _round_int
+
+        self.assertEqual(_round_int(320.5), 321)
+        self.assertEqual(_round_int(320.49), 320)
+        self.assertEqual(_round_int(-61.5), -62)
+        self.assertEqual(_round_int(-61.49), -61)
+
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks
 

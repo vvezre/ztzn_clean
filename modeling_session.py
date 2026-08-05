@@ -94,6 +94,61 @@ class ModelingSession(object):
         draft["captureSequence"] = events
         return self.store.save_draft(model_id, draft)
 
+    def _reset_to_first_area_when_empty(self, model_id, draft, state):
+        """Collapse an emptied multi-area draft back to its initial area.
+
+        The two public "clear all" commands intentionally run independently, so
+        the first command may leave the other point type in place.  Only after
+        *both* area points and connection points are empty is the old multi-area
+        topology no longer meaningful.  At that point keep the same modeling
+        session/modelId, retain the original first group, and remove all derived
+        groups, links, capture order, and unfinished planning output.
+
+        Returning to area one here prevents the next RTK sample from being
+        attached to the previously active area (for example area two).  Saved
+        named tasks live outside this draft and are deliberately not touched.
+        """
+        groups = list(draft.get("groups") or [])
+        links = list(draft.get("groupLinks") or [])
+        area_point_count = sum(len(group.get("points") or []) for group in groups)
+        link_point_count = sum(len(link.get("points") or []) for link in links)
+        if area_point_count or link_point_count:
+            return draft, state, False
+
+        if groups:
+            first_group = min(
+                groups,
+                key=lambda group: int(group.get("areaNumber") or 1),
+            )
+            first_group = dict(first_group)
+            first_group["areaNumber"] = 1
+            first_group["points"] = []
+            first_group["subAreas"] = []
+            first_group["connectors"] = []
+            first_group["updatedAt"] = self._timestamp()
+        else:
+            created = self.store.create_group(model_id, None, now=self._timestamp())
+            draft = created["draft"]
+            first_group = dict(created["group"])
+
+        draft["groups"] = [first_group]
+        draft["groupLinks"] = []
+        draft["captureSequence"] = []
+        draft["recognition"] = {"confirmed": False, "items": []}
+        draft["taskPreview"] = None
+        draft["taskPlan"] = None
+        saved = self.store.save_draft(model_id, draft, now=self._timestamp())
+
+        state = dict(state)
+        state["status"] = "recording"
+        state["currentGroupId"] = first_group.get("id")
+        state["currentLinkId"] = None
+        state["previousGroupId"] = None
+        state["pendingGroupId"] = None
+        state["captureMode"] = None
+        state["currentPointType"] = "area"
+        return saved, state, True
+
     def _summary(self, state, draft=None):
         if not state:
             return {
@@ -434,12 +489,19 @@ class ModelingSession(object):
                     draft = result["draft"]
 
             saved = self._remove_capture_points(model_id, draft, removed_ids)
-            state["currentPointType"] = point_type
+            saved, state, reset_to_first_area = self._reset_to_first_area_when_empty(
+                model_id,
+                saved,
+                state,
+            )
+            if not reset_to_first_area:
+                state["currentPointType"] = point_type
             state = self._write_state(state)
             return {
                 "modelId": model_id,
                 "pointType": point_type,
                 "clearedPointCount": len(removed_ids),
+                "resetToFirstArea": reset_to_first_area,
                 "session": self._summary(state, saved),
             }
 

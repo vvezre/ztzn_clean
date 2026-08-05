@@ -243,6 +243,9 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(cleared_link.get_json()["data"]["clearedPointCount"], 2)
         self.assertEqual(current["totalAreaPointCount"], 0)
         self.assertEqual(current["totalLinkPointCount"], 0)
+        self.assertEqual(current["currentAreaNumber"], 1)
+        self.assertEqual(current["groupCount"], 1)
+        self.assertEqual(current["linkCount"], 0)
 
     def test_sample_status_route_reports_current_readiness(self):
         response = self.client.get("/modeling/sample-status")

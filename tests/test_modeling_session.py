@@ -385,6 +385,7 @@ class ModelingSessionTest(unittest.TestCase):
                 _point("b2", 300, 0),
                 _point("b3", 300, 100),
                 _point("b4", 200, 100),
+                _point("reset1", 0, 0),
             ]),
             now=lambda: 1000,
         )
@@ -417,9 +418,63 @@ class ModelingSessionTest(unittest.TestCase):
 
         self.assertEqual(cleared_link["clearedPointCount"], 2)
         self.assertEqual(cleared_link["session"]["totalLinkPointCount"], 0)
-        self.assertEqual(final_draft["groupLinks"][0]["points"], [])
-        self.assertEqual(final_draft["groupLinks"][0]["status"], "draft")
+        self.assertTrue(cleared_link["resetToFirstArea"])
+        self.assertEqual(cleared_link["session"]["currentAreaNumber"], 1)
+        self.assertEqual(cleared_link["session"]["groupCount"], 1)
+        self.assertEqual(cleared_link["session"]["linkCount"], 0)
+        self.assertEqual(final_draft["groupLinks"], [])
+        self.assertEqual(len(final_draft["groups"]), 1)
+        self.assertEqual(final_draft["groups"][0]["areaNumber"], 1)
         self.assertEqual(final_draft["captureSequence"], [])
+
+        recorded_again = session.record_area_point()
+        self.assertEqual(recorded_again["point"]["id"], "reset1")
+        self.assertEqual(recorded_again["point"]["areaNumber"], 1)
+
+    def test_clear_all_resets_to_first_area_in_reverse_command_order(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(
+            store,
+            _PointProvider([
+                _point("a1", 0, 0),
+                _point("a2", 100, 0),
+                _point("a3", 100, 100),
+                _point("a4", 0, 100),
+                _point("l1", 100, 50),
+                _point("l2", 200, 50),
+                _point("b1", 200, 0),
+                _point("again1", 0, 0),
+            ]),
+            now=lambda: 1000,
+        )
+        started = session.start("clear-all-reverse")
+        for _ in range(4):
+            session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+        session.new_area()
+        session.record_area_point()
+
+        cleared_link = session.clear_all("link")
+        cleared_area = session.clear_all("area")
+        current = session.current()
+        draft = store.get_draft(started["modelId"])
+
+        self.assertFalse(cleared_link["resetToFirstArea"])
+        self.assertTrue(cleared_area["resetToFirstArea"])
+        self.assertEqual(current["modelId"], started["modelId"])
+        self.assertEqual(current["currentAreaNumber"], 1)
+        self.assertEqual(current["groupCount"], 1)
+        self.assertEqual(current["linkCount"], 0)
+        self.assertEqual(draft["taskPreview"], None)
+        self.assertEqual(draft["taskPlan"], None)
+
+        recorded_again = session.record_area_point()
+        self.assertEqual(recorded_again["point"]["id"], "again1")
+        self.assertEqual(recorded_again["point"]["areaNumber"], 1)
 
 
 if __name__ == "__main__":

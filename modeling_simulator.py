@@ -34,22 +34,29 @@ SIMULATOR_COMPANY_CODE = "ZTZN-PVC"
 SIMULATOR_PRODUCT_MODEL = "-T01"
 SIMULATOR_PRODUCT_ID = "999999"
 SIMULATOR_DEVICE_ID = SIMULATOR_PRODUCT_MODEL + SIMULATOR_PRODUCT_ID
-SIMULATOR_ORIGIN_LAT = 32.0365
-SIMULATOR_ORIGIN_LON = 118.1235
+SIMULATOR_ORIGIN_LAT = 32.03647857
+SIMULATOR_ORIGIN_LON = 118.92448993
 EARTH_RADIUS_M = 6371000.0
 
 
+# 固定场景使用最近一次真实双区域建模的相对尺寸和倾斜程度。
+#
+# 前端记录顺序仍严格保持为：
+#   区域1四点 -> 两个连接点 -> new_modeling_area -> 区域2四点。
+#
+# 原始真实记录中区域1的右侧两点是在区域2之后补录的；显式分区流程要求先完整
+# 记录区域1，所以这里只调整录入顺序，不改变各点坐标和最终区域轮廓。
 SCENARIO_POINTS = (
-    {"pointType": "area", "name": "home_lower_left", "x": 0, "y": 0},
-    {"pointType": "area", "name": "home_upper_left", "x": 0, "y": 452},
-    {"pointType": "area", "name": "home_upper_right", "x": 565, "y": 452},
-    {"pointType": "area", "name": "home_lower_right", "x": 565, "y": 0},
-    {"pointType": "link", "name": "bridge_start", "x": 0, "y": 470},
-    {"pointType": "link", "name": "bridge_end", "x": 0, "y": 534},
-    {"pointType": "area", "name": "remote_lower_left", "x": 0, "y": 552},
-    {"pointType": "area", "name": "remote_upper_left", "x": 0, "y": 778},
-    {"pointType": "area", "name": "remote_upper_right", "x": 452, "y": 778},
-    {"pointType": "area", "name": "remote_lower_right", "x": 452, "y": 552},
+    {"pointType": "area", "name": "home_lower_left", "x": 0.000, "y": 0.000},
+    {"pointType": "area", "name": "home_upper_left", "x": 7.362, "y": 117.944},
+    {"pointType": "area", "name": "home_upper_right", "x": 344.374, "y": 86.365},
+    {"pointType": "area", "name": "home_lower_right", "x": 342.394, "y": -61.646},
+    {"pointType": "link", "name": "bridge_start", "x": 9.502, "y": 170.529},
+    {"pointType": "link", "name": "bridge_end", "x": 10.576, "y": 204.143},
+    {"pointType": "area", "name": "remote_lower_left", "x": 16.882, "y": 260.830},
+    {"pointType": "area", "name": "remote_upper_left", "x": 23.914, "y": 399.779},
+    {"pointType": "area", "name": "remote_upper_right", "x": 379.429, "y": 363.040},
+    {"pointType": "area", "name": "remote_lower_right", "x": 368.523, "y": 235.322},
 )
 
 
@@ -488,10 +495,25 @@ class ModelingSimulatorController(object):
         return self._call("simulation points cleared", lambda: self.session.clear(point_type))
 
     def clear_all_modeling_points(self, point_type):
-        return self._call(
+        result = self._call(
             "all simulation {} points cleared".format(point_type),
             lambda: self.session.clear_all(point_type),
         )
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict) and data.get("resetToFirstArea"):
+            # The simulator advances through a fixed list of ten realistic
+            # samples.  When the shared FSM collapses an emptied draft back to
+            # area one, align the simulated live position with the first sample
+            # as well so the next record command starts at scenario point one.
+            point = scenario_point(0)
+            with self._position_lock:
+                self._current_position = dict(
+                    point,
+                    local_x=point["x"],
+                    local_y=point["y"],
+                    mode=2,
+                )
+        return result
 
     def finish_modeling(self):
         def action():

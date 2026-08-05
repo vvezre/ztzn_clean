@@ -162,6 +162,47 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(first["laneSpacingCm"], 64.6)
         self.assertEqual(second["laneSpacingCm"], 75.3)
 
+    def test_tilted_quadrilateral_preserves_both_real_boundary_lanes(self):
+        from modeling_preview import build_model_preview
+
+        # 来自真实小车模型的区域1坐标：上下边界天然不平行，且包含厘米级定位误差。
+        points = [
+            _point("p1", 0.0, 0.0),
+            _point("p2", 7.362, 117.944),
+            _point("p3", 344.374, 86.365),
+            _point("p4", 342.394, -61.646),
+        ]
+        draft = {
+            "id": "tilted-real-boundary",
+            "recognition": {"confirmed": True},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{"id": "sa1", "pointIds": [point["id"] for point in points]}],
+                "connectors": [],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+        lanes = preview["groups"][0]["subAreas"][0]["lanes"]
+
+        self.assertEqual(len(lanes), 4)
+        # 第一条精确保留 p2 -> p3 上边界。
+        self.assertEqual(
+            (lanes[0]["startX"], lanes[0]["startY"], lanes[0]["endX"], lanes[0]["endY"]),
+            (7.4, 117.9, 344.4, 86.4),
+        )
+        # 最后一条精确保留 p1 -> p4 下边界。
+        self.assertEqual(
+            (lanes[-1]["startX"], lanes[-1]["startY"], lanes[-1]["endX"], lanes[-1]["endY"]),
+            (0.0, 0.0, 342.4, -61.6),
+        )
+        # 两条真实边界可以有不同航向，不能再强迫它们绝对平行。
+        self.assertNotEqual(lanes[0]["heading"], lanes[-1]["heading"])
+
     def test_build_preview_requires_confirmed_recognition(self):
         from modeling_preview import ModelingPreviewError, build_model_preview
 

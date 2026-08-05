@@ -22,7 +22,20 @@ def _number(value):
 
 
 def _round_int(value):
-    return int(round(float(value)))
+    """
+    将厘米坐标稳定地四舍五入为整数，并保证 Python 2/3 结果一致。
+
+    Python 2 和 Python 3 对正好位于 ``.5`` 的数采用不同取整规则：前者通常
+    远离零取整，后者采用“银行家舍入”。建模插值点出现半厘米时，这会让电脑
+    预览与小车实际任务相差 1 cm，并进一步改变相邻转移段的角度和总长度。
+
+    这里显式采用工程上常用的“四舍五入，半数远离零”，不再依赖解释器内置
+    ``round`` 的版本差异。
+    """
+    number = float(value)
+    if number >= 0:
+        return int(math.floor(number + 0.5))
+    return int(math.ceil(number - 0.5))
 
 
 def _normalize_heading(value):
