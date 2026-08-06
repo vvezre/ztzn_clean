@@ -14,6 +14,18 @@ def _point(point_id, x, y):
     }
 
 
+def _rtk_point(point_id, lat, lon):
+    """Match real vehicle samples: RTK is present and x/y has not been derived."""
+    return {
+        "id": point_id,
+        "lat": lat,
+        "lon": lon,
+        "x": None,
+        "y": None,
+        "source": "rtk_mean",
+    }
+
+
 class _PointProvider(object):
     def __init__(self, points):
         self.points = iter(points)
@@ -222,6 +234,88 @@ class ModelingSessionTest(unittest.TestCase):
             or "modeling_bridge_return" in (task.get("mergedSources") or [])
             for task in task_plan["tasks"]
         ))
+
+    def test_test12_rtk_points_share_one_model_coordinate_frame(self):
+        """Regression: area two must stay above area one after route planning."""
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            _rtk_point("a1", 32.036476871000005, 118.924488329),
+            _rtk_point("a2", 32.03648831899999, 118.92448946500001),
+            _rtk_point("a3", 32.036481553, 118.92458954699998),
+            _rtk_point("a4", 32.036470035, 118.92458870099999),
+            _rtk_point("l1", 32.036492853, 118.92449166799997),
+            _rtk_point("l2", 32.036497688, 118.92449191199998),
+            _rtk_point("a5", 32.03650237, 118.92449218099998),
+            _rtk_point("a6", 32.036514266, 118.924492622),
+            _rtk_point("a7", 32.036511214, 118.924531126),
+            _rtk_point("a8", 32.036499099000004, 118.92452993699999),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        session.start("test12-coordinate-regression")
+        for _ in range(4):
+            session.record_area_point()
+        first_link = session.record_link_point()
+        second_link = session.record_link_point()
+        self.assertGreater(first_link["point"]["y"], 150.0)
+        self.assertGreater(second_link["point"]["y"], first_link["point"]["y"])
+        session.new_area()
+        for _ in range(4):
+            session.record_area_point()
+
+        finished = session.finish()
+        draft = store.get_draft(finished["modelId"])
+        self.assertEqual(draft["coordinateFrame"]["type"], "model_origin")
+        self.assertEqual(draft["coordinateFrame"]["originPointId"], "a1")
+
+        area_one = draft["groups"][0]["points"]
+        area_two = draft["groups"][1]["points"]
+        link = draft["groupLinks"][0]["points"]
+        self.assertAlmostEqual(area_one[0]["x"], 0.0, places=3)
+        self.assertAlmostEqual(area_one[0]["y"], 0.0, places=3)
+        self.assertGreater(min(point["y"] for point in area_two), 240.0)
+        self.assertGreater(min(point["y"] for point in link), 150.0)
+        self.assertLess(max(point["y"] for point in link), min(point["y"] for point in area_two))
+
+        clean_area_two = [
+            task for task in finished["taskPlan"]["tasks"]
+            if task["mode"] == 1 and task["areaNumber"] == 2
+        ]
+        self.assertTrue(clean_area_two)
+        self.assertGreater(
+            min(min(task["startY"], task["endY"]) for task in clean_area_two),
+            240,
+        )
+        self.assertGreater(
+            max(max(task["startY"], task["endY"]) for task in clean_area_two),
+            380,
+        )
+        self.assertEqual(
+            (finished["taskPlan"]["tasks"][-1]["endX"], finished["taskPlan"]["tasks"][-1]["endY"]),
+            (0, 0),
+        )
+
+        # Simulate a draft saved by the previous implementation: area two has
+        # its own local origin and carries no coordinate-frame marker.  The
+        # next recognition/build cycle must migrate it without new RTK samples.
+        legacy = store.get_draft(finished["modelId"])
+        legacy.pop("coordinateFrame", None)
+        remote_origin_x = legacy["groups"][1]["points"][0]["x"]
+        remote_origin_y = legacy["groups"][1]["points"][0]["y"]
+        for point in legacy["groups"][1]["points"]:
+            point["x"] = round(point["x"] - remote_origin_x, 3)
+            point["y"] = round(point["y"] - remote_origin_y, 3)
+        store.save_draft(finished["modelId"], legacy)
+
+        migrated = store.recognize_group(
+            finished["modelId"],
+            legacy["groups"][1]["id"],
+        )["draft"]
+        migrated_remote = migrated["groups"][1]["points"]
+        self.assertGreater(migrated_remote[0]["x"], 30.0)
+        self.assertGreater(migrated_remote[0]["y"], 280.0)
 
     def test_explicit_area_capture_keeps_extra_boundary_points(self):
         from modeling_session import ModelingSession

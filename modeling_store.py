@@ -9,6 +9,7 @@ import uuid
 from modeling_preview import build_model_preview
 from modeling_recognition import recognize_group_points
 from modeling_task_generator import generate_task_plan
+from modeling_coordinates import normalize_draft_coordinates
 
 
 MODEL_SCHEMA_VERSION = 1
@@ -241,7 +242,13 @@ class ModelingStore(object):
 
     def build_task_preview(self, model_id, now=None):
         current_time = self._timestamp(now)
+        # Re-normalize before geometry generation so an older draft whose
+        # second area started again at (0, 0) is repaired automatically.
         draft = self.get_draft(model_id)
+        force_coordinate_migration = (
+            (draft.get("coordinateFrame") or {}).get("type") != "model_origin"
+        )
+        draft = normalize_draft_coordinates(draft, force=force_coordinate_migration)
         preview = build_model_preview(draft, now=current_time)
         draft["taskPreview"] = preview
         draft["taskPlan"] = None
@@ -467,6 +474,9 @@ class ModelingStore(object):
         link["status"] = "ready" if len(points) == 2 and link.get("endGroupId") else "draft"
         link["updatedAt"] = current_time
         draft["groupLinks"][index] = link
+        # Connection points use the same origin immediately, so querying the
+        # active model never exposes a second or missing coordinate frame.
+        draft = normalize_draft_coordinates(draft)
         self._clear_task_outputs(draft)
 
         saved = self.save_draft(model_id, draft, now=current_time)
@@ -499,6 +509,7 @@ class ModelingStore(object):
         link["status"] = "ready" if len(next_points) == 2 and link.get("endGroupId") else "draft"
         link["updatedAt"] = current_time
         draft["groupLinks"][index] = link
+        draft = normalize_draft_coordinates(draft)
         self._clear_task_outputs(draft)
 
         saved = self.save_draft(model_id, draft, now=current_time)
@@ -568,6 +579,9 @@ class ModelingStore(object):
         group["points"] = points
         group["updatedAt"] = current_time
         draft["groups"][index] = group
+        # Keep the point list returned to the mini app in the same global frame
+        # that will later be used by preview and executable task generation.
+        draft = normalize_draft_coordinates(draft)
         recognition = draft.get("recognition")
         if isinstance(recognition, dict):
             recognition["confirmed"] = False
@@ -620,7 +634,13 @@ class ModelingStore(object):
 
     def recognize_group(self, model_id, group_id, now=None):
         current_time = self._timestamp(now)
+        # This also migrates already-recorded legacy models before recognizing
+        # area two/three.  Recognition must never create a per-area origin.
         draft = self.get_draft(model_id)
+        force_coordinate_migration = (
+            (draft.get("coordinateFrame") or {}).get("type") != "model_origin"
+        )
+        draft = normalize_draft_coordinates(draft, force=force_coordinate_migration)
         index = self._find_group_index(draft, group_id)
         group = dict(draft["groups"][index])
         recognition = recognize_group_points(group)
