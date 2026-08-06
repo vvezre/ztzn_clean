@@ -7,7 +7,7 @@ import time
 BRUSH_WIDTH_CM = 116.0
 # 相邻两条清扫线的目标重叠宽度，不是清扫线间距。
 DEFAULT_OVERLAP_CM = 53.0
-MIN_OVERLAP_CM = 10.0
+MIN_OVERLAP_CM = 30.0
 EPSILON = 1e-6
 
 
@@ -179,7 +179,15 @@ def _line_polygon_intersections(polygon_xy, normal, offset):
     return _unique_intersections(intersections)
 
 
-def _nearest_even_lane_count(span, target_spacing):
+def _minimum_lane_count(span, max_spacing):
+    """Return the smallest lane count whose actual spacing does not exceed max_spacing."""
+    if span <= EPSILON:
+        return 0
+    spacing_limit = max(float(max_spacing), 1.0)
+    return max(2, int(math.ceil(span / spacing_limit)) + 1)
+
+
+def _nearest_even_lane_count(span, target_spacing, max_spacing=None):
     """
     在 2、4、6... 中选择实际间距最接近目标间距的清扫线数。
 
@@ -192,6 +200,14 @@ def _nearest_even_lane_count(span, target_spacing):
     ideal = span / max(float(target_spacing), 1.0) + 1.0
     lower = max(2, int(math.floor(ideal / 2.0)) * 2)
     candidates = sorted(set([max(2, lower - 2), lower, lower + 2, lower + 4]))
+    if max_spacing is not None:
+        minimum = _minimum_lane_count(span, max_spacing)
+        minimum_even = minimum if minimum % 2 == 0 else minimum + 1
+        candidates.extend([minimum_even, minimum_even + 2])
+        candidates = sorted(set(
+            count for count in candidates
+            if span / float(count - 1) <= float(max_spacing) + EPSILON
+        ))
     return min(
         candidates,
         key=lambda count: (
@@ -231,7 +247,7 @@ def _is_convex_quadrilateral(points):
 
 
 def _generate_boundary_interpolated_quadrilateral_lanes(
-        polygon, sweep_angle, lane_spacing_cm, force_even):
+        polygon, sweep_angle, lane_spacing_cm, force_even, max_spacing_cm=None):
     """
     为允许倾斜的凸四边形生成边界保留式清扫线。
 
@@ -280,10 +296,12 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
 
     spacing = max(float(lane_spacing_cm), 1.0)
     if force_even:
-        lane_count = _nearest_even_lane_count(span, spacing)
+        lane_count = _nearest_even_lane_count(span, spacing, max_spacing=max_spacing_cm)
     else:
         ideal = span / spacing + 1.0
         lane_count = max(2, int(math.floor(ideal + 0.5)))
+        if max_spacing_cm is not None:
+            lane_count = max(lane_count, _minimum_lane_count(span, max_spacing_cm))
     actual_spacing = span / float(lane_count - 1)
 
     lanes = []
@@ -320,7 +338,8 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     return lanes
 
 
-def _generate_lanes(polygon, sweep_angle, lane_spacing_cm, force_even=False):
+def _generate_lanes(
+        polygon, sweep_angle, lane_spacing_cm, force_even=False, max_spacing_cm=None):
     """
     使用一组平行扫描线与区域多边形求交，得到每条真正位于区域内的清扫线段。
 
@@ -343,6 +362,7 @@ def _generate_lanes(polygon, sweep_angle, lane_spacing_cm, force_even=False):
         sweep_angle,
         lane_spacing_cm,
         force_even,
+        max_spacing_cm=max_spacing_cm,
     )
     if quadrilateral_lanes is not None:
         return quadrilateral_lanes
@@ -360,16 +380,20 @@ def _generate_lanes(polygon, sweep_angle, lane_spacing_cm, force_even=False):
     span = max_offset - min_offset
     if force_even and span > EPSILON:
         # 偶数条模式下重新均分区域跨度，所以 actual_spacing 可能与目标值略有差异。
-        lane_count = _nearest_even_lane_count(span, spacing)
+        lane_count = _nearest_even_lane_count(span, spacing, max_spacing=max_spacing_cm)
         actual_spacing = span / float(lane_count - 1)
         lane_offsets = [min_offset + actual_spacing * index for index in range(lane_count)]
     else:
         actual_spacing = spacing
+        if max_spacing_cm is not None:
+            minimum_count = _minimum_lane_count(span, max_spacing_cm)
+            if minimum_count > 1 and span > EPSILON:
+                actual_spacing = min(spacing, span / float(minimum_count - 1))
         lane_offsets = []
         offset = min_offset
         while offset <= max_offset + EPSILON:
             lane_offsets.append(offset)
-            offset += spacing
+            offset += actual_spacing
 
     lanes = []
     index = 1
@@ -468,6 +492,7 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
     overlap = max(float(overlap_cm), MIN_OVERLAP_CM)
     # 清扫线间距 = 滚刷宽度 - 重叠宽度。当前默认为 116 - 53 = 63cm。
     lane_spacing = max(brush_width - overlap, 1.0)
+    max_lane_spacing = max(brush_width - MIN_OVERLAP_CM, 1.0)
 
     group_previews = []
     sub_area_count = 0
@@ -496,6 +521,7 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
                 sweep_angle,
                 lane_spacing,
                 force_even=force_even_lanes,
+                max_spacing_cm=max_lane_spacing,
             )
             sub_area_count += 1
             lane_count += len(lanes)

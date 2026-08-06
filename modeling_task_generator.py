@@ -5,6 +5,7 @@ import time
 
 EARTH_RADIUS_M = 6371000.0
 EPSILON_CM = 1e-6
+ANCHOR_MATCH_CM = 2.0
 
 
 class ModelingTaskGenerationError(Exception):
@@ -381,6 +382,7 @@ def _append_transition_tasks(
         mapper,
         task_id,
         preview,
+        draft,
         from_group_id,
         to_group_id,
         source="modeling_transfer"):
@@ -397,7 +399,23 @@ def _append_transition_tasks(
             "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
         )
     route_points = route_points or []
-    path_points = [current] + route_points + [target]
+    if from_group_id == to_group_id and source in (
+            "modeling_start_to_first_lane", "modeling_return_origin"):
+        path_points = _group_anchor_transition_points(
+            draft, from_group_id, current, target, mapper
+        )
+    elif from_group_id == to_group_id:
+        path_points = [current, target]
+    elif route_points:
+        departure = _group_anchor_transition_points(
+            draft, from_group_id, current, route_points[0], mapper
+        )
+        arrival = _group_anchor_transition_points(
+            draft, to_group_id, route_points[-1], target, mapper
+        )
+        path_points = _dedupe_xy_path(departure + route_points[1:-1] + arrival)
+    else:
+        path_points = [current, target]
     for index in range(len(path_points) - 1):
         start = path_points[index]
         end = path_points[index + 1]
@@ -428,6 +446,92 @@ def _draft_point_map(draft):
             if point.get("id"):
                 result[point["id"]] = point
     return result
+
+
+def _dedupe_xy_path(points):
+    """Keep an ordered XY path while removing only consecutive duplicate positions."""
+    result = []
+    for point in points or []:
+        if point is None:
+            continue
+        xy = (_number(point[0]), _number(point[1]))
+        if None in xy:
+            continue
+        if not result or not _is_same_point(result[-1], xy):
+            result.append(xy)
+    return result
+
+
+def _group_recorded_xy(draft, group_id, mapper):
+    """Return the area's recorded route anchors in the same order as manual capture."""
+    for group in draft.get("groups") or []:
+        if group.get("id") != group_id:
+            continue
+        return _dedupe_xy_path([
+            mapper.point_to_xy(point)
+            for point in (group.get("points") or [])
+        ])
+    return []
+
+
+def _cyclic_anchor_indexes(start_index, end_index, count, step):
+    indexes = [start_index]
+    current = start_index
+    while current != end_index:
+        current = (current + step) % count
+        indexes.append(current)
+    return indexes
+
+
+def _group_anchor_transition_points(draft, group_id, current, target, mapper):
+    """
+    Connect two positions through the area's manually recorded anchors.
+
+    The old implementation connected current directly to target, which could cut
+    diagonally across the recorded area.  The new route enters the nearest recorded
+    anchor and then follows the original manual recording order.  This is
+    intentional: recorded points are route anchors, not an unordered polygon
+    whose shorter side may be chosen automatically.  Points that are collinear
+    are compacted later, so a recorded anchor constrains the trajectory without
+    forcing an unnecessary stop.
+    """
+    if current is None or target is None:
+        return []
+    if _is_same_point(current, target):
+        return [current]
+    anchors = _group_recorded_xy(draft, group_id, mapper)
+    if len(anchors) < 2:
+        return [current, target]
+
+    start_index = min(
+        range(len(anchors)),
+        key=lambda index: _length_cm(current, anchors[index]),
+    )
+    end_index = min(
+        range(len(anchors)),
+        key=lambda index: _length_cm(target, anchors[index]),
+    )
+    indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), 1)
+    return _dedupe_xy_path(
+        [current] + [anchors[index] for index in indexes] + [target]
+    )
+
+
+def _nearest_group_point_id(draft, group_id, target, mapper):
+    """Find the recorded area anchor nearest a bridge endpoint or other target."""
+    best = None
+    for group in draft.get("groups") or []:
+        if group.get("id") != group_id:
+            continue
+        for point in group.get("points") or []:
+            point_id = point.get("id")
+            xy = mapper.point_to_xy(point)
+            if not point_id or xy is None:
+                continue
+            candidate = (_length_cm(xy, target), point_id)
+            if best is None or candidate < best:
+                best = candidate
+    return best[1] if best is not None else None
 
 
 def _derive_two_group_round_trip_policy(draft, preview, mapper):
@@ -465,6 +569,17 @@ def _derive_two_group_round_trip_policy(draft, preview, mapper):
         if start_group_id != mapper.origin_group_id:
             point_ids.reverse()
 
+        point_map = _draft_point_map(draft)
+        remote_link_xy = mapper.point_to_xy(point_map.get(point_ids[-1]))
+        remote_exit_id = _nearest_group_point_id(
+            draft,
+            remote_group_id,
+            remote_link_xy,
+            mapper,
+        ) if remote_link_xy is not None else None
+        if not remote_exit_id:
+            continue
+
         outbound_ids = [mapper.origin_point_id]
         for point_id in point_ids:
             if outbound_ids[-1] != point_id:
@@ -483,7 +598,7 @@ def _derive_two_group_round_trip_policy(draft, preview, mapper):
             "groupAnchors": {
                 remote_group_id: {
                     "entryPointId": point_ids[-1],
-                    "exitPointId": point_ids[-1],
+                    "exitPointId": remote_exit_id,
                 },
                 mapper.origin_group_id: {
                     "entryPointId": point_ids[0],
@@ -533,14 +648,37 @@ def _group_lane_segments(preview, group_id, entry, exit_point):
                 })
             if not segments:
                 continue
-            score = _length_cm(entry, segments[0]["start"])
-            score += _length_cm(segments[-1]["end"], exit_point)
+            entry_distance = _length_cm(entry, segments[0]["start"])
+            exit_distance = _length_cm(segments[-1]["end"], exit_point)
+            score = entry_distance + exit_distance
             for index in range(len(segments) - 1):
                 score += _length_cm(segments[index]["end"], segments[index + 1]["start"])
-            candidates.append((score, reverse_order, reverse_first, segments))
+            candidates.append({
+                "score": score,
+                "entryDistance": entry_distance,
+                "exitDistance": exit_distance,
+                "reverseOrder": reverse_order,
+                "reverseFirst": reverse_first,
+                "segments": segments,
+            })
     if not candidates:
         raise ModelingTaskGenerationError("route policy group has no usable cleaning lanes")
-    return min(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+    exact_exit_candidates = [
+        candidate for candidate in candidates
+        if candidate["exitDistance"] <= ANCHOR_MATCH_CM
+    ]
+    pool = exact_exit_candidates or candidates
+    selected = min(
+        pool,
+        key=lambda candidate: (
+            candidate["exitDistance"] if not exact_exit_candidates else 0.0,
+            candidate["score"],
+            candidate["entryDistance"],
+            candidate["reverseOrder"],
+            candidate["reverseFirst"],
+        ),
+    )
+    return selected["segments"]
 
 
 def _append_xy_path(tasks, path_points, area_number, mapper, task_id, source):
@@ -574,7 +712,7 @@ def _point_ids_to_xy(point_ids, point_map, mapper):
     return result
 
 
-def _append_clean_segments(tasks, segments, current, mapper, task_id):
+def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
     """
     把已排好顺序的清扫线加入任务列表。
 
@@ -584,9 +722,19 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id):
     clean_count = 0
     for segment in segments:
         if current is not None and not _is_same_point(current, segment["start"]):
+            if clean_count == 0:
+                transition_points = _group_anchor_transition_points(
+                    draft,
+                    segment.get("groupId"),
+                    current,
+                    segment["start"],
+                    mapper,
+                )
+            else:
+                transition_points = [current, segment["start"]]
             task_id = _append_xy_path(
                 tasks,
-                [current, segment["start"]],
+                transition_points,
                 segment["areaNumber"],
                 mapper,
                 task_id,
@@ -687,6 +835,14 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
     outbound = _point_ids_to_xy(route_policy.get("outboundPointIds"), point_map, mapper)
     if len(outbound) < 2:
         raise ModelingTaskGenerationError("route policy outbound path is incomplete")
+    home_departure = _group_anchor_transition_points(
+        draft,
+        home_group_id,
+        outbound[0],
+        outbound[1],
+        mapper,
+    )
+    outbound = _dedupe_xy_path(home_departure + outbound[2:])
     task_id = _append_xy_path(
         tasks,
         outbound,
@@ -705,13 +861,20 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
         remote_exit,
     )
     current, task_id, added = _append_clean_segments(
-        tasks, remote_segments, current, mapper, task_id
+        tasks, remote_segments, current, mapper, task_id, draft
     )
     clean_count += added
     if not _is_same_point(current, remote_exit):
+        remote_exit_path = _group_anchor_transition_points(
+            draft,
+            remote_group_id,
+            current,
+            remote_exit,
+            mapper,
+        )
         task_id = _append_xy_path(
             tasks,
-            [current, remote_exit],
+            remote_exit_path,
             remote_group.get("areaNumber") or 2,
             mapper,
             task_id,
@@ -743,13 +906,20 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
         home_exit,
     )
     current, task_id, added = _append_clean_segments(
-        tasks, home_segments, current, mapper, task_id
+        tasks, home_segments, current, mapper, task_id, draft
     )
     clean_count += added
     if not _is_same_point(current, home_exit):
+        home_exit_path = _group_anchor_transition_points(
+            draft,
+            home_group_id,
+            current,
+            home_exit,
+            mapper,
+        )
         task_id = _append_xy_path(
             tasks,
-            [current, home_exit],
+            home_exit_path,
             home_group.get("areaNumber") or 1,
             mapper,
             task_id,
@@ -838,6 +1008,7 @@ def generate_task_plan(draft, now=None):
                 mapper,
                 task_id,
                 preview,
+                draft,
                 current_group_id,
                 segment.get("groupId"),
                 source="modeling_start_to_first_lane" if clean_count == 0 else "modeling_transfer",
@@ -873,6 +1044,7 @@ def generate_task_plan(draft, now=None):
             mapper,
             task_id,
             preview,
+            draft,
             current_group_id,
             origin_group_id,
             source="modeling_return_origin",

@@ -284,6 +284,28 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             [task["areaNumber"] for task in tasks if task["mode"] == 1],
             [2, 2, 2, 2, 1, 1, 1, 1],
         )
+        remote_clean = [task for task in tasks if task["mode"] == 1 and task["areaNumber"] == 2]
+        home_clean = [task for task in tasks if task["mode"] == 1 and task["areaNumber"] == 1]
+        self.assertEqual(
+            (remote_clean[-1]["endX"], remote_clean[-1]["endY"]),
+            (17, 261),
+        )
+        self.assertEqual(
+            (home_clean[-1]["endX"], home_clean[-1]["endY"]),
+            (0, 0),
+        )
+        self.assertFalse(any(task["source"] == "modeling_return_origin" for task in tasks))
+        visited = {
+            (task[prefix + "X"], task[prefix + "Y"])
+            for task in tasks
+            for prefix in ("start", "end")
+        }
+        expected_recorded_anchors = {
+            (0, 0), (7, 118), (344, 86), (342, -62),
+            (17, 261), (24, 400), (379, 363), (369, 235),
+            (10, 171), (11, 204),
+        }
+        self.assertTrue(expected_recorded_anchors.issubset(visited))
         _assert_continuous_round_trip(self, tasks)
         for index in range(1, len(tasks)):
             self.assertFalse(_same_direction_collinear(tasks[index - 1], tasks[index]), index)

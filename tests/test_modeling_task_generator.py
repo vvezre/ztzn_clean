@@ -10,6 +10,28 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(_round_int(-61.5), -62)
         self.assertEqual(_round_int(-61.49), -61)
 
+    def test_area_transition_follows_manual_recording_order_instead_of_shorter_reverse_side(self):
+        from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
+
+        points = [
+            {"id": "p1", "x": 0, "y": 0, "lat": 32.0, "lon": 118.0},
+            {"id": "p2", "x": 0, "y": 120, "lat": 32.0, "lon": 118.0},
+            {"id": "p3", "x": 340, "y": 90, "lat": 32.0, "lon": 118.0},
+            {"id": "p4", "x": 340, "y": -20, "lat": 32.0, "lon": 118.0},
+        ]
+        draft = {"groups": [{"id": "g1", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+
+        path = _group_anchor_transition_points(
+            draft,
+            "g1",
+            (0, 0),
+            (340, 90),
+            mapper,
+        )
+
+        self.assertEqual(path, [(0.0, 0.0), (0.0, 120.0), (340.0, 90.0)])
+
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks
 

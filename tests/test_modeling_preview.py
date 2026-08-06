@@ -162,6 +162,35 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(first["laneSpacingCm"], 64.6)
         self.assertEqual(second["laneSpacingCm"], 75.3)
 
+    def test_actual_overlap_never_drops_below_thirty_centimeters(self):
+        from modeling_preview import build_model_preview
+
+        points = [
+            _point("p1", 0, 0),
+            _point("p2", 0, 90),
+            _point("p3", 300, 90),
+            _point("p4", 300, 0),
+        ]
+        draft = {
+            "id": "minimum-overlap",
+            "recognition": {"confirmed": True},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{"id": "sa1", "pointIds": [point["id"] for point in points]}],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000, overlap_cm=0)
+        lanes = preview["groups"][0]["subAreas"][0]["lanes"]
+
+        self.assertEqual(preview["config"]["overlapCm"], 30.0)
+        self.assertGreaterEqual(len(lanes), 2)
+        self.assertTrue(all(116.0 - lane["laneSpacingCm"] >= 30.0 for lane in lanes))
+
     def test_tilted_quadrilateral_preserves_both_real_boundary_lanes(self):
         from modeling_preview import build_model_preview
 
