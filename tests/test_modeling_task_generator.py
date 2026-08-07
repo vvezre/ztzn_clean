@@ -70,6 +70,207 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(compacted[2]["mode"], 1)
         self.assertEqual([item["id"] for item in compacted], [1, 2, 3])
 
+    def test_test12_nearly_straight_outbound_points_become_one_executable_segment(self):
+        from modeling_task_generator import _compact_executable_tasks
+
+        points = [
+            (0, 0),
+            (11, 127),
+            (31, 178),
+            (34, 231),
+            (36, 284),
+            (40, 416),
+        ]
+        tasks = []
+        for index in range(len(points) - 1):
+            tasks.append({
+                "id": index + 1,
+                "mode": 2,
+                "startX": points[index][0],
+                "startY": points[index][1],
+                "endX": points[index + 1][0],
+                "endY": points[index + 1][1],
+                "startLat": 32.0,
+                "startLon": 118.0,
+                "endLat": 32.0,
+                "endLon": 118.0,
+                "source": "modeling_outbound" if index < 3 else "modeling_transfer",
+            })
+
+        compacted = _compact_executable_tasks(tasks)
+
+        self.assertEqual(len(compacted), 1)
+        self.assertEqual(
+            (
+                compacted[0]["startX"],
+                compacted[0]["startY"],
+                compacted[0]["endX"],
+                compacted[0]["endY"],
+            ),
+            (0, 0, 40, 416),
+        )
+        self.assertEqual(compacted[0]["mergedSegmentCount"], 5)
+        self.assertEqual(
+            compacted[0]["mergedSources"],
+            ["modeling_outbound", "modeling_transfer"],
+        )
+
+    def test_ninety_degree_transition_corner_is_kept_as_stop_and_turn_point(self):
+        from modeling_task_generator import _compact_executable_tasks
+
+        def task(task_id, start, end):
+            return {
+                "id": task_id,
+                "mode": 2,
+                "startX": start[0],
+                "startY": start[1],
+                "endX": end[0],
+                "endY": end[1],
+                "startLat": 32.0,
+                "startLon": 118.0,
+                "endLat": 32.0,
+                "endLon": 118.0,
+                "source": "modeling_outbound",
+            }
+
+        compacted = _compact_executable_tasks([
+            task(1, (0, 0), (0, 100)),
+            task(2, (0, 100), (100, 100)),
+        ])
+
+        self.assertEqual(len(compacted), 2)
+        self.assertEqual((compacted[0]["endX"], compacted[0]["endY"]), (0, 100))
+        self.assertEqual((compacted[1]["startX"], compacted[1]["startY"]), (0, 100))
+
+    def test_explicit_stop_boundary_is_not_removed_by_transition_simplification(self):
+        from modeling_task_generator import _compact_executable_tasks
+
+        tasks = [
+            {
+                "id": 1,
+                "mode": 2,
+                "startX": 0,
+                "startY": 0,
+                "endX": 2,
+                "endY": 100,
+                "startLat": 32.0,
+                "startLon": 118.0,
+                "endLat": 32.0,
+                "endLon": 118.0,
+                "source": "test",
+                "preserveEndStop": True,
+            },
+            {
+                "id": 2,
+                "mode": 2,
+                "startX": 2,
+                "startY": 100,
+                "endX": 4,
+                "endY": 200,
+                "startLat": 32.0,
+                "startLon": 118.0,
+                "endLat": 32.0,
+                "endLon": 118.0,
+                "source": "test",
+            },
+        ]
+
+        compacted = _compact_executable_tasks(tasks)
+
+        self.assertEqual(len(compacted), 2)
+        self.assertTrue(compacted[0]["preserveEndStop"])
+
+    def test_test12_full_plan_simplifies_outbound_and_bridge_return_only(self):
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        home_points = [
+            point("A1", 0.0, 0.0),
+            point("A2", 10.708, 127.296),
+            point("A3", 954.092, 52.061),
+            point("A4", 946.118, -76.013),
+        ]
+        remote_points = [
+            point("A5", 36.309, 283.536),
+            point("A6", 40.466, 415.813),
+            point("A7", 403.409, 381.877),
+            point("A8", 392.202, 247.164),
+        ]
+        link_points = [
+            point("L1", 31.474, 177.712),
+            point("L2", 33.774, 231.474),
+        ]
+        draft = {
+            "id": "test12-general-turn",
+            "recognition": {"confirmed": True},
+            "groups": [
+                {
+                    "id": "home",
+                    "areaNumber": 1,
+                    "points": home_points,
+                    "subAreas": [{"id": "home-area", "pointIds": [p["id"] for p in home_points]}],
+                },
+                {
+                    "id": "remote",
+                    "areaNumber": 2,
+                    "points": remote_points,
+                    "subAreas": [{"id": "remote-area", "pointIds": [p["id"] for p in remote_points]}],
+                },
+            ],
+            "groupLinks": [{
+                "id": "bridge",
+                "startGroupId": "home",
+                "endGroupId": "remote",
+                "status": "ready",
+                "points": link_points,
+            }],
+        }
+        draft["taskPreview"] = build_model_preview(draft, now=1000)
+
+        plan = generate_task_plan(draft, now=2000)
+        tasks = plan["tasks"]
+
+        self.assertEqual(plan["routeType"], "bridge_round_trip")
+        self.assertEqual(tasks[0]["mode"], 2)
+        self.assertEqual(
+            (tasks[0]["startX"], tasks[0]["startY"], tasks[0]["endX"], tasks[0]["endY"]),
+            (0, 0, 40, 416),
+        )
+
+        remote_clean_indexes = [
+            index for index, task in enumerate(tasks)
+            if task["mode"] == 1 and task["areaNumber"] == 2
+        ]
+        bridge_return = tasks[remote_clean_indexes[-1] + 1]
+        self.assertEqual(bridge_return["mode"], 2)
+        self.assertEqual(
+            (
+                bridge_return["startX"],
+                bridge_return["startY"],
+                bridge_return["endX"],
+                bridge_return["endY"],
+            ),
+            (36, 284, 11, 127),
+        )
+        self.assertEqual(tasks[remote_clean_indexes[-1] + 2]["mode"], 1)
+
+        connector_coordinates = {(31, 178), (34, 231)}
+        executable_endpoints = {
+            (task["startX"], task["startY"]) for task in tasks
+        } | {
+            (task["endX"], task["endY"]) for task in tasks
+        }
+        self.assertTrue(connector_coordinates.isdisjoint(executable_endpoints))
+
     def test_generate_task_plan_starts_and_ends_at_first_recorded_point(self):
         from modeling_task_generator import generate_task_plan
 

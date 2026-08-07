@@ -300,12 +300,12 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             for task in tasks
             for prefix in ("start", "end")
         }
-        expected_recorded_anchors = {
+        expected_area_anchors = {
             (0, 0), (7, 118), (344, 86), (342, -62),
             (17, 261), (24, 400), (379, 363), (369, 235),
-            (10, 171), (11, 204),
         }
-        self.assertTrue(expected_recorded_anchors.issubset(visited))
+        self.assertTrue(expected_area_anchors.issubset(visited))
+        self.assertTrue({(10, 171), (11, 204)}.isdisjoint(visited))
         _assert_continuous_round_trip(self, tasks)
         for index in range(1, len(tasks)):
             self.assertFalse(_same_direction_collinear(tasks[index - 1], tasks[index]), index)

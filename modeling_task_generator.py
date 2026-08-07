@@ -7,6 +7,17 @@ EARTH_RADIUS_M = 6371000.0
 EPSILON_CM = 1e-6
 ANCHOR_MATCH_CM = 2.0
 
+# Ordinary transition points come from manually sampled boundaries and bridge
+# points.  RTK sampling jitter can move those points several centimetres away
+# from the ideal centre line.  Treat a chain as one executable straight segment
+# when every intermediate point stays inside this corridor.
+TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
+
+# A real corner must never be hidden by the lateral-deviation simplifier.  This
+# threshold keeps test12's 16-18 degree sampling wobble continuous while a
+# physical 90-degree bridge corner is always retained as a stop-and-turn point.
+TRANSFER_HARD_TURN_DEG = 30.0
+
 
 class ModelingTaskGenerationError(Exception):
     pass
@@ -217,6 +228,156 @@ def _same_direction_collinear(left, right):
     return abs(cross) <= EPSILON_CM * left_length * right_length and dot > 0
 
 
+def _turn_angle_degrees(start, middle, end):
+    """Return the smaller heading change at *middle* in the range 0..180."""
+    incoming = _heading_from_xy(start, middle)
+    outgoing = _heading_from_xy(middle, end)
+    if incoming is None or outgoing is None:
+        return 0.0
+    difference = abs(incoming - outgoing) % 360.0
+    return min(difference, 360.0 - difference)
+
+
+def _point_to_segment_distance(point, start, end):
+    """Shortest distance from *point* to the finite start/end segment."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared <= EPSILON_CM:
+        return _length_cm(point, start)
+    projection = (
+        (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
+    ) / float(length_squared)
+    projection = max(0.0, min(1.0, projection))
+    nearest = (start[0] + projection * dx, start[1] + projection * dy)
+    return _length_cm(point, nearest)
+
+
+def _rdp_point_indexes(points, start_index, end_index, tolerance_cm):
+    """
+    Return the indexes retained by a Ramer-Douglas-Peucker simplification.
+
+    The distance is measured against a finite segment, so a point that doubles
+    back beyond either endpoint cannot be silently merged into a straight run.
+    """
+    if end_index <= start_index + 1:
+        return [start_index, end_index]
+
+    start = points[start_index]
+    end = points[end_index]
+    maximum_distance = -1.0
+    maximum_index = None
+    for index in range(start_index + 1, end_index):
+        distance = _point_to_segment_distance(points[index], start, end)
+        if distance > maximum_distance:
+            maximum_distance = distance
+            maximum_index = index
+
+    if maximum_index is not None and maximum_distance > tolerance_cm:
+        left = _rdp_point_indexes(points, start_index, maximum_index, tolerance_cm)
+        right = _rdp_point_indexes(points, maximum_index, end_index, tolerance_cm)
+        return left[:-1] + right
+    return [start_index, end_index]
+
+
+def _merge_task_span(tasks, start_index, end_index):
+    """Merge tasks[start_index:end_index] while preserving endpoint metadata."""
+    span = tasks[start_index:end_index]
+    merged = dict(span[0])
+    last = span[-1]
+    merged["endX"] = last.get("endX")
+    merged["endY"] = last.get("endY")
+    merged["endLat"] = last.get("endLat")
+    merged["endLon"] = last.get("endLon")
+
+    start = (_number(merged.get("startX")), _number(merged.get("startY")))
+    end = (_number(merged.get("endX")), _number(merged.get("endY")))
+    if None not in start and None not in end:
+        merged["length"] = _round_int(_length_cm(start, end))
+        heading = _heading_from_xy(start, end)
+        merged["heading"] = heading
+        merged["angle"] = heading
+
+    if len(span) > 1:
+        sources = []
+        segment_count = 0
+        for task in span:
+            segment_count += int(task.get("mergedSegmentCount") or 1)
+            task_sources = task.get("mergedSources") or [task.get("source")]
+            for source in task_sources:
+                if source and source not in sources:
+                    sources.append(source)
+        merged["mergedSources"] = sources
+        merged["mergedSegmentCount"] = segment_count
+
+    if last.get("preserveEndStop"):
+        merged["preserveEndStop"] = True
+    else:
+        merged.pop("preserveEndStop", None)
+    return merged
+
+
+def _can_extend_transfer_run(previous, current):
+    """Whether two neighbouring mode=2 tasks may be simplified as one chain."""
+    if int(previous.get("mode") or 0) != 2 or int(current.get("mode") or 0) != 2:
+        return False
+    if previous.get("preserveEndStop") or current.get("preserveStartStop"):
+        return False
+    previous_end = (_number(previous.get("endX")), _number(previous.get("endY")))
+    current_start = (_number(current.get("startX")), _number(current.get("startY")))
+    if None in previous_end or None in current_start:
+        return False
+    return _is_same_point(previous_end, current_start)
+
+
+def _simplify_transfer_run(tasks):
+    """
+    Simplify one continuous mode=2 run without removing real corners.
+
+    First preserve every local turn of at least TRANSFER_HARD_TURN_DEG.  Then
+    simplify the points between those hard corners using the 20 cm corridor.
+    The resulting task endpoints are exactly the places where the existing
+    point-to-point executor will stop and calculate a new heading.
+    """
+    if len(tasks) < 2:
+        return list(tasks)
+
+    first_start = (_number(tasks[0].get("startX")), _number(tasks[0].get("startY")))
+    if None in first_start:
+        return list(tasks)
+    points = [first_start]
+    for task in tasks:
+        endpoint = (_number(task.get("endX")), _number(task.get("endY")))
+        if None in endpoint:
+            return list(tasks)
+        points.append(endpoint)
+
+    hard_indexes = [0]
+    for index in range(1, len(points) - 1):
+        if _turn_angle_degrees(points[index - 1], points[index], points[index + 1]) >= TRANSFER_HARD_TURN_DEG:
+            hard_indexes.append(index)
+    hard_indexes.append(len(points) - 1)
+
+    retained_indexes = []
+    for index in range(len(hard_indexes) - 1):
+        section = _rdp_point_indexes(
+            points,
+            hard_indexes[index],
+            hard_indexes[index + 1],
+            TRANSFER_MAX_LATERAL_DEVIATION_CM,
+        )
+        if retained_indexes:
+            section = section[1:]
+        retained_indexes.extend(section)
+
+    simplified = []
+    for index in range(len(retained_indexes) - 1):
+        start_point_index = retained_indexes[index]
+        end_point_index = retained_indexes[index + 1]
+        simplified.append(_merge_task_span(tasks, start_point_index, end_point_index))
+    return simplified
+
+
 def _compact_executable_tasks(tasks):
     """
     合并同模式、同方向、同一直线上的普通中间任务段。
@@ -224,28 +385,40 @@ def _compact_executable_tasks(tasks):
     区域边界采样点、前端绘图点或连接桥中间点只有在真正形成拐角时才会留下；
     清扫模式发生变化或显式标记为必须停车的位置永远不会被跨越合并。
     """
-    compacted = []
+    # Preserve the old exact-collinear behaviour for every task mode first.
+    # This also keeps compatibility with existing saved plans and tests.
+    exactly_compacted = []
     for raw_task in tasks or []:
         task = dict(raw_task)
-        if compacted and _same_direction_collinear(compacted[-1], task):
-            merged = compacted[-1]
-            merged["endX"] = task.get("endX")
-            merged["endY"] = task.get("endY")
-            merged["endLat"] = task.get("endLat")
-            merged["endLon"] = task.get("endLon")
-            start = (_number(merged.get("startX")), _number(merged.get("startY")))
-            end = (_number(merged.get("endX")), _number(merged.get("endY")))
-            merged["length"] = _round_int(_length_cm(start, end))
-            heading = _heading_from_xy(start, end)
-            merged["heading"] = heading
-            merged["angle"] = heading
-            sources = list(merged.get("mergedSources") or [merged.get("source")])
-            if task.get("source") not in sources:
-                sources.append(task.get("source"))
-            merged["mergedSources"] = [source for source in sources if source]
-            merged["mergedSegmentCount"] = int(merged.get("mergedSegmentCount") or 1) + 1
+        if exactly_compacted and _same_direction_collinear(exactly_compacted[-1], task):
+            exactly_compacted[-1] = _merge_task_span(
+                [exactly_compacted[-1], task],
+                0,
+                2,
+            )
             continue
-        compacted.append(task)
+        exactly_compacted.append(task)
+
+    # Only ordinary movement runs receive tolerance-based simplification.
+    # Clean lines (mode=1) and boundaries carrying preserve*Stop remain exact.
+    compacted = []
+    index = 0
+    while index < len(exactly_compacted):
+        task = exactly_compacted[index]
+        if int(task.get("mode") or 0) != 2:
+            compacted.append(task)
+            index += 1
+            continue
+
+        run = [task]
+        next_index = index + 1
+        while (
+                next_index < len(exactly_compacted)
+                and _can_extend_transfer_run(run[-1], exactly_compacted[next_index])):
+            run.append(exactly_compacted[next_index])
+            next_index += 1
+        compacted.extend(_simplify_transfer_run(run))
+        index = next_index
 
     for index, task in enumerate(compacted, start=1):
         task["id"] = index
