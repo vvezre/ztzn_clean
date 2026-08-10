@@ -8,6 +8,7 @@ class ModelingSavedRoutesTest(unittest.TestCase):
         task_configs = {
             "route-a": {
                 "modelId": "model-a",
+                "areaOrder": [2, 1],
                 "taskList": [{
                     "startX": 0,
                     "startY": 0,
@@ -57,6 +58,7 @@ class ModelingSavedRoutesTest(unittest.TestCase):
             "model-b": {
                 "groups": [],
                 "groupLinks": [],
+                "taskPlan": {"areaOrder": [1, 2]},
             },
         }
 
@@ -76,6 +78,8 @@ class ModelingSavedRoutesTest(unittest.TestCase):
         self.assertTrue(result["routes"][1]["current"])
         self.assertEqual(result["routes"][0]["modelId"], "model-a")
         self.assertEqual(result["routes"][0]["taskCount"], 1)
+        self.assertEqual(result["routes"][0]["areaOrder"], [2, 1])
+        self.assertEqual(result["routes"][1]["areaOrder"], [1, 2])
         self.assertEqual(result["routes"][0]["areaPoints"][0]["id"], "a1")
         self.assertEqual(result["routes"][0]["linkPoints"][0]["id"], "l1")
         self.assertEqual(
@@ -100,6 +104,7 @@ class ModelingSavedRoutesTest(unittest.TestCase):
 
         route = result["routes"][0]
         self.assertIsNone(route["modelId"])
+        self.assertEqual(route["areaOrder"], [])
         self.assertEqual(route["areaPoints"], [])
         self.assertEqual(route["linkPoints"], [])
         self.assertEqual(len(route["pathPoints"]), 2)

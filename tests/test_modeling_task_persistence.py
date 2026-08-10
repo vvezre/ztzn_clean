@@ -30,6 +30,7 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
             "modelId": "model-1",
             "taskPlan": {
                 "status": "ready",
+                "areaOrder": [2, 1],
                 "tasks": [first_task],
             },
         }
@@ -38,6 +39,7 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
 
         self.assertEqual(saved["taskName"], u"厂区路线一")
         self.assertEqual(saved["modelId"], "model-1")
+        self.assertEqual(saved["areaOrder"], [2, 1])
         self.assertEqual(saved["taskList"], [first_task])
         self.assertEqual(saved["startLat"], 32.0364)
         self.assertEqual(saved["startLon"], 118.1234)

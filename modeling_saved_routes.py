@@ -27,6 +27,27 @@ def _safe_task_name(value):
         return None
 
 
+def _saved_area_order(task_config, model):
+    """Return the cleaning-area order stored for one named route.
+
+    New task files persist ``areaOrder`` directly because several saved routes
+    may originate from the same model but use different orders.  Older task
+    files do not contain this field, so they fall back to the task plan kept in
+    their associated model.  Invalid or unavailable legacy data becomes an
+    empty list instead of breaking the whole saved-route query.
+    """
+    area_order = (task_config or {}).get('areaOrder')
+    if isinstance(area_order, (list, tuple)) and area_order:
+        return list(area_order)
+
+    task_plan = (model or {}).get('taskPlan')
+    if isinstance(task_plan, dict):
+        area_order = task_plan.get('areaOrder')
+        if isinstance(area_order, (list, tuple)):
+            return list(area_order)
+    return []
+
+
 def discover_saved_task_names(file_names, load_task_config):
     """从任务目录中找出真正完整、可加载的已保存任务。
 
@@ -118,6 +139,7 @@ def build_saved_routes(task_names, current_task_name, load_task_config, load_mod
             'modelId': model_id,
             'current': task_name == current_task_name,
             'taskCount': len(task_list),
+            'areaOrder': _saved_area_order(task_config, model),
             'areaPoints': frontend_area_points(model),
             'linkPoints': frontend_link_points(model),
             'pathPoints': frontend_path_points({'tasks': task_list}),

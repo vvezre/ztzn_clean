@@ -113,6 +113,15 @@ def build_named_task(base_config, current_path, task_name):
     task_config["taskName"] = task_name
     task_config["modelId"] = current_path.get("modelId")
     task_config["taskList"] = copy.deepcopy(tasks)
+    # Keep the confirmed cleaning-area order with the named route.  A route
+    # list can contain several plans built from the same model, so the model's
+    # latest taskPlan alone is not a reliable source for each saved route.
+    area_order = task_plan.get("areaOrder")
+    task_config["areaOrder"] = (
+        copy.deepcopy(list(area_order))
+        if isinstance(area_order, (list, tuple))
+        else []
+    )
 
     # startLat/startLon 用于启动前检查是否位于路线原点。
     # heading 字段仅为兼容旧任务和前端展示保留，真车执行不再直接采用该预存航向。
