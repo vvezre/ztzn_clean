@@ -1,4 +1,15 @@
 # coding=utf-8
+"""根据已经确认的区域点生成“可绘制、可执行”的清扫线预览。
+
+本文件只负责几何规划，不直接驱动小车。评审时可以按下面四步阅读：
+
+1. 用区域前两个记录点确定一条边的方向，再旋转90度得到清扫主方向。
+2. 用“滚刷宽度 - 重叠宽度”得到目标线间距，并生成满足最低重叠的奇偶候选。
+3. 四点凸区域走两侧边界插值；其他多边形走平行线与多边形求交。
+4. 输出每条 lane 的起点、终点、航向、长度和实际间距，交给任务生成器排成 S 形。
+
+坐标约定：x 向东为正，y 向北为正，单位厘米；航向0度沿+y，90度沿+x。
+"""
 import math
 import time
 
@@ -7,7 +18,9 @@ import time
 BRUSH_WIDTH_CM = 116.0
 # 相邻两条清扫线的目标重叠宽度，不是清扫线间距。
 DEFAULT_OVERLAP_CM = 53.0
+# 实际路线允许偏离目标重叠，但任何方案都不能低于30厘米重叠。
 MIN_OVERLAP_CM = 30.0
+# 浮点几何判断误差，避免把几乎相等的坐标误判成不同点。
 EPSILON = 1e-6
 
 
@@ -82,19 +95,25 @@ def _default_sweep_angle(points):
     当前约定用户打的前两个区域点表示希望的首段方向，
     后续生成的所有清扫线都与这个方向平行。
     """
+    # 没有两个点就无法得到边界方向。
     if len(points) < 2:
         return None
+    # 记录顺序有业务含义：points[0] -> points[1] 就是用户先记录的区域侧边。
     start_xy = _point_xy(points[0])
     end_xy = _point_xy(points[1])
     if start_xy is None or end_xy is None:
         return None
+    # 边界方向向量 v=(dx,dy)。
     dx = end_xy[0] - start_xy[0]
     dy = end_xy[1] - start_xy[1]
     if abs(dx) < EPSILON and abs(dy) < EPSILON:
         return None
     # 几何求交必须保留完整精度；提前四舍五入到0.1°会让旋转矩形的最外侧扫描线
     # 与边界产生轻微夹角，最终漏掉首尾两条清扫线。展示时再统一保留0.1°。
+    # 本项目0度沿+y，所以航向角使用 atan2(dx,dy)。
     first_edge = math.degrees(math.atan2(dx, dy)) % 360.0
+    # 清扫线与该侧边垂直，因此统一沿顺时针方向旋转90度。
+    # 旋转后的反方向仍属于同一组平行线；真正从哪一端出发由 S 形排序阶段决定。
     return (first_edge + 90.0) % 360.0
 
 
@@ -159,18 +178,22 @@ def _line_polygon_intersections(polygon_xy, normal, offset):
     扫描线使用法向量方程 normal·point=offset 表示。
     对每条多边形边判断两个端点是否分布在扫描线两侧，若是则线性插值求交点。
     """
+    # 扫描线方程：normal.x*x + normal.y*y = offset。
     intersections = []
     count = len(polygon_xy)
     for index in range(count):
         start = polygon_xy[index]
         end = polygon_xy[(index + 1) % count]
+        # start_value/end_value 是边的两个端点到扫描线的带符号投影差。
         start_value = normal[0] * start[0] + normal[1] * start[1] - offset
         end_value = normal[0] * end[0] + normal[1] * end[1] - offset
         if abs(start_value) < EPSILON:
             intersections.append(start)
+        # 两个值相等说明该边与扫描线平行，不能用下面的比例式求唯一交点。
         denominator = start_value - end_value
         if abs(denominator) < EPSILON:
             continue
+        # 在线段 start -> end 上线性插值：Q=start+ratio*(end-start)。
         ratio = start_value / denominator
         if -EPSILON <= ratio <= 1.0 + EPSILON:
             x = start[0] + (end[0] - start[0]) * ratio
@@ -183,7 +206,9 @@ def _minimum_lane_count(span, max_spacing):
     """Return the smallest lane count whose actual spacing does not exceed max_spacing."""
     if span <= EPSILON:
         return 0
+    # 至少保留1厘米的正间距，避免配置错误造成除零。
     spacing_limit = max(float(max_spacing), 1.0)
+    # N条线有N-1个间隔，因此 N >= ceil(span/max_spacing)+1。
     return max(2, int(math.ceil(span / spacing_limit)) + 1)
 
 
@@ -197,17 +222,63 @@ def _nearest_even_lane_count(span, target_spacing, max_spacing=None):
     """
     if span <= EPSILON:
         return 0
+    # 如果不限制整数和奇偶，理论条数 N*=span/target_spacing+1。
     ideal = span / max(float(target_spacing), 1.0) + 1.0
+    # 找到理论条数附近较小的偶数，再向两侧扩展少量偶数候选。
     lower = max(2, int(math.floor(ideal / 2.0)) * 2)
     candidates = sorted(set([max(2, lower - 2), lower, lower + 2, lower + 4]))
     if max_spacing is not None:
+        # 先根据“最低重叠30厘米”得到绝不能少于的条数，再向上取偶数。
         minimum = _minimum_lane_count(span, max_spacing)
         minimum_even = minimum if minimum % 2 == 0 else minimum + 1
         candidates.extend([minimum_even, minimum_even + 2])
+        # 删除实际间距超过最大允许值的方案，保证实际重叠不低于下限。
         candidates = sorted(set(
             count for count in candidates
             if span / float(count - 1) <= float(max_spacing) + EPSILON
         ))
+    # 排序优先级：实际间距最接近目标值；其次条数最接近理论值；最后取更少条数。
+    return min(
+        candidates,
+        key=lambda count: (
+            abs(span / float(count - 1) - target_spacing),
+            abs(count - ideal),
+            count,
+        ),
+    )
+
+
+def _lane_count_candidates(span, target_spacing, max_spacing=None):
+    """返回同时包含奇数和偶数的有限清扫线数量候选。
+
+    N 条清扫线共有 N-1 个间隔。最低重叠决定最少需要多少条线，目标重叠
+    决定理论最优条数。候选范围从满足最低重叠的最少条数开始，到理论条数
+    上方一个整数为止；这样既包含目标值附近的奇偶方案，也不会为了改变出口
+    一直增加没有必要的清扫线。
+    """
+    if span <= EPSILON:
+        return []
+    spacing = max(float(target_spacing), 1.0)
+    ideal = span / spacing + 1.0
+    minimum = 2
+    if max_spacing is not None:
+        minimum = _minimum_lane_count(span, max_spacing)
+    maximum = max(minimum, int(math.ceil(ideal)) + 1)
+    candidates = []
+    for count in range(minimum, maximum + 1):
+        actual_spacing = span / float(count - 1)
+        if max_spacing is not None and actual_spacing > float(max_spacing) + EPSILON:
+            continue
+        candidates.append(count)
+    return candidates
+
+
+def _nearest_lane_count(span, target_spacing, max_spacing=None):
+    """在不限制奇偶的候选中选择实际间距最接近目标值的条数。"""
+    candidates = _lane_count_candidates(span, target_spacing, max_spacing=max_spacing)
+    if not candidates:
+        return 0
+    ideal = span / max(float(target_spacing), 1.0) + 1.0
     return min(
         candidates,
         key=lambda count: (
@@ -247,7 +318,8 @@ def _is_convex_quadrilateral(points):
 
 
 def _generate_boundary_interpolated_quadrilateral_lanes(
-        polygon, sweep_angle, lane_spacing_cm, force_even, max_spacing_cm=None):
+        polygon, sweep_angle, lane_spacing_cm, force_even, max_spacing_cm=None,
+        lane_count_override=None):
     """
     为允许倾斜的凸四边形生成边界保留式清扫线。
 
@@ -263,6 +335,7 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     只有 sweep_angle 与“前两个点自动确定的方向”一致时才启用该方法；手工指定
     其他清扫方向以及四点以上的复杂多边形仍走原有通用扫描线算法。
     """
+    # 本专用算法只处理严格四点区域；多点区域交给通用多边形扫描算法。
     if len(polygon) != 4:
         return None
     polygon_xy = [_point_xy(point) for point in polygon]
@@ -275,9 +348,11 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     if automatic_angle is None or _angle_difference(sweep_angle, automatic_angle) > 1e-4:
         return None
 
+    # 航向角转换为单位方向向量和与它垂直的法向量。
     radians = math.radians(sweep_angle)
     direction = (math.sin(radians), math.cos(radians))
     normal = (math.cos(radians), -math.sin(radians))
+    # 记录顺序约定：first=P1、second=P2、third=P3、fourth=P4。
     first, second, third, fourth = polygon_xy
 
     # 清扫宽度使用两条侧边在清扫线法向量上的投影均值。
@@ -290,28 +365,33 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
         normal[0] * (fourth[0] - third[0])
         + normal[1] * (fourth[1] - third[1])
     )
+    # 左右边可能因 RTK 误差略有差异，取两侧扫宽投影的平均值作为区域跨度D。
     span = (left_span + right_span) / 2.0
     if span <= EPSILON:
         return None
 
+    # spacing 是目标值63厘米；lane_count_override 用于生成指定奇偶候选。
     spacing = max(float(lane_spacing_cm), 1.0)
-    if force_even:
+    if lane_count_override is not None:
+        lane_count = max(2, int(lane_count_override))
+    elif force_even:
         lane_count = _nearest_even_lane_count(span, spacing, max_spacing=max_spacing_cm)
     else:
-        ideal = span / spacing + 1.0
-        lane_count = max(2, int(math.floor(ideal + 0.5)))
-        if max_spacing_cm is not None:
-            lane_count = max(lane_count, _minimum_lane_count(span, max_spacing_cm))
+        lane_count = _nearest_lane_count(span, spacing, max_spacing=max_spacing_cm)
+    # N条线把整个区域跨度分成N-1份，实际间距=D/(N-1)。
     actual_spacing = span / float(lane_count - 1)
 
     lanes = []
     for index in range(lane_count):
+        # ratio从0均匀变化到1，对应从P2/P3一侧逐步移动到P1/P4一侧。
         ratio = index / float(lane_count - 1)
         # 从远端边界向近端边界逐条插值；ratio=0/1 时精确保留两条真实边界。
+        # 左端点公式：start=P2+(P1-P2)*ratio。
         start = (
             second[0] + (first[0] - second[0]) * ratio,
             second[1] + (first[1] - second[1]) * ratio,
         )
+        # 右端点公式：end=P3+(P4-P3)*ratio。
         end = (
             third[0] + (fourth[0] - third[0]) * ratio,
             third[1] + (fourth[1] - third[1]) * ratio,
@@ -339,7 +419,8 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
 
 
 def _generate_lanes(
-        polygon, sweep_angle, lane_spacing_cm, force_even=False, max_spacing_cm=None):
+        polygon, sweep_angle, lane_spacing_cm, force_even=False, max_spacing_cm=None,
+        lane_count_override=None):
     """
     使用一组平行扫描线与区域多边形求交，得到每条真正位于区域内的清扫线段。
 
@@ -357,31 +438,39 @@ def _generate_lanes(
     if len(polygon_xy) < 3 or sweep_angle is None:
         return []
 
+    # 优先使用能完整保留四条真实边界的四点插值算法。
     quadrilateral_lanes = _generate_boundary_interpolated_quadrilateral_lanes(
         polygon,
         sweep_angle,
         lane_spacing_cm,
         force_even,
         max_spacing_cm=max_spacing_cm,
+        lane_count_override=lane_count_override,
     )
     if quadrilateral_lanes is not None:
         return quadrilateral_lanes
 
+    # 四点专用算法不适用时，建立通用平行扫描线坐标系。
     radians = math.radians(sweep_angle)
     # direction 是小车沿清扫线行驶的方向，normal 用于沿扫宽方向平移清扫线。
     direction = (math.sin(radians), math.cos(radians))
     normal = (math.cos(radians), -math.sin(radians))
     # 把每个多边形顶点投影到法向量上，最小/最大投影差就是扫宽方向的区域跨度。
+    # q=n·P：把每个顶点投影到扫宽方向；最大值减最小值就是区域扫宽跨度D。
     offsets = [normal[0] * x + normal[1] * y for x, y in polygon_xy]
     min_offset = min(offsets)
     max_offset = max(offsets)
     spacing = max(float(lane_spacing_cm), 1.0)
 
     span = max_offset - min_offset
-    if force_even and span > EPSILON:
-        # 偶数条模式下重新均分区域跨度，所以 actual_spacing 可能与目标值略有差异。
-        lane_count = _nearest_even_lane_count(span, spacing, max_spacing=max_spacing_cm)
+    if span > EPSILON and (lane_count_override is not None or force_even):
+        # 指定条数和旧偶数兼容模式都重新均分完整区域跨度。
+        if lane_count_override is not None:
+            lane_count = max(2, int(lane_count_override))
+        else:
+            lane_count = _nearest_even_lane_count(span, spacing, max_spacing=max_spacing_cm)
         actual_spacing = span / float(lane_count - 1)
+        # 每个offset对应一条方程 n·P=offset 的无限长平行扫描线。
         lane_offsets = [min_offset + actual_spacing * index for index in range(lane_count)]
     else:
         actual_spacing = spacing
@@ -436,6 +525,50 @@ def _generate_lanes(
     }]
 
 
+def _generate_lane_candidates(
+        polygon, sweep_angle, lane_spacing_cm, brush_width_cm,
+        max_spacing_cm=None):
+    """为一个子区域生成目标条数附近的全部合法奇偶清扫线方案。"""
+    polygon_xy = [_point_xy(point) for point in polygon]
+    polygon_xy = [xy for xy in polygon_xy if xy is not None]
+    if len(polygon_xy) < 3 or sweep_angle is None:
+        return []
+
+    radians = math.radians(sweep_angle)
+    normal = (math.cos(radians), -math.sin(radians))
+    if len(polygon_xy) == 4 and _is_convex_quadrilateral(polygon_xy):
+        first, second, third, fourth = polygon_xy
+        left_span = abs(normal[0] * (first[0] - second[0]) + normal[1] * (first[1] - second[1]))
+        right_span = abs(normal[0] * (fourth[0] - third[0]) + normal[1] * (fourth[1] - third[1]))
+        span = (left_span + right_span) / 2.0
+    else:
+        offsets = [normal[0] * x + normal[1] * y for x, y in polygon_xy]
+        span = max(offsets) - min(offsets)
+
+    result = []
+    for lane_count in _lane_count_candidates(
+            span, lane_spacing_cm, max_spacing=max_spacing_cm):
+        lanes = _generate_lanes(
+            polygon,
+            sweep_angle,
+            lane_spacing_cm,
+            force_even=False,
+            max_spacing_cm=max_spacing_cm,
+            lane_count_override=lane_count,
+        )
+        if len(lanes) != lane_count:
+            continue
+        actual_spacing = span / float(lane_count - 1)
+        result.append({
+            "laneCount": lane_count,
+            "parity": "even" if lane_count % 2 == 0 else "odd",
+            "laneSpacingCm": round(actual_spacing, 1),
+            "actualOverlapCm": round(float(brush_width_cm) - actual_spacing, 1),
+            "lanes": lanes,
+        })
+    return result
+
+
 def _build_group_link_preview(link):
     """
     生成跨区域连接桥的预览数据。
@@ -488,10 +621,13 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
     if not isinstance(recognition, dict) or not recognition.get("confirmed"):
         raise ModelingPreviewError("区域识别结果未确认，不能生成路径预览")
 
+    # 有效滚刷宽度W=116厘米。
     brush_width = float(brush_width_cm)
+    # 目标重叠O默认53厘米，并强制不能配置到30厘米以下。
     overlap = max(float(overlap_cm), MIN_OVERLAP_CM)
     # 清扫线间距 = 滚刷宽度 - 重叠宽度。当前默认为 116 - 53 = 63cm。
     lane_spacing = max(brush_width - overlap, 1.0)
+    # 最大允许间距=116-30=86厘米，用于保证实际重叠始终不少于30厘米。
     max_lane_spacing = max(brush_width - MIN_OVERLAP_CM, 1.0)
 
     group_previews = []
@@ -500,7 +636,8 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
     lane_count = 0
     warnings = []
     route_policy = draft.get("routePolicy") or {}
-    force_even_lanes = bool(route_policy.get("forceEvenLanes", True))
+    # 新规划默认不限制奇偶；显式 forceEvenLanes 只保留给历史策略兼容。
+    force_even_lanes = bool(route_policy.get("forceEvenLanes", False))
 
     for group in draft.get("groups") or []:
         # 每个 group 是一个独立清扫区域；一个 group 内仍可以识别出多个 subArea。
@@ -516,13 +653,28 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
             ]
             polygon = _clean_polygon_points(polygon)
             sweep_angle = _group_sweep_angle(group, polygon)
-            lanes = _generate_lanes(
+            lane_candidates = _generate_lane_candidates(
                 polygon,
                 sweep_angle,
                 lane_spacing,
-                force_even=force_even_lanes,
+                brush_width,
                 max_spacing_cm=max_lane_spacing,
             )
+            if force_even_lanes:
+                compatible = [
+                    candidate for candidate in lane_candidates
+                    if candidate.get("parity") == "even"
+                ]
+            else:
+                compatible = list(lane_candidates)
+            selected_candidate = min(
+                compatible or lane_candidates,
+                key=lambda candidate: (
+                    abs(float(candidate.get("laneSpacingCm") or 0.0) - lane_spacing),
+                    candidate.get("laneCount") or 0,
+                ),
+            ) if lane_candidates else None
+            lanes = list((selected_candidate or {}).get("lanes") or [])
             sub_area_count += 1
             lane_count += len(lanes)
             if len(polygon) < 3:
@@ -534,8 +686,13 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
                 "sweepAngle": _normalize_heading(sweep_angle),
                 "polygon": [_preview_point(point) for point in polygon],
                 "lanes": lanes,
+                "laneCandidates": lane_candidates,
                 "laneCount": len(lanes),
                 "laneSpacingCm": lanes[0].get("laneSpacingCm") if lanes else None,
+                "actualOverlapCm": (
+                    selected_candidate.get("actualOverlapCm")
+                    if selected_candidate else None
+                ),
             })
         connectors = list(group.get("connectors") or [])
         connector_count += len(connectors)
@@ -563,6 +720,7 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
             "brushWidthCm": round(brush_width, 1),
             "overlapCm": round(overlap, 1),
             "laneSpacingCm": round(lane_spacing, 1),
+            "minimumOverlapCm": round(MIN_OVERLAP_CM, 1),
             "forceEvenLanes": force_even_lanes,
         },
         "summary": {
@@ -574,5 +732,9 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
         },
         "groups": group_previews,
         "groupLinks": group_links,
+        "areaOrder": route_policy.get("areaOrder") or [
+            group.get("areaNumber")
+            for group in (draft.get("groups") or [])
+        ],
         "warnings": warnings,
     }

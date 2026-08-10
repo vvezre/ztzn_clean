@@ -104,6 +104,8 @@ class MQTTCommandHandler(object):
             'new_modeling_area': self._handle_new_modeling_area,
             'finishModeling': self._handle_finish_modeling,
             'finish_modeling': self._handle_finish_modeling,
+            'replanModelingRoute': self._handle_replan_modeling_route,
+            'replan_modeling_route': self._handle_replan_modeling_route,
             'getModelingState': self._handle_get_modeling_state,
             'get_modeling_state': self._handle_get_modeling_state,
             'undoModelingPoint': self._handle_undo_modeling_point,
@@ -161,6 +163,7 @@ class MQTTCommandHandler(object):
             'start_modeling': self._handle_start_modeling,
             'new_modeling_area': self._handle_new_modeling_area,
             'finish_modeling': self._handle_finish_modeling,
+            'replan_modeling_route': self._handle_replan_modeling_route,
             'get_modeling_state': self._handle_get_modeling_state,
             'undo_modeling_point': self._handle_undo_modeling_point,
             'delete_modeling_point': self._handle_delete_modeling_point,
@@ -535,6 +538,25 @@ class MQTTCommandHandler(object):
         # 完成打点后依次执行：区域识别 -> 清扫线预览 -> 机器人 taskPlan 生成。
         # 返回成功只表示规划完成；此时还没有路线名，必须再调用 save_modeling_task 才会保存。
         return self._call_controller('finish_modeling', 'modeling path generated')
+
+    def _handle_replan_modeling_route(self, params):
+        area_order = params.get('areaOrder') if isinstance(params, dict) else None
+        if not isinstance(area_order, (list, tuple)) or not area_order:
+            return {'success': False, 'message': 'areaOrder must be a non-empty array'}
+        normalized = []
+        for value in area_order:
+            try:
+                area_number = int(value)
+            except (TypeError, ValueError):
+                return {'success': False, 'message': 'areaOrder must contain area numbers'}
+            if area_number <= 0 or area_number in normalized:
+                return {'success': False, 'message': 'areaOrder must contain unique positive area numbers'}
+            normalized.append(area_number)
+        return self._call_controller(
+            'replan_modeling_route',
+            'modeling route replanned',
+            normalized,
+        )
 
     def _handle_get_modeling_state(self, params):
         return self._call_controller('get_modeling_state', 'modeling state fetched')

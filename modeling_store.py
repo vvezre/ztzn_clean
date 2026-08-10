@@ -31,6 +31,47 @@ def _text(value):
     return text_type(value)
 
 
+def _apply_route_selections_to_preview(preview, task_plan):
+    """让前端预览中的 lanes 与机器人最终选择的奇偶方案保持一致。"""
+    if not isinstance(preview, dict) or not isinstance(task_plan, dict):
+        return preview
+    selections = {
+        item.get("groupId"): item
+        for item in (task_plan.get("routeSelections") or [])
+        if isinstance(item, dict) and item.get("groupId")
+    }
+    total_lane_count = 0
+    for group in preview.get("groups") or []:
+        selection = selections.get(group.get("groupId")) or {}
+        sub_area_selections = {
+            item.get("subAreaId"): item
+            for item in (selection.get("subAreas") or [])
+            if isinstance(item, dict) and item.get("subAreaId")
+        }
+        for sub_area in group.get("subAreas") or []:
+            selected = sub_area_selections.get(sub_area.get("id"))
+            if selected:
+                selected_count = int(selected.get("laneCount") or 0)
+                candidate = next(
+                    (
+                        item for item in (sub_area.get("laneCandidates") or [])
+                        if int(item.get("laneCount") or 0) == selected_count
+                    ),
+                    None,
+                )
+                if candidate:
+                    sub_area["lanes"] = list(candidate.get("lanes") or [])
+                    sub_area["laneCount"] = len(sub_area["lanes"])
+                    sub_area["laneSpacingCm"] = candidate.get("laneSpacingCm")
+                    sub_area["actualOverlapCm"] = candidate.get("actualOverlapCm")
+            total_lane_count += int(sub_area.get("laneCount") or 0)
+    preview["areaOrder"] = list(task_plan.get("areaOrder") or preview.get("areaOrder") or [])
+    summary = dict(preview.get("summary") or {})
+    summary["laneCount"] = total_lane_count
+    preview["summary"] = summary
+    return preview
+
+
 class ModelingStoreError(Exception):
     pass
 
@@ -262,6 +303,10 @@ class ModelingStore(object):
         current_time = self._timestamp(now)
         draft = self.get_draft(model_id)
         task_plan = generate_task_plan(draft, now=current_time)
+        draft["taskPreview"] = _apply_route_selections_to_preview(
+            draft.get("taskPreview"),
+            task_plan,
+        )
         draft["taskPlan"] = task_plan
         saved = self.save_draft(model_id, draft, now=current_time)
         return {

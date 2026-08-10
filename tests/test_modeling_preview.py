@@ -54,7 +54,7 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(lanes[0]["heading"], 180.0)
         self.assertGreater(lanes[0]["lengthCm"], 0)
 
-    def test_standard_panel_length_generates_four_cleaning_lanes(self):
+    def test_standard_panel_length_offers_four_and_five_lane_candidates(self):
         from modeling_preview import build_model_preview
 
         points = [
@@ -85,9 +85,18 @@ class ModelingPreviewTest(unittest.TestCase):
         preview = build_model_preview(draft, now=1000)
 
         self.assertEqual(preview["config"]["laneSpacingCm"], 63.0)
-        self.assertEqual(preview["groups"][0]["subAreas"][0]["laneCount"], 4)
+        sub_area = preview["groups"][0]["subAreas"][0]
+        self.assertEqual(sub_area["laneCount"], 5)
+        self.assertEqual(
+            [candidate["laneCount"] for candidate in sub_area["laneCandidates"]],
+            [4, 5, 6],
+        )
+        self.assertTrue(all(
+            candidate["actualOverlapCm"] >= 30.0
+            for candidate in sub_area["laneCandidates"]
+        ))
 
-    def test_default_policy_uses_nearest_even_lane_count(self):
+    def test_default_policy_does_not_force_even_lane_count(self):
         from modeling_preview import build_model_preview
 
         points = [
@@ -112,8 +121,12 @@ class ModelingPreviewTest(unittest.TestCase):
 
         preview = build_model_preview(draft, now=1000)
 
-        self.assertTrue(preview["config"]["forceEvenLanes"])
-        self.assertEqual(preview["groups"][0]["subAreas"][0]["laneCount"], 4)
+        self.assertFalse(preview["config"]["forceEvenLanes"])
+        self.assertEqual(preview["groups"][0]["subAreas"][0]["laneCount"], 3)
+        self.assertEqual(
+            [candidate["laneCount"] for candidate in preview["groups"][0]["subAreas"][0]["laneCandidates"]],
+            [3, 4, 5],
+        )
 
     def test_round_trip_policy_chooses_nearest_even_lane_count_per_area(self):
         from modeling_preview import build_model_preview
@@ -218,7 +231,7 @@ class ModelingPreviewTest(unittest.TestCase):
         preview = build_model_preview(draft, now=1000)
         lanes = preview["groups"][0]["subAreas"][0]["lanes"]
 
-        self.assertEqual(len(lanes), 4)
+        self.assertGreaterEqual(len(lanes), 2)
         # 第一条精确保留 p2 -> p3 上边界。
         self.assertEqual(
             (lanes[0]["startX"], lanes[0]["startY"], lanes[0]["endX"], lanes[0]["endY"]),

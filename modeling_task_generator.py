@@ -1,22 +1,38 @@
 # coding=utf-8
+"""把清扫线预览转换为小车按顺序执行的点到点任务。
+
+本文件承担路线规划的“排序与落地”部分：
+
+1. 为每个区域比较奇数/偶数清扫线、首线方向和整组正反顺序，生成 S 形候选。
+2. 默认按区域编号1、2、3依次清扫，也可按前端 areaOrder 重新排序。
+3. 把 groupLinks 当作双向图，通过连接点寻找任意区域之间的可达路径。
+4. 区域内沿人工记录边界比较正反两个方向，不允许用斜线穿过区域。
+5. 每两个连续路径点生成一条任务：mode=1 是清扫，mode=2 是对接、换行或连接桥移动。
+6. 合并近似直行的普通移动点，但保留30度以上的真实转弯；清扫线本身绝不做容差合并。
+7. 输出前强制检查起点、终点和每一段连续性，防止小车执行断裂路线。
+
+坐标单位为厘米；航向角约定0度=+y、90度=+x、180度=-y、270度=-x。
+"""
+import itertools
 import math
 import time
 
 
+# 经纬度与局部厘米坐标互相换算时使用的地球平均半径，单位米。
 EARTH_RADIUS_M = 6371000.0
+# 几何计算的近零阈值。
 EPSILON_CM = 1e-6
-ANCHOR_MATCH_CM = 2.0
-
-# Ordinary transition points come from manually sampled boundaries and bridge
-# points.  RTK sampling jitter can move those points several centimetres away
-# from the ideal centre line.  Treat a chain as one executable straight segment
-# when every intermediate point stays inside this corridor.
+# 区域边界和连接桥由人工遥控打点，RTK 抖动会让本来接近直线的点左右偏几厘米。
+# 只有普通移动 mode=2 使用这条20厘米走廊；清扫线 mode=1 不使用容差合并。
 TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
 
-# A real corner must never be hidden by the lateral-deviation simplifier.  This
-# threshold keeps test12's 16-18 degree sampling wobble continuous while a
-# physical 90-degree bridge corner is always retained as a stop-and-turn point.
+# 局部方向变化达到30度就认为是真实转弯，必须保留为任务端点，让小车停车重新转向。
+# test12 中16～18度的采样摆动可以连续直行，而实际90度连接桥转角一定会被保留。
 TRANSFER_HARD_TURN_DEG = 30.0
+
+# 入口和出口首先决定清扫线奇偶及S形方向；在端点代价相近时，再用目标重叠
+# 偏差区分候选。该权重只参与同一端点方案内的排序，不是覆盖硬限制。
+OVERLAP_DEVIATION_WEIGHT = 2.0
 
 
 class ModelingTaskGenerationError(Exception):
@@ -64,14 +80,17 @@ def _heading_from_xy(start, end):
     坐标约定与 RTK 航向保持一致：0°=+y，90°=+x，180°=-y，270°=-x。
     start 和 end 重合时没有有效方向，返回 None。
     """
+    # 先构造“任务起点 -> 任务终点”的方向向量。
     dx = end[0] - start[0]
     dy = end[1] - start[1]
     if abs(dx) < EPSILON_CM and abs(dy) < EPSILON_CM:
         return None
+    # 因0度沿+y，必须用atan2(dx,dy)；结果统一归一化到[0,360)。
     return _normalize_heading(math.degrees(math.atan2(dx, dy)))
 
 
 def _length_cm(start, end):
+    """使用勾股定理计算两个厘米坐标点之间的直线距离。"""
     return math.hypot(end[0] - start[0], end[1] - start[1])
 
 
@@ -117,9 +136,12 @@ class _CoordinateMapper(object):
         小范围建模采用局部平面近似：dy 换算纬度差，dx 根据当前纬度下的经度缩放换算经度差。
         """
         origin = self.origin
+        # x/y是厘米，先减去模型原点并换成米。
         dx_m = (float(x) - origin["x"]) / 100.0
         dy_m = (float(y) - origin["y"]) / 100.0
+        # 纬度方向直接使用“南北距离/地球半径”得到弧度差。
         lat = origin["lat"] + math.degrees(dy_m / EARTH_RADIUS_M)
+        # 经度方向还要除以平均纬度的cos值，修正经线间距。
         mean_lat = math.radians((origin["lat"] + lat) / 2.0)
         cos_lat = math.cos(mean_lat)
         if abs(cos_lat) < 1e-12:
@@ -170,12 +192,16 @@ def _segment_task(start, end, mode, area_number, task_id, mapper, source):
     """
     # 小车任务和前端接口都使用整数厘米，因此先落到实际执行精度再判断长度。
     # 这样可以避免原始浮点坐标不同、但取整后起终点相同的0厘米伪任务。
+    # 小车实际协议使用整数厘米；先统一取整，保证电脑和车载Python版本结果一致。
     start = (_round_int(start[0]), _round_int(start[1]))
     end = (_round_int(end[0]), _round_int(end[1]))
+    # L=sqrt((x2-x1)^2+(y2-y1)^2)。
     length = _length_cm(start, end)
     if length <= EPSILON_CM:
         return None
+    # heading完全由本任务段起终点计算，不沿用上一段旧方向。
     heading = _heading_from_xy(start, end)
+    # 同时生成RTK经纬度：x/y供规划与绘图，经纬度供真实导航和日志核对。
     start_lat, start_lon = mapper.xy_to_lat_lon(start[0], start[1])
     end_lat, end_lon = mapper.xy_to_lat_lon(end[0], end[1])
     return {
@@ -222,7 +248,7 @@ def _same_direction_collinear(left, right):
     if left_length <= EPSILON_CM or right_length <= EPSILON_CM:
         return False
 
-    # 叉积判断是否在同一直线上，点积保证不是到中间点后掉头。
+    # 叉积为0表示两段共线；点积大于0表示方向相同，而不是到中间点后掉头。
     cross = left_vector[0] * right_vector[1] - left_vector[1] * right_vector[0]
     dot = left_vector[0] * right_vector[0] + left_vector[1] * right_vector[1]
     return abs(cross) <= EPSILON_CM * left_length * right_length and dot > 0
@@ -234,21 +260,26 @@ def _turn_angle_degrees(start, middle, end):
     outgoing = _heading_from_xy(middle, end)
     if incoming is None or outgoing is None:
         return 0.0
+    # 例如350度到10度的真实变化是20度，不是340度，因此取圆周上的较小夹角。
     difference = abs(incoming - outgoing) % 360.0
     return min(difference, 360.0 - difference)
 
 
 def _point_to_segment_distance(point, start, end):
     """Shortest distance from *point* to the finite start/end segment."""
+    # 线段方向向量AB。
     dx = end[0] - start[0]
     dy = end[1] - start[1]
     length_squared = dx * dx + dy * dy
     if length_squared <= EPSILON_CM:
         return _length_cm(point, start)
+    # 投影比例 t=((P-A)·(B-A))/|B-A|^2。
     projection = (
         (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
     ) / float(length_squared)
+    # 限制到有限线段[0,1]，防止掉头点投影到线段延长线后被错误合并。
     projection = max(0.0, min(1.0, projection))
+    # Q=A+t(B-A)是线段上离P最近的投影点，|P-Q|就是横向偏差。
     nearest = (start[0] + projection * dx, start[1] + projection * dy)
     return _length_cm(point, nearest)
 
@@ -263,20 +294,24 @@ def _rdp_point_indexes(points, start_index, end_index, tolerance_cm):
     if end_index <= start_index + 1:
         return [start_index, end_index]
 
+    # 先假设这一段可以由首点直接连到尾点。
     start = points[start_index]
     end = points[end_index]
     maximum_distance = -1.0
     maximum_index = None
+    # 找出所有中间点中偏离首尾线段最远的一个。
     for index in range(start_index + 1, end_index):
         distance = _point_to_segment_distance(points[index], start, end)
         if distance > maximum_distance:
             maximum_distance = distance
             maximum_index = index
 
+    # 最大偏差超过20厘米时必须保留该点，并递归检查它左右两段。
     if maximum_index is not None and maximum_distance > tolerance_cm:
         left = _rdp_point_indexes(points, start_index, maximum_index, tolerance_cm)
         right = _rdp_point_indexes(points, maximum_index, end_index, tolerance_cm)
         return left[:-1] + right
+    # 所有中间点都在容差走廊内，执行时只保留首尾点即可。
     return [start_index, end_index]
 
 
@@ -352,12 +387,14 @@ def _simplify_transfer_run(tasks):
             return list(tasks)
         points.append(endpoint)
 
+    # 首点和尾点永远保留，中间先检查是否存在30度以上的真实转角。
     hard_indexes = [0]
     for index in range(1, len(points) - 1):
         if _turn_angle_degrees(points[index - 1], points[index], points[index + 1]) >= TRANSFER_HARD_TURN_DEG:
             hard_indexes.append(index)
     hard_indexes.append(len(points) - 1)
 
+    # 每两个真实转角之间再执行20厘米RDP直线简化。
     retained_indexes = []
     for index in range(len(hard_indexes) - 1):
         section = _rdp_point_indexes(
@@ -498,9 +535,11 @@ def _link_xy_points(link, mapper):
 
     相邻重复点会被忽略，但中间过渡点会完整保留，因此连接桥不限于两个点。
     """
+    # 优先使用按人工记录顺序保存的连接点数组。
     raw_points = list(link.get("points") or [])
     if not raw_points:
         raw_points = [link.get("startPoint"), link.get("endPoint")]
+    # 全部连接点转换到模型统一坐标系，并仅删除相邻重复位置。
     points = []
     for point in raw_points:
         xy = mapper.point_to_xy(point)
@@ -509,13 +548,8 @@ def _link_xy_points(link, mapper):
     return points
 
 
-def _link_points_between(preview, from_group_id, to_group_id, mapper):
-    """
-    在区域连接图中查找 from_group_id 到 to_group_id 的连接点序列。
-
-    groupLinks 被构建为双向图，使用广度优先搜索寻找可达路径。
-    反向通过同一条连接桥时，会自动反转连接点顺序。
-    """
+def _link_route_between(preview, from_group_id, to_group_id, mapper):
+    """返回区域图中的连接桥边序列，每条边保留方向化后的全部桥点。"""
     if not from_group_id or not to_group_id or from_group_id == to_group_id:
         return []
 
@@ -526,25 +560,49 @@ def _link_points_between(preview, from_group_id, to_group_id, mapper):
         link_points = _link_xy_points(link, mapper)
         if not start_group_id or not end_group_id or len(link_points) < 2:
             continue
-        graph.setdefault(start_group_id, []).append((end_group_id, link_points))
-        graph.setdefault(end_group_id, []).append((start_group_id, list(reversed(link_points))))
+        graph.setdefault(start_group_id, []).append({
+            "fromGroupId": start_group_id,
+            "toGroupId": end_group_id,
+            "linkId": link.get("id"),
+            "points": link_points,
+        })
+        graph.setdefault(end_group_id, []).append({
+            "fromGroupId": end_group_id,
+            "toGroupId": start_group_id,
+            "linkId": link.get("id"),
+            "points": list(reversed(link_points)),
+        })
 
     queue = [(from_group_id, [])]
     visited = set([from_group_id])
     while queue:
-        group_id, route_points = queue.pop(0)
-        for next_group_id, link_points in graph.get(group_id, []):
+        group_id, route_edges = queue.pop(0)
+        for edge in graph.get(group_id, []):
+            next_group_id = edge["toGroupId"]
             if next_group_id in visited:
                 continue
-            next_route = list(route_points)
-            for point in link_points:
-                if not next_route or not _is_same_point(next_route[-1], point):
-                    next_route.append(point)
+            next_route = route_edges + [edge]
             if next_group_id == to_group_id:
                 return next_route
             visited.add(next_group_id)
             queue.append((next_group_id, next_route))
     return None
+
+
+def _link_points_between(preview, from_group_id, to_group_id, mapper):
+    """
+    在区域连接图中查找 from_group_id 到 to_group_id 的连接点序列。
+
+    groupLinks 被构建为双向图，使用广度优先搜索寻找可达路径。
+    反向通过同一条连接桥时，会自动反转连接点顺序。
+    """
+    route_edges = _link_route_between(preview, from_group_id, to_group_id, mapper)
+    if route_edges is None:
+        return None
+    points = []
+    for edge in route_edges:
+        points.extend(edge.get("points") or [])
+    return _dedupe_xy_path(points)
 
 
 def _append_transition_tasks(
@@ -566,12 +624,11 @@ def _append_transition_tasks(
     跨区域时必须先查找用户记录的连接桥，然后按“当前点 -> 连接点... -> 目标点”拆成多个连续任务段。
     若两个区域没有可达的连接桥，直接报错，不允许机器人跨空直线行驶。
     """
-    route_points = _link_points_between(preview, from_group_id, to_group_id, mapper)
-    if from_group_id != to_group_id and route_points is None:
+    route_edges = _link_route_between(preview, from_group_id, to_group_id, mapper)
+    if from_group_id != to_group_id and route_edges is None:
         raise ModelingTaskGenerationError(
             "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
         )
-    route_points = route_points or []
     if from_group_id == to_group_id and source in (
             "modeling_start_to_first_lane", "modeling_return_origin"):
         path_points = _group_anchor_transition_points(
@@ -579,14 +636,29 @@ def _append_transition_tasks(
         )
     elif from_group_id == to_group_id:
         path_points = [current, target]
-    elif route_points:
-        departure = _group_anchor_transition_points(
-            draft, from_group_id, current, route_points[0], mapper
+    elif route_edges:
+        first_points = route_edges[0].get("points") or []
+        path_points = _group_anchor_transition_points(
+            draft, from_group_id, current, first_points[0], mapper
         )
+        for edge_index, edge in enumerate(route_edges):
+            edge_points = edge.get("points") or []
+            path_points = _dedupe_xy_path(path_points + edge_points)
+            if edge_index + 1 < len(route_edges):
+                next_points = route_edges[edge_index + 1].get("points") or []
+                intermediate_group_id = edge.get("toGroupId")
+                boundary = _group_anchor_transition_points(
+                    draft,
+                    intermediate_group_id,
+                    edge_points[-1],
+                    next_points[0],
+                    mapper,
+                )
+                path_points = _dedupe_xy_path(path_points + boundary[1:])
         arrival = _group_anchor_transition_points(
-            draft, to_group_id, route_points[-1], target, mapper
+            draft, to_group_id, path_points[-1], target, mapper
         )
-        path_points = _dedupe_xy_path(departure + route_points[1:-1] + arrival)
+        path_points = _dedupe_xy_path(path_points + arrival[1:])
     else:
         path_points = [current, target]
     for index in range(len(path_points) - 1):
@@ -656,17 +728,58 @@ def _cyclic_anchor_indexes(start_index, end_index, count, step):
     return indexes
 
 
+def _nearest_boundary_projection(point, anchors):
+    """把任意位置投影到记录区域的闭合边界，返回最近投影点及所在边。"""
+    best = None
+    for index in range(len(anchors)):
+        start = anchors[index]
+        end = anchors[(index + 1) % len(anchors)]
+        delta_x = end[0] - start[0]
+        delta_y = end[1] - start[1]
+        denominator = delta_x * delta_x + delta_y * delta_y
+        if denominator <= EPSILON_CM:
+            ratio = 0.0
+        else:
+            ratio = (
+                (point[0] - start[0]) * delta_x
+                + (point[1] - start[1]) * delta_y
+            ) / denominator
+            ratio = max(0.0, min(1.0, ratio))
+        projection = (
+            start[0] + delta_x * ratio,
+            start[1] + delta_y * ratio,
+        )
+        candidate = (
+            _length_cm(point, projection),
+            index,
+            ratio,
+            projection,
+        )
+        if best is None or candidate[:3] < best[:3]:
+            best = candidate
+    return {
+        "edgeIndex": best[1],
+        "ratio": best[2],
+        "point": best[3],
+    }
+
+
+def _boundary_anchor_candidates(projection, anchors):
+    """返回投影所在边的相邻记录点；命中角点时只返回该角点。"""
+    for index, anchor in enumerate(anchors):
+        if _is_same_point(anchor, projection["point"]):
+            return [index]
+    edge_index = projection["edgeIndex"]
+    return [edge_index, (edge_index + 1) % len(anchors)]
+
+
 def _group_anchor_transition_points(draft, group_id, current, target, mapper):
     """
     Connect two positions through the area's manually recorded anchors.
 
-    The old implementation connected current directly to target, which could cut
-    diagonally across the recorded area.  The new route enters the nearest recorded
-    anchor and then follows the original manual recording order.  This is
-    intentional: recorded points are route anchors, not an unordered polygon
-    whose shorter side may be chosen automatically.  Points that are collinear
-    are compacted later, so a recorded anchor constrains the trajectory without
-    forcing an unnecessary stop.
+    记录点是允许行驶的边界锚点，因此不能从 current 斜穿区域到 target。
+    边界本身按闭环处理，同时比较人工记录正向和反向两条路径，选择总长度更短
+    的合法方向。后续直线简化只删除近似共线中间点，不会改变所选边界方向。
     """
     if current is None or target is None:
         return []
@@ -676,113 +789,76 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
     if len(anchors) < 2:
         return [current, target]
 
-    start_index = min(
-        range(len(anchors)),
-        key=lambda index: _length_cm(current, anchors[index]),
-    )
-    end_index = min(
-        range(len(anchors)),
-        key=lambda index: _length_cm(target, anchors[index]),
-    )
-    indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), 1)
-    return _dedupe_xy_path(
-        [current] + [anchors[index] for index in indexes] + [target]
-    )
+    # 清扫线端点或连接点可能位于两个人工角点之间。先判断它最接近哪条真实
+    # 记录边，再只允许从这条边的两个相邻记录点进入/离开。这样既能比较完整
+    # 的顺、逆时针总路程，又不会为了距离更短而斜穿到不相邻的区域角点。
+    current_projection = _nearest_boundary_projection(current, anchors)
+    target_projection = _nearest_boundary_projection(target, anchors)
+    candidates = []
+    start_indexes = _boundary_anchor_candidates(current_projection, anchors)
+    end_indexes = _boundary_anchor_candidates(target_projection, anchors)
+    for start_priority, start_index in enumerate(start_indexes):
+        for end_priority, end_index in enumerate(end_indexes):
+            forward_indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), 1)
+            reverse_indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), -1)
+            for direction_priority, indexes in enumerate((forward_indexes, reverse_indexes)):
+                path = _dedupe_xy_path(
+                    [current] + [anchors[index] for index in indexes] + [target]
+                )
+                length = sum(
+                    _length_cm(path[index], path[index + 1])
+                    for index in range(len(path) - 1)
+                )
+                candidates.append((
+                    length,
+                    start_priority,
+                    end_priority,
+                    direction_priority,
+                    path,
+                ))
+    return min(candidates, key=lambda item: item[:4])[4]
 
 
-def _nearest_group_point_id(draft, group_id, target, mapper):
-    """Find the recorded area anchor nearest a bridge endpoint or other target."""
-    best = None
-    for group in draft.get("groups") or []:
-        if group.get("id") != group_id:
-            continue
-        for point in group.get("points") or []:
-            point_id = point.get("id")
-            xy = mapper.point_to_xy(point)
-            if not point_id or xy is None:
-                continue
-            candidate = (_length_cm(xy, target), point_id)
-            if best is None or candidate < best:
-                best = candidate
-    return best[1] if best is not None else None
+def _group_lane_candidate_sets(group):
+    """组合一个区域内各子区域的合法清扫线数量候选。"""
+    option_sets = []
+    for sub_area in group.get("subAreas") or []:
+        options = list(sub_area.get("laneCandidates") or [])
+        if not options and sub_area.get("lanes"):
+            spacing = _number(sub_area.get("laneSpacingCm"))
+            options = [{
+                "laneCount": len(sub_area.get("lanes") or []),
+                "laneSpacingCm": spacing,
+                "actualOverlapCm": sub_area.get("actualOverlapCm"),
+                "lanes": list(sub_area.get("lanes") or []),
+            }]
+        if options:
+            option_sets.append((sub_area.get("id"), options))
+    if not option_sets:
+        return []
+
+    combinations = []
+    for selected_options in itertools.product(*[item[1] for item in option_sets]):
+        lanes = []
+        selections = []
+        for (sub_area_id, _), option in zip(option_sets, selected_options):
+            option_lanes = list(option.get("lanes") or [])
+            lanes.extend(option_lanes)
+            selections.append({
+                "subAreaId": sub_area_id,
+                "laneCount": len(option_lanes),
+                "laneSpacingCm": option.get("laneSpacingCm"),
+                "actualOverlapCm": option.get("actualOverlapCm"),
+            })
+        if lanes:
+            combinations.append({
+                "lanes": lanes,
+                "subAreas": selections,
+            })
+    return combinations
 
 
-def _derive_two_group_round_trip_policy(draft, preview, mapper):
-    """
-    为常规“起始区域 -> 连接桥 -> 远端区域”记录流程自动生成往返策略。
-
-    记录顺序只决定哪个区域是起始区域；执行顺序固定为先经连接桥到远端区域，
-    清扫远端后沿原桥返回，再清扫起始区域并回到第一个记录点。
-    """
-    groups = list(preview.get("groups") or [])
-    if len(groups) != 2 or not mapper.origin_group_id or not mapper.origin_point_id:
-        return None
-    group_ids = [group.get("groupId") for group in groups]
-    if mapper.origin_group_id not in group_ids:
-        return None
-    remote_group_id = next(
-        (group_id for group_id in group_ids if group_id != mapper.origin_group_id),
-        None,
-    )
-    if not remote_group_id:
-        return None
-
-    for link in draft.get("groupLinks") or []:
-        start_group_id = link.get("startGroupId")
-        end_group_id = link.get("endGroupId")
-        if set([start_group_id, end_group_id]) != set([mapper.origin_group_id, remote_group_id]):
-            continue
-        point_ids = [
-            point.get("id")
-            for point in (link.get("points") or [])
-            if point.get("id")
-        ]
-        if len(point_ids) < 2:
-            continue
-        if start_group_id != mapper.origin_group_id:
-            point_ids.reverse()
-
-        point_map = _draft_point_map(draft)
-        remote_link_xy = mapper.point_to_xy(point_map.get(point_ids[-1]))
-        remote_exit_id = _nearest_group_point_id(
-            draft,
-            remote_group_id,
-            remote_link_xy,
-            mapper,
-        ) if remote_link_xy is not None else None
-        if not remote_exit_id:
-            continue
-
-        outbound_ids = [mapper.origin_point_id]
-        for point_id in point_ids:
-            if outbound_ids[-1] != point_id:
-                outbound_ids.append(point_id)
-        return_ids = list(reversed(point_ids))
-        return {
-            "type": "bridge_round_trip",
-            "derived": True,
-            "forceEvenLanes": True,
-            "originPointId": mapper.origin_point_id,
-            "homeGroupId": mapper.origin_group_id,
-            "remoteGroupId": remote_group_id,
-            "linkId": link.get("id"),
-            "outboundPointIds": outbound_ids,
-            "returnPointIds": return_ids,
-            "groupAnchors": {
-                remote_group_id: {
-                    "entryPointId": point_ids[-1],
-                    "exitPointId": remote_exit_id,
-                },
-                mapper.origin_group_id: {
-                    "entryPointId": point_ids[0],
-                    "exitPointId": mapper.origin_point_id,
-                },
-            },
-        }
-    return None
-
-
-def _group_lane_segments(preview, group_id, entry, exit_point):
+def _select_group_lane_segments(preview, group_id, entry, exit_point):
     """
     为指定区域选择一组最适合入口和出口的 S 形清扫顺序。
 
@@ -797,61 +873,87 @@ def _group_lane_segments(preview, group_id, entry, exit_point):
     group = _preview_group(preview, group_id)
     if group is None:
         raise ModelingTaskGenerationError("route policy references an unknown modeling group")
-    lanes = []
-    for sub_area in group.get("subAreas") or []:
-        lanes.extend(sub_area.get("lanes") or [])
-    if not lanes:
+    lane_sets = _group_lane_candidate_sets(group)
+    if not lane_sets:
         raise ModelingTaskGenerationError("route policy group has no cleaning lanes")
 
+    target_overlap = _number((preview.get("config") or {}).get("overlapCm")) or 0.0
     candidates = []
-    for reverse_order in (False, True):
-        ordered = list(reversed(lanes)) if reverse_order else list(lanes)
-        for reverse_first in (False, True):
-            segments = []
-            for index, lane in enumerate(ordered):
-                points = _lane_points(lane, reverse=bool(index % 2) ^ reverse_first)
-                if points is None:
+    for lane_set in lane_sets:
+        lanes = lane_set["lanes"]
+        for reverse_order in (False, True):
+            ordered = list(reversed(lanes)) if reverse_order else list(lanes)
+            for reverse_first in (False, True):
+                segments = []
+                for index, lane in enumerate(ordered):
+                    points = _lane_points(lane, reverse=bool(index % 2) ^ reverse_first)
+                    if points is None:
+                        continue
+                    segments.append({
+                        "groupId": group_id,
+                        "areaNumber": group.get("areaNumber") or 1,
+                        "start": points[0],
+                        "end": points[1],
+                        "sourceId": lane.get("id"),
+                    })
+                if not segments:
                     continue
-                segments.append({
-                    "groupId": group_id,
-                    "areaNumber": group.get("areaNumber") or 1,
-                    "start": points[0],
-                    "end": points[1],
-                    "sourceId": lane.get("id"),
+                entry_distance = _length_cm(entry, segments[0]["start"])
+                exit_distance = _length_cm(segments[-1]["end"], exit_point)
+                transfer_distance = sum(
+                    _length_cm(segments[index]["end"], segments[index + 1]["start"])
+                    for index in range(len(segments) - 1)
+                )
+                clean_distance = sum(
+                    _length_cm(segment["start"], segment["end"])
+                    for segment in segments
+                )
+                overlap_deviation = sum(
+                    abs((_number(item.get("actualOverlapCm")) or target_overlap) - target_overlap)
+                    for item in lane_set.get("subAreas") or []
+                )
+                candidates.append({
+                    "endpointCost": entry_distance + exit_distance,
+                    "routeCost": entry_distance + exit_distance + transfer_distance + clean_distance,
+                    "overlapDeviation": overlap_deviation,
+                    "entryDistance": entry_distance,
+                    "exitDistance": exit_distance,
+                    "reverseOrder": reverse_order,
+                    "reverseFirst": reverse_first,
+                    "segments": segments,
+                    "subAreas": lane_set.get("subAreas") or [],
                 })
-            if not segments:
-                continue
-            entry_distance = _length_cm(entry, segments[0]["start"])
-            exit_distance = _length_cm(segments[-1]["end"], exit_point)
-            score = entry_distance + exit_distance
-            for index in range(len(segments) - 1):
-                score += _length_cm(segments[index]["end"], segments[index + 1]["start"])
-            candidates.append({
-                "score": score,
-                "entryDistance": entry_distance,
-                "exitDistance": exit_distance,
-                "reverseOrder": reverse_order,
-                "reverseFirst": reverse_first,
-                "segments": segments,
-            })
     if not candidates:
         raise ModelingTaskGenerationError("route policy group has no usable cleaning lanes")
-    exact_exit_candidates = [
-        candidate for candidate in candidates
-        if candidate["exitDistance"] <= ANCHOR_MATCH_CM
-    ]
-    pool = exact_exit_candidates or candidates
     selected = min(
-        pool,
+        candidates,
         key=lambda candidate: (
-            candidate["exitDistance"] if not exact_exit_candidates else 0.0,
-            candidate["score"],
-            candidate["entryDistance"],
+            candidate["endpointCost"],
+            candidate["overlapDeviation"] * OVERLAP_DEVIATION_WEIGHT,
+            candidate["routeCost"],
+            len(candidate["segments"]),
             candidate["reverseOrder"],
             candidate["reverseFirst"],
         ),
     )
-    return selected["segments"]
+    return {
+        "segments": selected["segments"],
+        "selection": {
+            "groupId": group_id,
+            "areaNumber": group.get("areaNumber") or 1,
+            "laneCount": len(selected["segments"]),
+            "entryDistanceCm": round(selected["entryDistance"], 1),
+            "exitDistanceCm": round(selected["exitDistance"], 1),
+            "reverseOrder": selected["reverseOrder"],
+            "reverseFirst": selected["reverseFirst"],
+            "subAreas": selected["subAreas"],
+        },
+    }
+
+
+def _group_lane_segments(preview, group_id, entry, exit_point):
+    """兼容旧调用方，只返回选中的S形清扫段。"""
+    return _select_group_lane_segments(preview, group_id, entry, exit_point)["segments"]
 
 
 def _append_xy_path(tasks, path_points, area_number, mapper, task_id, source):
@@ -892,6 +994,7 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
     如果 current 不在下一条清扫线起点，先插入 mode=2 换行段；
     然后再插入 mode=1 清扫段。返回最终位置、下一个任务 ID 和新增清扫段数量。
     """
+    # clean_count既用于汇总，也用于判断“进入第一条线”是否需要沿人工锚点走。
     clean_count = 0
     for segment in segments:
         if current is not None and not _is_same_point(current, segment["start"]):
@@ -913,6 +1016,7 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
                 task_id,
                 "modeling_transfer",
             )
+        # 真正的清扫线生成mode=1任务；它不会被20厘米直线容差规则合并。
         task = _segment_task(
             segment["start"],
             segment["end"],
@@ -985,6 +1089,7 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
 
     生成顺序：出程 -> 远端区域 S 形清扫 -> 返程连接桥 -> 起始区域 S 形清扫 -> 回原点。
     """
+    # 先建立pointId索引，再从策略中读取桥头、区域入口和区域出口。
     point_map = _draft_point_map(draft)
     anchors = route_policy.get("groupAnchors") or {}
     remote_group_id = route_policy.get("remoteGroupId")
@@ -1001,10 +1106,12 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
     if None in (remote_entry, remote_exit, home_entry, home_exit):
         raise ModelingTaskGenerationError("route policy anchors are incomplete")
 
+    # tasks始终保持首尾连续；task_id按最终执行顺序递增。
     tasks = []
     task_id = 1
     clean_count = 0
     # 第一阶段：按业务指定的出程点序列到达远端区域入口。
+    # 出程初始点序列是“模型原点 -> 连接桥点...”。
     outbound = _point_ids_to_xy(route_policy.get("outboundPointIds"), point_map, mapper)
     if len(outbound) < 2:
         raise ModelingTaskGenerationError("route policy outbound path is incomplete")
@@ -1027,6 +1134,7 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
     current = outbound[-1]
 
     # 第二阶段：选择与远端区域入口/出口最匹配的 S 形清扫顺序。
+    # 从四种S形候选中选择最匹配远端入口和远端桥侧出口的一种。
     remote_segments = _group_lane_segments(
         preview,
         remote_group_id,
@@ -1056,6 +1164,7 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
         current = remote_exit
 
     # 第三阶段：按用户记录的连接点返回起始区域。
+    # 原桥返回，点序列已在策略阶段反转为“远端桥头 -> 起始区域桥头”。
     return_path = _point_ids_to_xy(route_policy.get("returnPointIds"), point_map, mapper)
     if not return_path:
         raise ModelingTaskGenerationError("route policy return path is incomplete")
@@ -1072,6 +1181,7 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
     current = return_path[-1]
 
     # 第四阶段：清扫起始区域，并将最后一段对齐回原点方向。
+    # 起始区域把桥头作为入口，把模型原点作为出口，再选择对应S形方向。
     home_segments = _group_lane_segments(
         preview,
         home_group_id,
@@ -1101,6 +1211,7 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
 
     if not tasks or clean_count == 0:
         raise ModelingTaskGenerationError("route policy produced no cleaning tasks")
+    # 全部几何段生成后再合并近似直行的mode=2中间点，降低无意义停车次数。
     tasks = _compact_executable_tasks(tasks)
     clean_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
     _validate_continuous_round_trip(
@@ -1113,6 +1224,186 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
         "generatedAt": int(now if now is not None else time.time()),
         "taskName": draft.get("name") or draft.get("id") or "",
         "routeType": "bridge_round_trip",
+        "summary": {
+            "taskCount": len(tasks),
+            "cleanTaskCount": clean_count,
+            "transferTaskCount": len(tasks) - clean_count,
+            "totalLengthCm": total_length,
+        },
+        "tasks": tasks,
+    }
+
+
+def _resolve_area_order(preview, route_policy):
+    """把前端区域编号顺序转换为完整、无重复的 groupId 顺序。"""
+    groups = list(preview.get("groups") or [])
+    if not groups:
+        raise ModelingTaskGenerationError("modeling preview contains no areas")
+    default_groups = sorted(
+        groups,
+        key=lambda group: (
+            int(group.get("areaNumber") or 0),
+            str(group.get("groupId") or ""),
+        ),
+    )
+    requested = (route_policy or {}).get("areaOrder")
+    if requested is None:
+        requested = [group.get("areaNumber") for group in default_groups]
+    if not isinstance(requested, (list, tuple)):
+        raise ModelingTaskGenerationError("areaOrder must be an array")
+
+    by_id = {str(group.get("groupId")): group for group in groups if group.get("groupId")}
+    by_number = {
+        int(group.get("areaNumber")): group
+        for group in groups
+        if group.get("areaNumber") is not None
+    }
+    ordered_groups = []
+    seen = set()
+    for value in requested:
+        group = by_id.get(str(value))
+        if group is None:
+            try:
+                group = by_number.get(int(value))
+            except (TypeError, ValueError):
+                group = None
+        group_id = group.get("groupId") if group else None
+        if not group_id:
+            raise ModelingTaskGenerationError("areaOrder contains an unknown area: {}".format(value))
+        if group_id in seen:
+            raise ModelingTaskGenerationError("areaOrder contains duplicate areas")
+        seen.add(group_id)
+        ordered_groups.append(group)
+    expected = set(group.get("groupId") for group in groups)
+    if seen != expected:
+        raise ModelingTaskGenerationError("areaOrder must contain every modeling area exactly once")
+    return ordered_groups
+
+
+def _transition_entry_reference(preview, from_group_id, to_group_id, mapper, fallback):
+    """返回跨区路线到达目标区域一侧的桥头，供S形入口评分使用。"""
+    if from_group_id == to_group_id:
+        return fallback
+    route_edges = _link_route_between(preview, from_group_id, to_group_id, mapper)
+    if not route_edges:
+        raise ModelingTaskGenerationError(
+            "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
+        )
+    return route_edges[-1]["points"][-1]
+
+
+def _transition_exit_reference(preview, from_group_id, to_group_id, mapper, fallback):
+    """返回离开当前区域时应靠近的第一座桥头，供S形出口评分使用。"""
+    if from_group_id == to_group_id:
+        return fallback
+    route_edges = _link_route_between(preview, from_group_id, to_group_id, mapper)
+    if not route_edges:
+        raise ModelingTaskGenerationError(
+            "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
+        )
+    return route_edges[0]["points"][0]
+
+
+def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
+    """按默认或前端指定区域顺序，统一规划单区域和任意多区域闭环路线。"""
+    ordered_groups = _resolve_area_order(preview, route_policy)
+    origin = (mapper.origin["x"], mapper.origin["y"])
+    origin_group_id = mapper.origin_group_id
+    origin_group = _preview_group(preview, origin_group_id) or {}
+
+    tasks = []
+    selections = []
+    task_id = 1
+    clean_count = 0
+    current = origin
+    current_group_id = origin_group_id
+
+    for index, group in enumerate(ordered_groups):
+        group_id = group.get("groupId")
+        next_group_id = (
+            ordered_groups[index + 1].get("groupId")
+            if index + 1 < len(ordered_groups)
+            else origin_group_id
+        )
+        entry_reference = _transition_entry_reference(
+            preview,
+            current_group_id,
+            group_id,
+            mapper,
+            current,
+        )
+        exit_reference = _transition_exit_reference(
+            preview,
+            group_id,
+            next_group_id,
+            mapper,
+            origin,
+        )
+        selected = _select_group_lane_segments(
+            preview,
+            group_id,
+            entry_reference,
+            exit_reference,
+        )
+        segments = selected["segments"]
+        selection = dict(selected["selection"])
+        selection["order"] = index + 1
+        selections.append(selection)
+
+        if not _is_same_point(current, segments[0]["start"]):
+            task_id = _append_transition_tasks(
+                tasks,
+                current,
+                segments[0]["start"],
+                group.get("areaNumber") or index + 1,
+                mapper,
+                task_id,
+                preview,
+                draft,
+                current_group_id,
+                group_id,
+                source="modeling_start_to_first_lane" if clean_count == 0 else "modeling_transfer",
+            )
+        current, task_id, added = _append_clean_segments(
+            tasks,
+            segments,
+            segments[0]["start"],
+            mapper,
+            task_id,
+            draft,
+        )
+        clean_count += added
+        current_group_id = group_id
+
+    if not tasks or clean_count == 0:
+        raise ModelingTaskGenerationError("路径预览中没有可生成的清扫线")
+
+    if not _is_same_point(current, origin):
+        task_id = _append_transition_tasks(
+            tasks,
+            current,
+            origin,
+            origin_group.get("areaNumber") or 1,
+            mapper,
+            task_id,
+            preview,
+            draft,
+            current_group_id,
+            origin_group_id,
+            source="modeling_return_origin",
+        )
+
+    tasks = _compact_executable_tasks(tasks)
+    clean_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
+    _validate_continuous_round_trip(tasks, origin)
+    total_length = sum(int(task.get("length") or 0) for task in tasks)
+    return {
+        "status": "ready",
+        "generatedAt": int(now if now is not None else time.time()),
+        "taskName": draft.get("name") or draft.get("id") or "",
+        "routeType": "area_order",
+        "areaOrder": [group.get("areaNumber") for group in ordered_groups],
+        "routeSelections": selections,
         "summary": {
             "taskCount": len(tasks),
             "cleanTaskCount": clean_count,
@@ -1147,10 +1438,10 @@ def generate_task_plan(draft, now=None):
         raise ModelingTaskGenerationError("路径预览未生成或不可用，不能生成执行任务")
 
     # 所有任务段都必须同时生成相对坐标和 RTK 经纬度，因此先建立统一坐标转换器。
+    # 建立统一坐标转换器，保证任务中的x/y与lat/lon互相对应。
     mapper = _CoordinateMapper(draft)
+    # 显式历史策略继续兼容；所有新建模型统一按区域顺序走通用候选规划。
     route_policy = draft.get("routePolicy") or {}
-    if not route_policy.get("type"):
-        route_policy = _derive_two_group_round_trip_policy(draft, preview, mapper) or route_policy
     if route_policy.get("type") == "bridge_round_trip":
         # 业务明确指定先清扫远端区域、再返回起始区域时，使用专用闭环策略。
         return _generate_bridge_round_trip_plan(
@@ -1160,84 +1451,10 @@ def generate_task_plan(draft, now=None):
             route_policy,
             now=now,
         )
-    tasks = []
-    task_id = 1
-    clean_count = 0
-    # 路线原点固定为用户记录的第一个有效建模点。
-    origin = (mapper.origin["x"], mapper.origin["y"])
-    origin_group_id = mapper.origin_group_id
-    origin_group = _preview_group(preview, origin_group_id) or {}
-    current = origin
-    current_group_id = origin_group_id
-
-    for segment in _iter_clean_segments(preview, draft, mapper):
-        if not _is_same_point(current, segment["start"]):
-            # 第一次对接标记为 modeling_start_to_first_lane，后续换行标记为 modeling_transfer。
-            task_id = _append_transition_tasks(
-                tasks,
-                current,
-                segment["start"],
-                segment["areaNumber"],
-                mapper,
-                task_id,
-                preview,
-                draft,
-                current_group_id,
-                segment.get("groupId"),
-                source="modeling_start_to_first_lane" if clean_count == 0 else "modeling_transfer",
-            )
-        clean_task = _segment_task(
-            segment["start"],
-            segment["end"],
-            1,
-            segment["areaNumber"],
-            task_id,
-            mapper,
-            "modeling_clean",
-        )
-        if clean_task is not None:
-            # sourceLaneId 将可执行任务段与预览中的清扫线关联，便于日志排查和前端对照。
-            clean_task["sourceLaneId"] = segment.get("sourceId")
-            tasks.append(clean_task)
-            task_id += 1
-            clean_count += 1
-            current = segment["end"]
-            current_group_id = segment.get("groupId")
-
-    if not tasks or clean_count == 0:
-        raise ModelingTaskGenerationError("路径预览中没有可生成的清扫线")
-
-    if not _is_same_point(current, origin):
-        # 清扫完成后生成返回原点的移动段，使整条路线形成闭环。
-        task_id = _append_transition_tasks(
-            tasks,
-            current,
-            origin,
-            origin_group.get("areaNumber") or 1,
-            mapper,
-            task_id,
-            preview,
-            draft,
-            current_group_id,
-            origin_group_id,
-            source="modeling_return_origin",
-        )
-
-    # 同一直线上的普通中间点只用于建模/绘图，不让它们变成额外停车点。
-    tasks = _compact_executable_tasks(tasks)
-    clean_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
-    # 任务一旦保存后会直接驱动小车，所以在输出前强制校验首尾和每一段连续性。
-    _validate_continuous_round_trip(tasks, origin)
-    total_length = sum(int(task.get("length") or 0) for task in tasks)
-    return {
-        "status": "ready",
-        "generatedAt": int(now if now is not None else time.time()),
-        "taskName": draft.get("name") or draft.get("id") or "",
-        "summary": {
-            "taskCount": len(tasks),
-            "cleanTaskCount": clean_count,
-            "transferTaskCount": len(tasks) - clean_count,
-            "totalLengthCm": total_length,
-        },
-        "tasks": tasks,
-    }
+    return _generate_area_order_plan(
+        draft,
+        preview,
+        mapper,
+        route_policy,
+        now=now,
+    )

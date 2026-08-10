@@ -161,7 +161,7 @@ class ModelingSessionTest(unittest.TestCase):
             session.new_area()
         self.assertEqual(incomplete_link.exception.code, "MODELING_LINK_INCOMPLETE")
 
-    def test_explicit_two_area_capture_generates_remote_first_round_trip(self):
+    def test_explicit_two_area_capture_defaults_to_area_one_then_area_two(self):
         from modeling_session import ModelingSession
         from modeling_store import ModelingStore
 
@@ -208,7 +208,8 @@ class ModelingSessionTest(unittest.TestCase):
         )
         self.assertEqual(len(finished["taskPreview"]["groupLinks"]), 1)
         task_plan = finished["taskPlan"]
-        self.assertEqual(task_plan["routeType"], "bridge_round_trip")
+        self.assertEqual(task_plan["routeType"], "area_order")
+        self.assertEqual(task_plan["areaOrder"], [1, 2])
         self.assertEqual(task_plan["summary"]["cleanTaskCount"], 12)
         self.assertEqual(
             (task_plan["tasks"][0]["startX"], task_plan["tasks"][0]["startY"]),
@@ -216,24 +217,71 @@ class ModelingSessionTest(unittest.TestCase):
         )
         self.assertEqual(
             (task_plan["tasks"][0]["endX"], task_plan["tasks"][0]["endY"]),
-            (0, 778),
+            (565, 0),
         )
-        self.assertGreaterEqual(task_plan["tasks"][0].get("mergedSegmentCount", 1), 2)
         clean_tasks = [task for task in task_plan["tasks"] if task["mode"] == 1]
-        self.assertEqual([task["areaNumber"] for task in clean_tasks], [2] * 4 + [1] * 8)
+        self.assertEqual([task["areaNumber"] for task in clean_tasks], [1] * 8 + [2] * 4)
         self.assertEqual(
             (clean_tasks[0]["startX"], clean_tasks[0]["startY"], clean_tasks[0]["endX"], clean_tasks[0]["endY"]),
-            (0, 778, 452, 778),
+            (0, 0, 565, 0),
         )
         self.assertEqual(
             (task_plan["tasks"][-1]["endX"], task_plan["tasks"][-1]["endY"]),
             (0, 0),
         )
         self.assertTrue(any(
-            task.get("source") == "modeling_bridge_return"
-            or "modeling_bridge_return" in (task.get("mergedSources") or [])
+            task.get("source") == "modeling_return_origin"
+            or "modeling_return_origin" in (task.get("mergedSources") or [])
             for task in task_plan["tasks"]
         ))
+
+    def test_ready_session_can_replan_using_frontend_area_order(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            _point("a1", 0, 0),
+            _point("a2", 0, 200),
+            _point("a3", 300, 200),
+            _point("a4", 300, 0),
+            _point("l1", 0, 200),
+            _point("l2", 0, 300),
+            _point("b1", 0, 300),
+            _point("b2", 0, 500),
+            _point("b3", 300, 500),
+            _point("b4", 300, 300),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        session.start("reordered-route")
+        for _ in range(4):
+            session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+        session.new_area()
+        for _ in range(4):
+            session.record_area_point()
+
+        finished = session.finish()
+        replanned = session.replan([2, 1])
+        saved = store.get_draft(finished["modelId"])
+
+        self.assertEqual(finished["areaOrder"], [1, 2])
+        self.assertEqual(replanned["areaOrder"], [2, 1])
+        self.assertEqual(replanned["taskPlan"]["areaOrder"], [2, 1])
+        self.assertEqual(replanned["taskPreview"]["areaOrder"], [2, 1])
+        self.assertEqual(saved["routePolicy"], {
+            "type": "area_order",
+            "areaOrder": [2, 1],
+        })
+        clean_areas = [
+            task["areaNumber"]
+            for task in replanned["taskPlan"]["tasks"]
+            if task["mode"] == 1
+        ]
+        first_area_one = clean_areas.index(1)
+        self.assertTrue(all(area == 2 for area in clean_areas[:first_area_one]))
+        self.assertTrue(all(area == 1 for area in clean_areas[first_area_one:]))
 
     def test_test12_rtk_points_share_one_model_coordinate_frame(self):
         """Regression: area two must stay above area one after route planning."""

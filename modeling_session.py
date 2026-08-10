@@ -554,6 +554,39 @@ class ModelingSession(object):
             state = self._write_state(state)
             return {
                 "modelId": model_id,
+                "areaOrder": generated["taskPlan"].get("areaOrder") or [],
+                "taskName": generated["taskPlan"].get("taskName") or saved.get("name") or "",
+                "updatedAt": saved.get("updatedAt"),
+                "taskPreview": saved.get("taskPreview"),
+                "taskPlan": generated["taskPlan"],
+                "session": self._summary(state, saved),
+            }
+
+    def replan(self, area_order):
+        """使用已记录的区域和连接桥，按新的区域顺序重新生成当前路线。"""
+        with self._lock:
+            state = self._require_state(allow_ready=True)
+            if not isinstance(area_order, (list, tuple)):
+                raise ModelingSessionError("MODELING_AREA_ORDER_INVALID", "areaOrder must be an array")
+            model_id = state["modelId"]
+            draft = self.store.get_draft(model_id)
+            route_policy = dict(draft.get("routePolicy") or {})
+            route_policy["type"] = "area_order"
+            route_policy["areaOrder"] = list(area_order)
+            route_policy.pop("forceEvenLanes", None)
+            draft["routePolicy"] = route_policy
+            draft["taskPreview"] = None
+            draft["taskPlan"] = None
+            self.store.save_draft(model_id, draft, now=self._timestamp())
+            self.store.build_task_preview(model_id)
+            generated = self.store.generate_task_plan(model_id)
+            saved = self.store.save_model(model_id)
+            state["status"] = "ready"
+            state["currentPointType"] = None
+            state = self._write_state(state)
+            return {
+                "modelId": model_id,
+                "areaOrder": generated["taskPlan"].get("areaOrder") or [],
                 "taskName": generated["taskPlan"].get("taskName") or saved.get("name") or "",
                 "updatedAt": saved.get("updatedAt"),
                 "taskPreview": saved.get("taskPreview"),
@@ -570,6 +603,7 @@ class ModelingSession(object):
                 raise ModelingSessionError("MODELING_PATH_NOT_READY", "modeling task plan is not ready")
             return {
                 "modelId": draft.get("id") or state["modelId"],
+                "areaOrder": task_plan.get("areaOrder") or [],
                 "taskName": task_plan.get("taskName") or draft.get("name") or "",
                 "updatedAt": draft.get("updatedAt") or task_plan.get("generatedAt"),
                 "taskPreview": draft.get("taskPreview"),

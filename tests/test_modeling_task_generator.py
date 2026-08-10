@@ -10,7 +10,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(_round_int(-61.5), -62)
         self.assertEqual(_round_int(-61.49), -61)
 
-    def test_area_transition_follows_manual_recording_order_instead_of_shorter_reverse_side(self):
+    def test_area_transition_chooses_shorter_direction_around_recorded_boundary(self):
         from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
 
         points = [
@@ -30,7 +30,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             mapper,
         )
 
-        self.assertEqual(path, [(0.0, 0.0), (0.0, 120.0), (340.0, 90.0)])
+        self.assertEqual(path, [(0.0, 0.0), (340.0, -20.0), (340.0, 90.0)])
 
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks
@@ -239,12 +239,10 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         plan = generate_task_plan(draft, now=2000)
         tasks = plan["tasks"]
 
-        self.assertEqual(plan["routeType"], "bridge_round_trip")
-        self.assertEqual(tasks[0]["mode"], 2)
-        self.assertEqual(
-            (tasks[0]["startX"], tasks[0]["startY"], tasks[0]["endX"], tasks[0]["endY"]),
-            (0, 0, 40, 416),
-        )
+        self.assertEqual(plan["routeType"], "area_order")
+        self.assertEqual(plan["areaOrder"], [1, 2])
+        self.assertEqual(tasks[0]["mode"], 1)
+        self.assertEqual((tasks[0]["startX"], tasks[0]["startY"]), (0, 0))
 
         remote_clean_indexes = [
             index for index, task in enumerate(tasks)
@@ -253,15 +251,9 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         bridge_return = tasks[remote_clean_indexes[-1] + 1]
         self.assertEqual(bridge_return["mode"], 2)
         self.assertEqual(
-            (
-                bridge_return["startX"],
-                bridge_return["startY"],
-                bridge_return["endX"],
-                bridge_return["endY"],
-            ),
-            (36, 284, 11, 127),
+            (bridge_return["startX"], bridge_return["startY"], bridge_return["endX"], bridge_return["endY"]),
+            (36, 284, 0, 0),
         )
-        self.assertEqual(tasks[remote_clean_indexes[-1] + 2]["mode"], 1)
 
         connector_coordinates = {(31, 178), (34, 231)}
         executable_endpoints = {
@@ -494,7 +486,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                 (tasks[index]["startX"], tasks[index]["startY"]),
             )
 
-    def test_two_connected_groups_clean_remote_first_then_home_and_return_to_origin(self):
+    def test_two_connected_groups_default_to_area_one_then_area_two_and_return_to_origin(self):
         from modeling_task_generator import generate_task_plan
 
         preview = {
@@ -545,12 +537,13 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         tasks = plan["tasks"]
         clean_areas = [task["areaNumber"] for task in tasks if task["mode"] == 1]
 
-        self.assertEqual(plan["routeType"], "bridge_round_trip")
-        self.assertEqual(clean_areas, [2, 2, 1, 1])
+        self.assertEqual(plan["routeType"], "area_order")
+        self.assertEqual(plan["areaOrder"], [1, 2])
+        self.assertEqual(clean_areas, [1, 1, 2, 2])
         self.assertEqual((tasks[0]["startX"], tasks[0]["startY"]), (0, 0))
         self.assertEqual((tasks[-1]["endX"], tasks[-1]["endY"]), (0, 0))
-        # 出程上的同一直线普通点被合并，不会在连接桥端点额外停车。
-        self.assertEqual((tasks[0]["endX"], tasks[0]["endY"]), (0, 300))
+        # 同一直线普通点被合并，不会在连接桥端点额外停车。
+        self.assertEqual((tasks[0]["endX"], tasks[0]["endY"]), (100, 0))
         for index in range(1, len(tasks)):
             self.assertEqual(
                 (tasks[index - 1]["endX"], tasks[index - 1]["endY"]),

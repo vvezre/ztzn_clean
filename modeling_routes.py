@@ -186,6 +186,14 @@ def register_modeling_routes(app, storage_dir=None, store=None, sample_point_pro
         except Exception as error:
             return _handle_store_error(error)
 
+    @app.route("/modeling/session/replan", methods=["POST"])
+    def modeling_session_replan():
+        payload = request.get_json(silent=True) or {}
+        try:
+            return _ok(modeling_session.replan(payload.get("areaOrder")))
+        except Exception as error:
+            return _handle_store_error(error)
+
     @app.route("/modeling/models", methods=["GET"])
     def modeling_list_models():
         try:

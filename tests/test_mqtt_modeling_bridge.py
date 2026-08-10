@@ -113,6 +113,18 @@ class _FakeController(object):
     def finish_modeling(self):
         return {"success": True, "data": {"modelId": "active-model", "taskPlan": {"status": "ready"}}}
 
+    def replan_modeling_route(self, area_order):
+        self.area_order = list(area_order)
+        return {
+            "success": True,
+            "message": "modeling route replanned",
+            "data": {
+                "modelId": "active-model",
+                "areaOrder": list(area_order),
+                "taskPlan": {"status": "ready", "areaOrder": list(area_order)},
+            },
+        }
+
     def get_modeling_state(self):
         return {"success": True, "data": {"status": "recording"}}
 
@@ -197,6 +209,18 @@ class _StubAdapter(object):
                 "data": {
                     "areaNumber": 2,
                     "groupCount": 2,
+                },
+            }
+        if path == "/modeling/session/replan":
+            return {
+                "success": True,
+                "data": {
+                    "modelId": "model-1",
+                    "areaOrder": list(json_data["areaOrder"]),
+                    "taskPlan": {
+                        "status": "ready",
+                        "areaOrder": list(json_data["areaOrder"]),
+                    },
                 },
             }
         if path.endswith("/sample-point"):
@@ -325,6 +349,36 @@ class _StubAdapter(object):
 
 
 class MqttModelingBridgeTest(unittest.TestCase):
+    def test_handler_and_adapter_replan_with_frontend_area_order(self):
+        from mqtt_handler import MQTTCommandHandler
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        controller = _FakeController()
+        handled = MQTTCommandHandler(controller).handle({
+            "command": "replan_modeling_route",
+            "params": {"areaOrder": [2, 1, 3]},
+        })
+        adapter = _StubAdapter()
+        adapted = VehicleControllerAdapter.replan_modeling_route(adapter, [2, 1, 3])
+
+        self.assertTrue(handled["success"])
+        self.assertEqual(controller.area_order, [2, 1, 3])
+        self.assertEqual(handled["data"]["areaOrder"], [2, 1, 3])
+        self.assertTrue(adapted["success"])
+        self.assertEqual(adapter.path, "/modeling/session/replan")
+        self.assertEqual(adapter.json_data, {"areaOrder": [2, 1, 3]})
+
+    def test_handler_rejects_invalid_replan_area_order(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        handler = MQTTCommandHandler(_FakeController())
+        for area_order in (None, [], [1, 1], [0, 1], ["bad", 1]):
+            result = handler.handle({
+                "command": "replan_modeling_route",
+                "params": {"areaOrder": area_order},
+            })
+            self.assertFalse(result["success"], area_order)
+
     def test_handler_saves_named_modeling_task_and_lists_robot_tasks(self):
         from mqtt_handler import MQTTCommandHandler
 

@@ -48,6 +48,7 @@
       "get_status",
       "start_modeling",
       "finish_modeling",
+      "replan_modeling_route",
       "get_modeling_state",
       "undo_modeling_point",
       "clear_modeling_points",

@@ -38,8 +38,8 @@ def _assert_continuous_round_trip(test_case, tasks, origin=(0, 0)):
 
 
 class ModelingRoutePropertyTest(unittest.TestCase):
-    def test_random_rotated_rectangles_keep_even_lanes_continuity_and_no_mergeable_stops(self):
-        from modeling_preview import _nearest_even_lane_count, build_model_preview
+    def test_random_rotated_rectangles_keep_safe_overlap_continuity_and_no_mergeable_stops(self):
+        from modeling_preview import build_model_preview
         from modeling_task_generator import _same_direction_collinear, generate_task_plan
 
         randomizer = random.Random(20260803)
@@ -80,10 +80,13 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             lanes = preview["groups"][0]["subAreas"][0]["lanes"]
             tasks = plan["tasks"]
 
-            expected_lane_count = _nearest_even_lane_count(clean_span, 63.0)
-            self.assertEqual(len(lanes), expected_lane_count, case_index)
-            self.assertEqual(len(lanes) % 2, 0, case_index)
-            self.assertEqual(plan["summary"]["cleanTaskCount"], len(lanes), case_index)
+            sub_area = preview["groups"][0]["subAreas"][0]
+            candidates = sub_area["laneCandidates"]
+            selected_count = plan["routeSelections"][0]["laneCount"]
+            self.assertIn(selected_count, [candidate["laneCount"] for candidate in candidates], case_index)
+            self.assertTrue(all(candidate["actualOverlapCm"] >= 30.0 for candidate in candidates), case_index)
+            self.assertEqual(plan["summary"]["cleanTaskCount"], selected_count, case_index)
+            self.assertFalse(preview["config"]["forceEvenLanes"], case_index)
             _assert_continuous_round_trip(self, tasks)
             for index in range(1, len(tasks)):
                 self.assertFalse(
@@ -134,7 +137,6 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             lanes = preview["groups"][0]["subAreas"][0]["lanes"]
 
             self.assertGreaterEqual(len(lanes), 2, case_index)
-            self.assertEqual(len(lanes) % 2, 0, case_index)
             self.assertAlmostEqual(lanes[0]["startX"], points[1]["x"], places=1)
             self.assertAlmostEqual(lanes[0]["startY"], points[1]["y"], places=1)
             self.assertAlmostEqual(lanes[0]["endX"], points[2]["x"], places=1)
@@ -143,12 +145,18 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             self.assertAlmostEqual(lanes[-1]["startY"], points[0]["y"], places=1)
             self.assertAlmostEqual(lanes[-1]["endX"], points[3]["x"], places=1)
             self.assertAlmostEqual(lanes[-1]["endY"], points[3]["y"], places=1)
-            self.assertEqual(plan["summary"]["cleanTaskCount"], len(lanes), case_index)
+            selected_count = plan["routeSelections"][0]["laneCount"]
+            self.assertEqual(plan["summary"]["cleanTaskCount"], selected_count, case_index)
+            self.assertIn(
+                selected_count,
+                [candidate["laneCount"] for candidate in preview["groups"][0]["subAreas"][0]["laneCandidates"]],
+                case_index,
+            )
             _assert_continuous_round_trip(self, plan["tasks"])
 
         self.assertGreaterEqual(tested, 90)
 
-    def test_random_two_area_routes_clean_remote_first_and_preserve_bridge_turns(self):
+    def test_random_two_area_routes_default_to_area_order_and_preserve_bridge_turns(self):
         from modeling_preview import build_model_preview
         from modeling_task_generator import _same_direction_collinear, generate_task_plan
 
@@ -209,15 +217,16 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             tasks = plan["tasks"]
             clean_areas = [task["areaNumber"] for task in tasks if task["mode"] == 1]
 
-            self.assertEqual(plan["routeType"], "bridge_round_trip", case_index)
-            first_home_index = clean_areas.index(1)
-            self.assertTrue(all(area == 2 for area in clean_areas[:first_home_index]), case_index)
-            self.assertTrue(all(area == 1 for area in clean_areas[first_home_index:]), case_index)
+            self.assertEqual(plan["routeType"], "area_order", case_index)
+            self.assertEqual(plan["areaOrder"], [1, 2], case_index)
+            first_remote_index = clean_areas.index(2)
+            self.assertTrue(all(area == 1 for area in clean_areas[:first_remote_index]), case_index)
+            self.assertTrue(all(area == 2 for area in clean_areas[first_remote_index:]), case_index)
             _assert_continuous_round_trip(self, tasks)
             for index in range(1, len(tasks)):
                 self.assertFalse(_same_direction_collinear(tasks[index - 1], tasks[index]), case_index)
 
-    def test_real_tilted_two_area_route_keeps_boundary_lanes_and_bridge_round_trip(self):
+    def test_real_tilted_two_area_route_keeps_boundary_lanes_and_default_area_order(self):
         from modeling_preview import build_model_preview
         from modeling_task_generator import _same_direction_collinear, generate_task_plan
 
@@ -270,8 +279,8 @@ class ModelingRoutePropertyTest(unittest.TestCase):
         home_lanes = preview["groups"][0]["subAreas"][0]["lanes"]
         remote_lanes = preview["groups"][1]["subAreas"][0]["lanes"]
 
-        self.assertEqual(len(home_lanes), 4)
-        self.assertEqual(len(remote_lanes), 4)
+        self.assertEqual(len(home_lanes), 3)
+        self.assertEqual(len(remote_lanes), 3)
         self.assertEqual(
             (home_lanes[0]["startX"], home_lanes[0]["startY"], home_lanes[0]["endX"], home_lanes[0]["endY"]),
             (7.4, 117.9, 344.4, 86.4),
@@ -280,21 +289,17 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             (remote_lanes[0]["startX"], remote_lanes[0]["startY"], remote_lanes[0]["endX"], remote_lanes[0]["endY"]),
             (23.9, 399.8, 379.4, 363.0),
         )
+        self.assertEqual(plan["areaOrder"], [1, 2])
         self.assertEqual(
             [task["areaNumber"] for task in tasks if task["mode"] == 1],
-            [2, 2, 2, 2, 1, 1, 1, 1],
+            [1, 1, 1, 1, 2, 2, 2, 2],
         )
         remote_clean = [task for task in tasks if task["mode"] == 1 and task["areaNumber"] == 2]
         home_clean = [task for task in tasks if task["mode"] == 1 and task["areaNumber"] == 1]
-        self.assertEqual(
-            (remote_clean[-1]["endX"], remote_clean[-1]["endY"]),
-            (17, 261),
-        )
-        self.assertEqual(
-            (home_clean[-1]["endX"], home_clean[-1]["endY"]),
-            (0, 0),
-        )
-        self.assertFalse(any(task["source"] == "modeling_return_origin" for task in tasks))
+        self.assertEqual((home_clean[0]["startX"], home_clean[0]["startY"]), (0, 0))
+        self.assertEqual((home_clean[-1]["endX"], home_clean[-1]["endY"]), (7, 118))
+        self.assertEqual((remote_clean[-1]["endX"], remote_clean[-1]["endY"]), (17, 261))
+        self.assertTrue(any(task["source"] == "modeling_return_origin" for task in tasks))
         visited = {
             (task[prefix + "X"], task[prefix + "Y"])
             for task in tasks

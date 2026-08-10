@@ -361,6 +361,16 @@ class VehicleControllerAdapter(object):
             'modeling path generated',
         )
 
+    def replan_modeling_route(self, area_order):
+        """按前端给出的区域编号顺序重新规划，不重新采点。"""
+        return self._normalize_modeling_response(
+            self._call(
+                '/modeling/session/replan',
+                json_data={'areaOrder': list(area_order or [])},
+            ),
+            'modeling route replanned',
+        )
+
     def sample_modeling_point(self, model_id=None, group_id=None):
         """
         采样一个区域边界点。
@@ -616,6 +626,7 @@ class VehicleControllerAdapter(object):
             'message': 'modeling path fetched',
             'data': {
                 'modelId': draft.get('id') or str(model_id),
+                'areaOrder': task_plan.get('areaOrder') or [],
                 'taskName': task_plan.get('taskName') or draft.get('name') or '',
                 'updatedAt': draft.get('updatedAt') or task_plan.get('generatedAt'),
                 'taskPreview': draft.get('taskPreview'),
@@ -678,6 +689,7 @@ class VehicleControllerAdapter(object):
             'success': True,
             'message': 'modeling result fetched',
             'data': {
+                'areaOrder': task_plan.get('areaOrder') or [],
                 'areaPoints': frontend_area_points(draft),
                 'linkPoints': frontend_link_points(draft),
                 'pathPoints': frontend_path_points(task_plan),
