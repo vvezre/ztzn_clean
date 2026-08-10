@@ -113,7 +113,11 @@ class ModelingSessionTest(unittest.TestCase):
             session.record_link_point()
 
         created_area = session.new_area()
-        self.assertEqual(created_area, {"areaNumber": 2, "groupCount": 2})
+        self.assertEqual(created_area, {
+            "areaNumber": 2,
+            "sourceAreaNumber": 1,
+            "groupCount": 2,
+        })
         next_area = session.record_area_point()
         self.assertEqual(next_area["point"]["id"], "b1")
         self.assertEqual(next_area["point"]["areaNumber"], 2)
@@ -127,6 +131,79 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(finished["session"]["linkCount"], 1)
         self.assertEqual(finished["taskPlan"]["status"], "ready")
         self.assertGreater(finished["taskPlan"]["summary"]["transferTaskCount"], 0)
+
+    def test_connection_source_uses_nearest_area_for_branched_topology(self):
+        """区域2完成后回到区域1记录连接点，应创建区域1到区域3的桥。"""
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            # 区域1
+            _point("a1", 0, 0),
+            _point("a2", 0, 200),
+            _point("a3", 400, 200),
+            _point("a4", 400, 0),
+            # 区域1 -> 区域2
+            _point("l1", 0, 220),
+            _point("l2", 0, 280),
+            # 区域2
+            _point("b1", 0, 300),
+            _point("b2", 0, 500),
+            _point("b3", 300, 500),
+            _point("b4", 300, 300),
+            # 当前区域虽为2，但这里已经驶回区域1右上角。
+            _point("l3", 400, 200),
+            _point("l4", 470, 230),
+            # 区域3
+            _point("c1", 500, 200),
+            _point("c2", 500, 400),
+            _point("c3", 800, 400),
+            _point("c4", 800, 200),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        started = session.start("branched-three-areas")
+
+        for _ in range(4):
+            session.record_area_point()
+        first_bridge_start = session.record_link_point()
+        session.record_link_point()
+        first_new_area = session.new_area()
+        for _ in range(4):
+            session.record_area_point()
+
+        second_bridge_start = session.record_link_point()
+        second_bridge_end = session.record_link_point()
+        third_area = session.new_area()
+        for _ in range(4):
+            session.record_area_point()
+
+        replanned = session.replan([1, 2, 3])
+        saved = store.get_draft(started["modelId"])
+        group_number_by_id = {
+            group["id"]: group["areaNumber"]
+            for group in saved["groups"]
+        }
+        topology = [
+            (
+                group_number_by_id[link["startGroupId"]],
+                group_number_by_id[link["endGroupId"]],
+            )
+            for link in saved["groupLinks"]
+        ]
+
+        self.assertEqual(first_bridge_start["sourceAreaNumber"], 1)
+        self.assertEqual(first_new_area["sourceAreaNumber"], 1)
+        self.assertEqual(second_bridge_start["sourceAreaNumber"], 1)
+        self.assertEqual(second_bridge_end["sourceAreaNumber"], 1)
+        self.assertEqual(third_area["sourceAreaNumber"], 1)
+        self.assertEqual(topology, [(1, 2), (1, 3)])
+        self.assertEqual(replanned["areaOrder"], [1, 2, 3])
+        self.assertEqual(replanned["taskPlan"]["status"], "ready")
+        self.assertEqual(
+            [selection["areaNumber"] for selection in replanned["taskPlan"]["routeSelections"]],
+            [1, 2, 3],
+        )
 
     def test_new_area_rejects_missing_or_incomplete_connection(self):
         from modeling_session import ModelingSession, ModelingSessionError
@@ -274,6 +351,56 @@ class ModelingSessionTest(unittest.TestCase):
             "type": "area_order",
             "areaOrder": [2, 1],
         })
+        clean_areas = [
+            task["areaNumber"]
+            for task in replanned["taskPlan"]["tasks"]
+            if task["mode"] == 1
+        ]
+        first_area_one = clean_areas.index(1)
+        self.assertTrue(all(area == 2 for area in clean_areas[:first_area_one]))
+        self.assertTrue(all(area == 1 for area in clean_areas[first_area_one:]))
+
+    def test_recording_session_can_replan_as_first_route_generation_command(self):
+        """新前端确认区域顺序后，无需先调用 finish_modeling。"""
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            _point("a1", 0, 0),
+            _point("a2", 0, 200),
+            _point("a3", 300, 200),
+            _point("a4", 300, 0),
+            _point("l1", 0, 200),
+            _point("l2", 0, 300),
+            _point("b1", 0, 300),
+            _point("b2", 0, 500),
+            _point("b3", 300, 500),
+            _point("b4", 300, 300),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        started = session.start("first-replan")
+        for _ in range(4):
+            session.record_area_point()
+        session.record_link_point()
+        session.record_link_point()
+        session.new_area()
+        for _ in range(4):
+            session.record_area_point()
+
+        # 不调用 finish()，直接按前端确认的顺序完成首次区域识别和路线生成。
+        replanned = session.replan([2, 1])
+        saved = store.get_draft(started["modelId"])
+
+        self.assertEqual(replanned["session"]["status"], "ready")
+        self.assertEqual(replanned["areaOrder"], [2, 1])
+        self.assertEqual(replanned["taskPreview"]["status"], "ready")
+        self.assertEqual(replanned["taskPreview"]["areaOrder"], [2, 1])
+        self.assertEqual(replanned["taskPlan"]["status"], "ready")
+        self.assertEqual(replanned["taskPlan"]["areaOrder"], [2, 1])
+        self.assertTrue(saved["recognition"]["confirmed"])
+        self.assertTrue(all(group.get("subAreas") for group in saved["groups"]))
+
         clean_areas = [
             task["areaNumber"]
             for task in replanned["taskPlan"]["tasks"]

@@ -1,11 +1,13 @@
 # coding=utf-8
 import io
 import json
+import math
 import os
 import threading
 import time
 
 from modeling_capture import MixedCaptureError, resolve_mixed_capture
+from modeling_coordinates import find_model_origin, lat_lon_to_model_xy_cm
 
 
 SESSION_SCHEMA_VERSION = 1
@@ -72,6 +74,105 @@ class ModelingSession(object):
 
     def _find_link(self, draft, link_id):
         return next((link for link in (draft.get("groupLinks") or []) if link.get("id") == link_id), None)
+
+    def _finite_number(self, value):
+        """把坐标字段转换为可参与距离计算的有限浮点数。"""
+        if value is None or value == "":
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if not math.isnan(number) and not math.isinf(number) else None
+
+    def _stored_point_xy(self, point):
+        """读取已经统一到模型坐标系中的区域点坐标。"""
+        x = self._finite_number((point or {}).get("x"))
+        y = self._finite_number((point or {}).get("y"))
+        return (x, y) if x is not None and y is not None else None
+
+    def _sample_point_xy(self, draft, point):
+        """把刚采样的连接点换算到当前模型的厘米坐标系。"""
+        origin = find_model_origin(draft)
+        xy = lat_lon_to_model_xy_cm(
+            origin,
+            (point or {}).get("lat"),
+            (point or {}).get("lon"),
+        )
+        if xy is not None:
+            return xy
+        # 模拟器和部分测试会直接提供已经换算好的 x/y，RTK 不可用时保留兼容。
+        return self._stored_point_xy(point)
+
+    def _point_to_segment_distance(self, point, start, end):
+        """计算一个点到有限边界线段的最短距离，单位为厘米。"""
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length_squared = dx * dx + dy * dy
+        if length_squared <= 1e-9:
+            return math.hypot(point[0] - start[0], point[1] - start[1])
+        projection = (
+            (point[0] - start[0]) * dx
+            + (point[1] - start[1]) * dy
+        ) / float(length_squared)
+        projection = max(0.0, min(1.0, projection))
+        nearest = (
+            start[0] + projection * dx,
+            start[1] + projection * dy,
+        )
+        return math.hypot(point[0] - nearest[0], point[1] - nearest[1])
+
+    def _group_boundary_distance(self, group, point_xy):
+        """计算连接点到一个已记录区域闭合边界的最短距离。"""
+        boundary = [
+            xy for xy in (
+                self._stored_point_xy(point)
+                for point in ((group or {}).get("points") or [])
+            )
+            if xy is not None
+        ]
+        if not boundary:
+            return None
+        if len(boundary) == 1:
+            return math.hypot(
+                point_xy[0] - boundary[0][0],
+                point_xy[1] - boundary[0][1],
+            )
+        distances = [
+            self._point_to_segment_distance(
+                point_xy,
+                boundary[index],
+                boundary[(index + 1) % len(boundary)],
+            )
+            for index in range(len(boundary))
+        ]
+        return min(distances)
+
+    def _nearest_link_source_group(self, draft, sampled_point, fallback_group):
+        """根据第一个连接点的位置确定连接桥真正连接的已有区域。
+
+        用户可能在记录完区域2后驶回区域1，再从区域1记录通往区域3的
+        连接桥。因此这里不能把当前编辑区域直接当作连接桥起点，而是比较
+        连接点到每个已记录区域边界的距离，选择最近的区域。
+        """
+        point_xy = self._sample_point_xy(draft, sampled_point)
+        if point_xy is None:
+            return fallback_group, None
+        candidates = []
+        for group in draft.get("groups") or []:
+            distance = self._group_boundary_distance(group, point_xy)
+            if distance is None:
+                continue
+            candidates.append((
+                distance,
+                int(group.get("areaNumber") or 0),
+                str(group.get("id") or ""),
+                group,
+            ))
+        if not candidates:
+            return fallback_group, None
+        selected = min(candidates, key=lambda item: item[:3])
+        return selected[3], selected[0]
 
     def _append_capture_event(self, model_id, draft, point_type, point):
         events = list(draft.get("captureSequence") or [])
@@ -238,6 +339,12 @@ class ModelingSession(object):
                     "MODELING_LINK_INCOMPLETE",
                     "record both connection points before creating the next area",
                 )
+            source_group = self._find_group(draft, current_link.get("startGroupId"))
+            if source_group is None:
+                raise ModelingSessionError(
+                    "MODELING_LINK_SOURCE_MISSING",
+                    "connection source area is missing",
+                )
 
             created = self.store.create_group_from_pending_link(
                 model_id,
@@ -245,7 +352,7 @@ class ModelingSession(object):
                 now=self._timestamp(),
             )
             next_group = created["group"]
-            state["previousGroupId"] = current_group.get("id")
+            state["previousGroupId"] = source_group.get("id")
             state["currentGroupId"] = next_group.get("id")
             state["currentLinkId"] = None
             state["pendingGroupId"] = None
@@ -255,6 +362,7 @@ class ModelingSession(object):
             summary = self._summary(state, created["draft"])
             return {
                 "areaNumber": next_group.get("areaNumber"),
+                "sourceAreaNumber": source_group.get("areaNumber"),
                 "groupCount": summary.get("groupCount"),
             }
 
@@ -302,22 +410,35 @@ class ModelingSession(object):
                 raise ModelingSessionError("MODELING_GROUP_MISSING", "current modeling area is missing")
 
             link_id = state.get("currentLinkId")
+            source_group = current_group
             if not link_id:
                 if len(current_group.get("points") or []) < 4:
                     raise ModelingSessionError(
                         "MODELING_AREA_INCOMPLETE",
                         "record at least four area points before recording connection points",
                     )
+                # 先完成区域点数量校验再读取 RTK，避免失败命令无意义地
+                # 消耗一次定位采样。这个点既用于保存，也用于判断桥从哪一区域出发。
+                sampled_point = self._sample()
+                source_group, _source_distance_cm = self._nearest_link_source_group(
+                    draft,
+                    sampled_point,
+                    current_group,
+                )
                 created = self.store.create_pending_group_link(
                     model_id,
-                    current_group["id"],
+                    source_group["id"],
                     now=self._timestamp(),
                 )
                 link_id = created["groupLink"]["id"]
                 state["currentLinkId"] = link_id
                 draft = created["draft"]
+            else:
+                sampled_point = self._sample()
+                active_link = self._find_link(draft, link_id) or {}
+                source_group = self._find_group(draft, active_link.get("startGroupId")) or current_group
 
-            result = self.store.append_group_link_point(model_id, link_id, self._sample())
+            result = self.store.append_group_link_point(model_id, link_id, sampled_point)
             saved = self._append_capture_event(
                 model_id,
                 result["draft"],
@@ -332,6 +453,7 @@ class ModelingSession(object):
                 "pointType": "link",
                 "pointNo": result["point"].get("sequence"),
                 "point": result["point"],
+                "sourceAreaNumber": source_group.get("areaNumber"),
                 "session": self._summary(state, saved),
             }
 
@@ -505,46 +627,66 @@ class ModelingSession(object):
                 "session": self._summary(state, saved),
             }
 
+    def _prepare_route_planning(self, state):
+        """校验并识别当前建模数据，使其具备生成路线的条件。
+
+        ``finish_modeling`` 和 ``replan_modeling_route`` 都可能成为一次建模
+        的首个规划命令。无论由哪个命令触发，生成预览前都必须完成相同
+        的准备步骤：解析兼容模式记录、校验区域与连接桥、识别每个区域。
+
+        调用方必须已经持有 ``self._lock``，并传入活动会话状态。
+        """
+        model_id = state["modelId"]
+        draft = self.store.get_draft(model_id)
+
+        # 兼容早期把区域点和连接点混合记录在同一条边界序列中的模型。
+        if state.get("captureMode") == "mixed_boundary":
+            try:
+                draft = resolve_mixed_capture(draft)
+            except MixedCaptureError as error:
+                raise ModelingSessionError(error.code, error.message)
+            draft = self.store.save_draft(model_id, draft)
+
+        # 每条连接桥必须保留两个桥头，并且明确连接哪两个区域。
+        links = list(draft.get("groupLinks") or [])
+        incomplete_links = [
+            link for link in links
+            if len(link.get("points") or []) != 2
+            or not link.get("startGroupId")
+            or not link.get("endGroupId")
+        ]
+        if incomplete_links:
+            raise ModelingSessionError(
+                "MODELING_LINK_INCOMPLETE",
+                "each connection must contain its original start and end points",
+            )
+
+        # 每个区域至少四个记录点，才能形成可识别的闭合清扫区域。
+        groups = list(draft.get("groups") or [])
+        incomplete_groups = [group for group in groups if len(group.get("points") or []) < 4]
+        if incomplete_groups:
+            raise ModelingSessionError(
+                "MODELING_AREA_INCOMPLETE",
+                "each modeling area requires at least four points",
+            )
+
+        # 识别结果会写回各区域的 subAreas，路径预览以这些结果生成清扫线。
+        for group in groups:
+            recognized = self.store.recognize_group(model_id, group["id"])
+            recognition = recognized.get("recognition") or {}
+            if recognition.get("needsConfirmation") or not recognized.get("group", {}).get("subAreas"):
+                raise ModelingSessionError(
+                    "MODELING_RECOGNITION_NEEDS_CONFIRMATION",
+                    "the recorded area needs confirmation before a path can be generated",
+                )
+
+        return self.store.get_draft(model_id)
+
     def finish(self):
         with self._lock:
             state = self._require_state()
             model_id = state["modelId"]
-            draft = self.store.get_draft(model_id)
-            if state.get("captureMode") == "mixed_boundary":
-                try:
-                    draft = resolve_mixed_capture(draft)
-                except MixedCaptureError as error:
-                    raise ModelingSessionError(error.code, error.message)
-                draft = self.store.save_draft(model_id, draft)
-            links = list(draft.get("groupLinks") or [])
-            incomplete_links = [
-                link for link in links
-                if len(link.get("points") or []) != 2
-                or not link.get("startGroupId")
-                or not link.get("endGroupId")
-            ]
-            if incomplete_links:
-                raise ModelingSessionError(
-                    "MODELING_LINK_INCOMPLETE",
-                    "each connection must contain its original start and end points",
-                )
-
-            groups = list(draft.get("groups") or [])
-            incomplete_groups = [group for group in groups if len(group.get("points") or []) < 4]
-            if incomplete_groups:
-                raise ModelingSessionError(
-                    "MODELING_AREA_INCOMPLETE",
-                    "each modeling area requires at least four points",
-                )
-
-            for group in groups:
-                recognized = self.store.recognize_group(model_id, group["id"])
-                recognition = recognized.get("recognition") or {}
-                if recognition.get("needsConfirmation") or not recognized.get("group", {}).get("subAreas"):
-                    raise ModelingSessionError(
-                        "MODELING_RECOGNITION_NEEDS_CONFIRMATION",
-                        "the recorded area needs confirmation before a path can be generated",
-                    )
+            self._prepare_route_planning(state)
 
             self.store.build_task_preview(model_id)
             generated = self.store.generate_task_plan(model_id)
@@ -569,7 +711,9 @@ class ModelingSession(object):
             if not isinstance(area_order, (list, tuple)):
                 raise ModelingSessionError("MODELING_AREA_ORDER_INVALID", "areaOrder must be an array")
             model_id = state["modelId"]
-            draft = self.store.get_draft(model_id)
+            # 新前端把本命令作为首次规划入口，因此这里不能假定
+            # finish_modeling 已经提前完成区域识别和完整性校验。
+            draft = self._prepare_route_planning(state)
             route_policy = dict(draft.get("routePolicy") or {})
             route_policy["type"] = "area_order"
             route_policy["areaOrder"] = list(area_order)

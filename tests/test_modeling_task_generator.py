@@ -32,6 +32,122 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
 
         self.assertEqual(path, [(0.0, 0.0), (340.0, -20.0), (340.0, 90.0)])
 
+    def test_connection_points_enter_boundary_through_the_nearest_recorded_anchors(self):
+        """连接点不得为缩短距离而斜穿到同一条边的远端角点。"""
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _compact_executable_tasks,
+            _group_anchor_transition_points,
+        )
+
+        points = [
+            {"id": "A1", "x": 0.0, "y": 0.0, "lat": 32.0, "lon": 118.0},
+            {"id": "A2", "x": 10.708, "y": 127.296, "lat": 32.0, "lon": 118.0},
+            {"id": "A3", "x": 954.092, "y": 52.061, "lat": 32.0, "lon": 118.0},
+            {"id": "A4", "x": 946.118, "y": -76.013, "lat": 32.0, "lon": 118.0},
+        ]
+        draft = {"groups": [{"id": "area-1", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+
+        outbound = _group_anchor_transition_points(
+            draft,
+            "area-1",
+            (31.474, 177.712),  # L1，靠近 A2
+            (957.0, 105.0),     # L3，靠近 A3
+            mapper,
+        )
+        inbound = _group_anchor_transition_points(
+            draft,
+            "area-1",
+            (957.0, 105.0),
+            (31.474, 177.712),
+            mapper,
+        )
+
+        self.assertEqual(outbound, [
+            (31.474, 177.712),
+            (10.708, 127.296),
+            (954.092, 52.061),
+            (957.0, 105.0),
+        ])
+        self.assertEqual(inbound, list(reversed(outbound)))
+
+        # 后续普通移动点简化也必须保留 A2、A3 这两个明显转向点。
+        raw_tasks = []
+        for index in range(len(outbound) - 1):
+            start = outbound[index]
+            end = outbound[index + 1]
+            raw_tasks.append({
+                "id": index + 1,
+                "mode": 2,
+                "startX": start[0],
+                "startY": start[1],
+                "endX": end[0],
+                "endY": end[1],
+                "startLat": 32.0,
+                "startLon": 118.0,
+                "endLat": 32.0,
+                "endLon": 118.0,
+                "source": "modeling_transfer",
+            })
+        compacted = _compact_executable_tasks(raw_tasks)
+        executable_points = {
+            (task[prefix + "X"], task[prefix + "Y"])
+            for task in compacted
+            for prefix in ("start", "end")
+        }
+        self.assertIn((10.708, 127.296), executable_points)
+        self.assertIn((954.092, 52.061), executable_points)
+
+    def test_connection_bridge_at_edge_middle_uses_boundary_projection_before_corner(self):
+        """桥头位于边中部时，必须先接上边界，再沿边界前往清扫入口。"""
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _group_anchor_transition_points,
+            _nearest_boundary_projection,
+        )
+
+        points = [
+            {"id": "A9", "x": 774.092, "y": 212.061, "lat": 32.0, "lon": 118.0},
+            {"id": "A10", "x": 778.249, "y": 344.338, "lat": 32.0, "lon": 118.0},
+            {"id": "A11", "x": 1141.192, "y": 310.402, "lat": 32.0, "lon": 118.0},
+            {"id": "A12", "x": 1129.985, "y": 175.689, "lat": 32.0, "lon": 118.0},
+        ]
+        draft = {"groups": [{"id": "area-3", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+        anchors = [mapper.point_to_xy(point) for point in points]
+        bridge = (965.0, 165.0)
+        projection = _nearest_boundary_projection(bridge, anchors)["point"]
+
+        outbound = _group_anchor_transition_points(
+            draft,
+            "area-3",
+            bridge,
+            anchors[2],  # A11：区域3第一条清扫线入口
+            mapper,
+        )
+        inbound = _group_anchor_transition_points(
+            draft,
+            "area-3",
+            anchors[3],  # A12：区域3最后一条清扫线出口
+            bridge,
+            mapper,
+        )
+
+        # 去程：L4 -> 边界投影Q -> A12 -> A11。
+        self.assertEqual(len(outbound), 4)
+        self.assertEqual(outbound[0], bridge)
+        self.assertAlmostEqual(outbound[1][0], projection[0], places=6)
+        self.assertAlmostEqual(outbound[1][1], projection[1], places=6)
+        self.assertEqual(outbound[2:], [anchors[3], anchors[2]])
+
+        # 返程：A12 -> 同一个投影Q -> L4，和去程使用相同边界接入点。
+        self.assertEqual(len(inbound), 3)
+        self.assertEqual(inbound[0], anchors[3])
+        self.assertAlmostEqual(inbound[1][0], projection[0], places=6)
+        self.assertAlmostEqual(inbound[1][1], projection[1], places=6)
+        self.assertEqual(inbound[2], bridge)
+
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks
 

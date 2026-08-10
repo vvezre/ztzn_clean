@@ -169,10 +169,11 @@ class ModelingAdaptiveRouteTest(unittest.TestCase):
             for task in tasks[last_area_one_task + 1:first_area_three_task]
             for prefix in ("start", "end")
         }
-        # 区域1桥头与区域2桥头在同一直线上，会按现有规则合并为一段，
-        # 因此不要求在(0,128)额外停车，但必须到达区域2的边界入口。
-        self.assertIn((0, 228), transfer_points)
-        self.assertIn((400, 228), transfer_points)
+        # 区域1桥头、区域2左下桥头与左侧边界近似共线，普通移动点会被
+        # 合并，不要求逐点停车。右侧桥头(400,300)更靠近区域2右上角，
+        # 因此必须沿记录边界经过左上、右上角，不能斜穿到右下角。
+        self.assertIn((0, 356), transfer_points)
+        self.assertIn((400, 356), transfer_points)
         self.assertIn((400, 300), transfer_points)
         self.assertIn((500, 300), transfer_points)
 

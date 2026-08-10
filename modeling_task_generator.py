@@ -25,6 +25,9 @@ EPSILON_CM = 1e-6
 # 区域边界和连接桥由人工遥控打点，RTK 抖动会让本来接近直线的点左右偏几厘米。
 # 只有普通移动 mode=2 使用这条20厘米走廊；清扫线 mode=1 不使用容差合并。
 TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
+# 边界投影点距离记录角点不超过20cm时直接吸附到角点，避免让小车为RTK抖动
+# 产生的很短边界段额外停车；超过该距离时必须保留投影点，禁止斜切到角点。
+BOUNDARY_CORNER_SNAP_CM = 20.0
 
 # 局部方向变化达到30度就认为是真实转弯，必须保留为任务端点，让小车停车重新转向。
 # test12 中16～18度的采样摆动可以连续直行，而实际90度连接桥转角一定会被保留。
@@ -765,12 +768,22 @@ def _nearest_boundary_projection(point, anchors):
 
 
 def _boundary_anchor_candidates(projection, anchors):
-    """返回投影所在边的相邻记录点；命中角点时只返回该角点。"""
+    """返回投影所在边上距离投影最近的那个记录角点。"""
     for index, anchor in enumerate(anchors):
         if _is_same_point(anchor, projection["point"]):
             return [index]
     edge_index = projection["edgeIndex"]
-    return [edge_index, (edge_index + 1) % len(anchors)]
+    if projection["ratio"] <= 0.5:
+        return [edge_index]
+    return [(edge_index + 1) % len(anchors)]
+
+
+def _boundary_projection_waypoint(projection, anchor):
+    """投影离角点较远时返回投影点，靠近角点时允许直接吸附。"""
+    point = projection["point"]
+    if _length_cm(point, anchor) > BOUNDARY_CORNER_SNAP_CM:
+        return point
+    return None
 
 
 def _group_anchor_transition_points(draft, group_id, current, target, mapper):
@@ -789,9 +802,9 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
     if len(anchors) < 2:
         return [current, target]
 
-    # 清扫线端点或连接点可能位于两个人工角点之间。先判断它最接近哪条真实
-    # 记录边，再只允许从这条边的两个相邻记录点进入/离开。这样既能比较完整
-    # 的顺、逆时针总路程，又不会为了距离更短而斜穿到不相邻的区域角点。
+    # 清扫线端点或连接点可能位于两个人工角点之间。先找到最近边界和最近
+    # 角点，再比较沿记录边界正向、反向行驶的总长度。投影离角点超过容差
+    # 时必须加入路径，形成“桥头 -> 投影点 -> 角点”，禁止斜切到角点。
     current_projection = _nearest_boundary_projection(current, anchors)
     target_projection = _nearest_boundary_projection(target, anchors)
     candidates = []
@@ -802,9 +815,20 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
             forward_indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), 1)
             reverse_indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), -1)
             for direction_priority, indexes in enumerate((forward_indexes, reverse_indexes)):
-                path = _dedupe_xy_path(
-                    [current] + [anchors[index] for index in indexes] + [target]
+                start_projection_point = _boundary_projection_waypoint(
+                    current_projection, anchors[start_index]
                 )
+                end_projection_point = _boundary_projection_waypoint(
+                    target_projection, anchors[end_index]
+                )
+                path = [current]
+                if start_projection_point is not None:
+                    path.append(start_projection_point)
+                path.extend(anchors[index] for index in indexes)
+                if end_projection_point is not None:
+                    path.append(end_projection_point)
+                path.append(target)
+                path = _dedupe_xy_path(path)
                 length = sum(
                     _length_cm(path[index], path[index + 1])
                     for index in range(len(path) - 1)
