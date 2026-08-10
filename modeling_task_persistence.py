@@ -9,7 +9,11 @@ except NameError:
     text_type = str
 
 
-INVALID_TASK_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Keep the regular expression itself as Unicode.  On Python 2.7 a byte-pattern
+# character class containing ``\x00-\x1f`` can incorrectly match the first
+# character of a non-ASCII Unicode task name, causing valid Chinese route names
+# to be rejected as unsafe.  Python 3 does not expose that behaviour.
+INVALID_TASK_NAME_CHARS = re.compile(u'[<>:"/\\|?*\x00-\x1f]')
 WINDOWS_RESERVED_NAMES = set(
     ["CON", "PRN", "AUX", "NUL"]
     + ["COM{}".format(index) for index in range(1, 10)]

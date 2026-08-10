@@ -9,6 +9,9 @@ from modeling_task_persistence import (
 
 
 class ModelingTaskPersistenceTest(unittest.TestCase):
+    def test_normalize_task_name_accepts_chinese_unicode_name(self):
+        self.assertEqual(normalize_task_name(u"测试路线"), u"测试路线")
+
     def test_builds_named_robot_task_from_ready_modeling_plan(self):
         base_config = {
             "goBackLen": 10,
