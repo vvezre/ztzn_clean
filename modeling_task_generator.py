@@ -69,6 +69,22 @@ def _round_int(value):
     return int(math.ceil(number - 0.5))
 
 
+def _stable_cost_key(value):
+    """Return a Python-2/3-stable integer key for route-cost comparison.
+
+    Route candidates are scored with Euclidean floating-point distances.  Two
+    geometrically symmetric candidates can therefore differ only in the last
+    binary floating-point bits on Python 2 and Python 3.  That meaningless
+    difference must not override the explicit deterministic tie breakers
+    (lane order and first-lane direction) below.
+
+    Costs use centimetres, so quantising to 0.001 cm keeps far more precision
+    than the robot can physically execute while producing the same ordering on
+    both interpreters.
+    """
+    return _round_int(float(value) * 1000.0)
+
+
 def _normalize_heading(value):
     number = _number(value)
     if number is None:
@@ -952,9 +968,11 @@ def _select_group_lane_segments(preview, group_id, entry, exit_point):
     selected = min(
         candidates,
         key=lambda candidate: (
-            candidate["endpointCost"],
-            candidate["overlapDeviation"] * OVERLAP_DEVIATION_WEIGHT,
-            candidate["routeCost"],
+            _stable_cost_key(candidate["endpointCost"]),
+            _stable_cost_key(
+                candidate["overlapDeviation"] * OVERLAP_DEVIATION_WEIGHT
+            ),
+            _stable_cost_key(candidate["routeCost"]),
             len(candidate["segments"]),
             candidate["reverseOrder"],
             candidate["reverseFirst"],

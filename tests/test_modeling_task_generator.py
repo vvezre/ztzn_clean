@@ -2,6 +2,16 @@ import unittest
 
 
 class ModelingTaskGeneratorTest(unittest.TestCase):
+    def test_route_cost_key_ignores_interpreter_level_float_noise(self):
+        from modeling_task_generator import _stable_cost_key
+
+        # Python 3 and the vehicle's Python 2.7 can produce these two values
+        # for the same symmetric route.  They must remain a deterministic tie.
+        self.assertEqual(
+            _stable_cost_key(236.53595992744647),
+            _stable_cost_key(236.53595992744644),
+        )
+
     def test_round_int_uses_same_half_away_from_zero_rule_on_python2_and_python3(self):
         from modeling_task_generator import _round_int
 
