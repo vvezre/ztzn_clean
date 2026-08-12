@@ -1,3 +1,4 @@
+# coding=utf-8
 import unittest
 
 
@@ -158,6 +159,57 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertAlmostEqual(inbound[1][1], projection[1], places=6)
         self.assertEqual(inbound[2], bridge)
 
+    def test_bridge_projection_splits_edge_instead_of_visiting_corner_and_backtracking(self):
+        """连接桥落在A2--A3边中部时，应从A2直达投影点，不能先到A3再折返。"""
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _group_anchor_transition_points,
+            _nearest_boundary_projection,
+        )
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        # “三区域测试1”中区域1和区域3连接位置的实际坐标。L3在区域1
+        # 的A2--A3边外侧，最近边界点Q应把这条边切开。
+        anchors = [
+            point("A1", 0.0, 0.0),
+            point("A2", 9.869, 121.403),
+            point("A3", 936.484, 44.456),
+            point("A4", 924.522, -83.763),
+        ]
+        draft = {
+            "groups": [{"id": "g1", "areaNumber": 1, "points": anchors}],
+            "groupLinks": [],
+        }
+        mapper = _CoordinateMapper(draft)
+        origin = mapper.point_to_xy(anchors[0])
+        bridge = (823.503, 103.222)
+        recorded_xy = [mapper.point_to_xy(item) for item in anchors]
+        projection = _nearest_boundary_projection(bridge, recorded_xy)["point"]
+
+        path = _group_anchor_transition_points(
+            draft,
+            "g1",
+            origin,
+            bridge,
+            mapper,
+        )
+
+        self.assertEqual(path[0], origin)
+        self.assertEqual(path[1], mapper.point_to_xy(anchors[1]))
+        self.assertAlmostEqual(path[2][0], projection[0], places=6)
+        self.assertAlmostEqual(path[2][1], projection[1], places=6)
+        self.assertEqual(path[3], bridge)
+        self.assertEqual(len(path), 4)
+        self.assertNotIn(mapper.point_to_xy(anchors[2]), path)
+
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks
 
@@ -267,6 +319,77 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(len(compacted), 2)
         self.assertEqual((compacted[0]["endX"], compacted[0]["endY"]), (0, 100))
         self.assertEqual((compacted[1]["startX"], compacted[1]["startY"]), (0, 100))
+
+    def test_one_centimeter_pseudo_transfer_is_absorbed_without_losing_next_turn(self):
+        """亚厘米原始误差取整成1cm时，不得让小车额外移动并停车一次。"""
+        from modeling_task_generator import _compact_executable_tasks
+
+        tasks = [
+            {
+                "id": 1, "mode": 2, "areaNumber": 2,
+                "startX": 0, "startY": 0, "endX": 40, "endY": 416,
+                "startLat": 32.0, "startLon": 118.0,
+                "endLat": 32.00001, "endLon": 118.00001,
+                "heading": 5.5, "angle": 5.5, "length": 418,
+                "source": "modeling_start_to_first_lane",
+            },
+            {
+                "id": 2, "mode": 2, "areaNumber": 2,
+                "startX": 40, "startY": 416, "endX": 41, "endY": 416,
+                "startLat": 32.00001, "startLon": 118.00001,
+                "endLat": 32.00001, "endLon": 118.00002,
+                "heading": 90.0, "angle": 90.0, "length": 1,
+                "source": "modeling_start_to_first_lane",
+            },
+            {
+                "id": 3, "mode": 1, "areaNumber": 2,
+                "startX": 41, "startY": 416, "endX": 403, "endY": 382,
+                "startLat": 32.00001, "startLon": 118.00002,
+                "endLat": 32.00002, "endLon": 118.00003,
+                "heading": 95.4, "angle": 95.4, "length": 364,
+                "source": "modeling_clean",
+            },
+        ]
+
+        compacted = _compact_executable_tasks(tasks)
+
+        self.assertEqual(len(compacted), 2)
+        self.assertEqual((compacted[0]["endX"], compacted[0]["endY"]), (40, 416))
+        self.assertEqual((compacted[1]["startX"], compacted[1]["startY"]), (40, 416))
+        self.assertEqual((compacted[1]["endX"], compacted[1]["endY"]), (403, 382))
+        self.assertEqual(compacted[1]["mode"], 1)
+        self.assertAlmostEqual(compacted[1]["heading"], 95.4, places=1)
+
+    def test_three_centimeter_transfer_and_explicit_short_stop_are_preserved(self):
+        """达到3cm的真实移动和显式停车标记都不能被近点规则删除。"""
+        from modeling_task_generator import _compact_executable_tasks
+
+        def task(task_id, start, end, preserve=False):
+            return {
+                "id": task_id, "mode": 2, "areaNumber": 1,
+                "startX": start[0], "startY": start[1],
+                "endX": end[0], "endY": end[1],
+                "startLat": 32.0, "startLon": 118.0,
+                "endLat": 32.0, "endLon": 118.0,
+                "heading": 90.0, "angle": 90.0,
+                "length": abs(end[0] - start[0]),
+                "source": "test",
+                "preserveEndStop": preserve,
+            }
+
+        three_cm = _compact_executable_tasks([
+            task(1, (0, 0), (3, 0)),
+            task(2, (3, 0), (3, 100), preserve=True),
+        ])
+        explicit_one_cm = _compact_executable_tasks([
+            task(1, (0, 0), (1, 0), preserve=True),
+            task(2, (1, 0), (1, 100)),
+        ])
+
+        self.assertEqual(len(three_cm), 2)
+        self.assertEqual((three_cm[0]["startX"], three_cm[0]["endX"]), (0, 3))
+        self.assertEqual(len(explicit_one_cm), 2)
+        self.assertTrue(explicit_one_cm[0]["preserveEndStop"])
 
     def test_explicit_stop_boundary_is_not_removed_by_transition_simplification(self):
         from modeling_task_generator import _compact_executable_tasks
@@ -388,6 +511,88 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             (task["endX"], task["endY"]) for task in tasks
         }
         self.assertTrue(connector_coordinates.isdisjoint(executable_endpoints))
+
+    def test_test12_area_order_two_then_one_has_no_one_centimeter_pseudo_task(self):
+        """test12按[2,1]执行时，A6直接作为区域2第一条清扫线起点。"""
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        home_points = [
+            point("A1", 0.0, 0.0),
+            point("A2", 10.708, 127.296),
+            point("A3", 954.092, 52.061),
+            point("A4", 946.118, -76.013),
+        ]
+        remote_points = [
+            point("A5", 36.309, 283.536),
+            point("A6", 40.466, 415.813),
+            point("A7", 403.409, 381.877),
+            point("A8", 392.202, 247.164),
+        ]
+        link_points = [
+            point("L1", 31.474, 177.712),
+            point("L2", 33.774, 231.474),
+        ]
+        draft = {
+            "id": "test12-area-order-2-1",
+            "recognition": {"confirmed": True},
+            "groups": [
+                {
+                    "id": "home",
+                    "areaNumber": 1,
+                    "points": home_points,
+                    "subAreas": [{"id": "home-area", "pointIds": [p["id"] for p in home_points]}],
+                },
+                {
+                    "id": "remote",
+                    "areaNumber": 2,
+                    "points": remote_points,
+                    "subAreas": [{"id": "remote-area", "pointIds": [p["id"] for p in remote_points]}],
+                },
+            ],
+            "groupLinks": [{
+                "id": "bridge",
+                "startGroupId": "home",
+                "endGroupId": "remote",
+                "status": "ready",
+                "points": link_points,
+            }],
+            "routePolicy": {"type": "area_order", "areaOrder": [2, 1]},
+        }
+        draft["taskPreview"] = build_model_preview(draft, now=1000)
+
+        plan = generate_task_plan(draft, now=2000)
+        tasks = plan["tasks"]
+
+        self.assertEqual(plan["areaOrder"], [2, 1])
+        self.assertEqual(plan["summary"]["taskCount"], 16)
+        self.assertEqual(plan["summary"]["cleanTaskCount"], 8)
+        self.assertEqual(
+            (tasks[0]["startX"], tasks[0]["startY"], tasks[0]["endX"], tasks[0]["endY"]),
+            (0, 0, 40, 416),
+        )
+        self.assertEqual(tasks[1]["mode"], 1)
+        self.assertEqual(
+            (tasks[1]["startX"], tasks[1]["startY"], tasks[1]["endX"], tasks[1]["endY"]),
+            (40, 416, 403, 382),
+        )
+        self.assertFalse([
+            task for task in tasks
+            if int(task.get("mode") or 0) == 2 and int(task.get("length") or 0) < 3
+        ])
+        self.assertTrue(all(
+            (left["endX"], left["endY"]) == (right["startX"], right["startY"])
+            for left, right in zip(tasks, tasks[1:])
+        ))
 
     def test_generate_task_plan_starts_and_ends_at_first_recorded_point(self):
         from modeling_task_generator import generate_task_plan

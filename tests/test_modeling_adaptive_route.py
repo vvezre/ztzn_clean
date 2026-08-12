@@ -169,13 +169,14 @@ class ModelingAdaptiveRouteTest(unittest.TestCase):
             for task in tasks[last_area_one_task + 1:first_area_three_task]
             for prefix in ("start", "end")
         }
-        # 区域1桥头、区域2左下桥头与左侧边界近似共线，普通移动点会被
-        # 合并，不要求逐点停车。右侧桥头(400,300)更靠近区域2右上角，
-        # 因此必须沿记录边界经过左上、右上角，不能斜穿到右下角。
-        self.assertIn((0, 356), transfer_points)
-        self.assertIn((400, 356), transfer_points)
+        # 区域2右侧桥头(400,300)位于右边界中部。投影点会把右边界切开，
+        # 程序比较完整的上下两条边界路线后，应走更短的左下->右下->投影，
+        # 而不是因投影略靠近右上角就绕行左上、右上再折返。
+        self.assertIn((400, 228), transfer_points)
         self.assertIn((400, 300), transfer_points)
         self.assertIn((500, 300), transfer_points)
+        self.assertNotIn((0, 356), transfer_points)
+        self.assertNotIn((400, 356), transfer_points)
 
         self.assertEqual((tasks[0]["startX"], tasks[0]["startY"]), (0, 0))
         self.assertEqual((tasks[-1]["endX"], tasks[-1]["endY"]), (0, 0))

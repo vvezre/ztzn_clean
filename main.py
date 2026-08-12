@@ -73,7 +73,6 @@ from edge_target_guard import (
     should_accept_edge_stop,
     should_recover_from_edge_stop,
 )
-from DynamicCronScheduler import DynamicCronScheduler
 from FixedPositiveChecker import FixedPositiveChecker
 
 from flask_cors import CORS
@@ -4261,7 +4260,17 @@ def autoDriveByRTKThread(task_token=None):
     global global_auto_clean_stop
     # 任务线程可能由接口启动，也可能由循环自动清扫复用；没有 token 时先登记为新的自动清扫任务。
     if task_token is None:
-        task_token = _begin_runtime_task('auto_drive')
+        # Normal manual/MQTT starts pass through _start_runtime_thread, which
+        # checks the lifecycle under TASK_SWITCH_LOCK before creating a token.
+        # Reject direct background calls while a task is active so they cannot
+        # replace the active token and make the running route stop as stale.
+        with TASK_SWITCH_LOCK:
+            if not _can_start_runtime_task():
+                logger.warning(
+                    "direct autoDriveByRTKThread call rejected: runtime task is already active"
+                )
+                return 0
+            task_token = _begin_runtime_task('auto_drive')
     # 如果当前线程已经不是最新任务，或已收到停止信号，直接退出，避免旧线程继续控车。
     if _runtime_task_should_stop(task_token, 'auto_drive'):
         logger.warn("auto clean task token is no longer active; exit")
@@ -9241,9 +9250,6 @@ def init_mqtt(redis_client=None):
 #         json_data = json.loads(payload)
 #         command = json_data['command']
 #         logger.info("执行命令：{}".format(command))
-#     elif topic == setCronTopic:
-#         redis_cli.set('taskCron', payload)
-#         dyn_scheduler.update_cron("autoDrive", payload)
 #
 # # 创建客户端实例（使用公共测试服务器）
 # mqtt_client = MqttClient(
@@ -9279,8 +9285,6 @@ def init_mqtt(redis_client=None):
 # controllerTopic = "vehicle/" + vehicleId + "/controller"
 # mqtt_client.subscribe(controllerTopic)
 # # 设置cron主题
-# setCronTopic = "vehicle/" + vehicleId + "/setCron"
-# mqtt_client.subscribe(setCronTopic)
 # # 发布消息
 # mqtt_client.publish(registerTopic, json.dumps(registerInfo))
 #
@@ -9300,26 +9304,6 @@ def init_mqtt(redis_client=None):
 #             }}
 #         mqtt_client.publish(hearBeatTopic, json.dumps(hearbeatInfo))
 #         time.sleep(5)
-
-# 启动定时任务
-def task_hello():
-    logger.info("hello")
-
-# 创建调度器实例
-dyn_scheduler = DynamicCronScheduler()
-cron = redis_cli.get('taskCron')
-if cron == None:
-    cron = "0 10 * * *"
-# 添加任务：每分钟执行
-# dyn_scheduler.add_job("myjob", task_hello, cron="*/10 * * * *")
-dyn_scheduler.add_job("autoDrive", autoDriveByRTKThread, cron=cron)
-
-@app.route("/vehicle/updateCron", methods=['GET'])
-def updateCron():
-    cron = request.args.get('cron')
-    redis_cli.set('taskCron', cron)
-    dyn_scheduler.update_cron("autoDrive", cron)
-    return make_response("设置成功")
 
 def main():
     _mark_runtime_initializing('系统启动，正在初始化配置和运行环境', 'main_start')

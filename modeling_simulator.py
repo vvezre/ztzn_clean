@@ -51,13 +51,27 @@ SCENARIO_POINTS = (
     {"pointType": "area", "name": "home_upper_left", "x": 7.362, "y": 117.944},
     {"pointType": "area", "name": "home_upper_right", "x": 344.374, "y": 86.365},
     {"pointType": "area", "name": "home_lower_right", "x": 342.394, "y": -61.646},
-    {"pointType": "link", "name": "bridge_start", "x": 9.502, "y": 170.529},
-    {"pointType": "link", "name": "bridge_end", "x": 10.576, "y": 204.143},
-    {"pointType": "area", "name": "remote_lower_left", "x": 16.882, "y": 260.830},
-    {"pointType": "area", "name": "remote_upper_left", "x": 23.914, "y": 399.779},
-    {"pointType": "area", "name": "remote_upper_right", "x": 379.429, "y": 363.040},
-    {"pointType": "area", "name": "remote_lower_right", "x": 368.523, "y": 235.322},
+    {"pointType": "link", "name": "bridge_1_start", "x": 9.502, "y": 170.529},
+    {"pointType": "link", "name": "bridge_1_end", "x": 10.576, "y": 204.143},
+    {"pointType": "area", "name": "upper_lower_left", "x": 16.882, "y": 260.830},
+    {"pointType": "area", "name": "upper_upper_left", "x": 23.914, "y": 399.779},
+    {"pointType": "area", "name": "upper_upper_right", "x": 379.429, "y": 363.040},
+    {"pointType": "area", "name": "upper_lower_right", "x": 368.523, "y": 235.322},
+    # Bridge 2 joins the midpoint of area two's right edge to the midpoint of
+    # area three's left edge.  Area three keeps the same tilted footprint as
+    # area two and is translated to its right.
+    {"pointType": "link", "name": "bridge_2_start", "x": 373.976, "y": 299.181},
+    {"pointType": "link", "name": "bridge_2_end", "x": 433.516, "y": 299.182},
+    {"pointType": "area", "name": "right_lower_left", "x": 430.000, "y": 229.707},
+    {"pointType": "area", "name": "right_upper_left", "x": 437.032, "y": 368.656},
+    {"pointType": "area", "name": "right_upper_right", "x": 792.547, "y": 331.917},
+    {"pointType": "area", "name": "right_lower_right", "x": 781.641, "y": 204.199},
 )
+
+# A new area must be created immediately before recording scenario points 7
+# and 13 (zero-based indexes 6 and 12).  Keeping these boundaries explicit
+# makes the manual MQTT flow and the automatic preload flow identical.
+SCENARIO_NEW_AREA_INDEXES = frozenset((6, 12))
 
 
 class ModelingSimulatorError(Exception):
@@ -414,7 +428,7 @@ class ModelingSimulatorController(object):
             self.player.cancel()
             started = self.session.start("simulator-two-areas", restart=True)
             for index, spec in enumerate(SCENARIO_POINTS):
-                if index == 6:
+                if index in SCENARIO_NEW_AREA_INDEXES:
                     self.session.new_area()
                 if spec["pointType"] == "area":
                     self._record("area", self.session.record_area_point)
@@ -526,6 +540,13 @@ class ModelingSimulatorController(object):
             return result
         return self._call("simulation modeling path generated", action)
 
+    def replan_modeling_route(self, area_order):
+        def action():
+            result = self.session.replan(area_order)
+            self.player.load(result.get("taskPlan"))
+            return result
+        return self._call("simulation modeling route replanned", action)
+
     def get_modeling_path(self, model_id=None):
         def action():
             result = self.session.current_path()
@@ -550,6 +571,7 @@ class ModelingSimulatorController(object):
                 )
             self.player.load(task_plan)
             return {
+                "areaOrder": task_plan.get("areaOrder") or [],
                 "areaPoints": _frontend_area_points(draft),
                 "linkPoints": _frontend_link_points(draft),
                 "pathPoints": _frontend_path_points(task_plan),
@@ -610,6 +632,9 @@ class ModelingSimulatorController(object):
                     "modelId": saved.get("modelId"),
                     "current": name == current_task_name,
                     "taskCount": len(task_plan.get("tasks") or []),
+                    # Match the real FSM saved-routes response: every named
+                    # route carries the area order used to generate its path.
+                    "areaOrder": copy.deepcopy(task_plan.get("areaOrder") or []),
                     "areaPoints": _frontend_area_points(model),
                     "linkPoints": _frontend_link_points(model),
                     "pathPoints": _frontend_path_points(task_plan),

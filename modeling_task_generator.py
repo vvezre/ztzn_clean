@@ -33,6 +33,13 @@ BOUNDARY_CORNER_SNAP_CM = 20.0
 # test12 中16～18度的采样摆动可以连续直行，而实际90度连接桥转角一定会被保留。
 TRANSFER_HARD_TURN_DEG = 30.0
 
+# 小于3厘米的普通转场低于当前RTK点到点导航的有效执行尺度，不应单独形成
+# “移动几乎看不见、但停车并重新下发下一任务”的伪任务。这里只处理mode=2
+# 普通转场；清扫线本身以及带preserveStartStop/preserveEndStop的显式停车点
+# 永远保留。被吸收后，下一任务的起点会回填到上一任务终点，并重新计算
+# 航向与长度，因此真正的90度转向仍然存在，只是不再多停一次。
+MIN_EXECUTABLE_TRANSFER_CM = 3.0
+
 # 入口和出口首先决定清扫线奇偶及S形方向；在端点代价相近时，再用目标重叠
 # 偏差区分候选。该权重只参与同一端点方案内的排序，不是覆盖硬限制。
 OVERLAP_DEVIATION_WEIGHT = 2.0
@@ -244,6 +251,88 @@ def _segment_task(start, end, mode, area_number, task_id, mapper, source):
     }
 
 
+def _refresh_task_geometry(task):
+    """根据任务当前的整数厘米起终点，重新计算航向和长度。"""
+    start = (_number(task.get("startX")), _number(task.get("startY")))
+    end = (_number(task.get("endX")), _number(task.get("endY")))
+    if None in start or None in end:
+        return task
+    length = _length_cm(start, end)
+    heading = _heading_from_xy(start, end)
+    task["heading"] = heading
+    task["angle"] = heading
+    task["length"] = _round_int(length)
+    return task
+
+
+def _reanchor_task_start(task, source_task):
+    """把task起点吸附到source_task起点，并同步坐标、经纬度和任务几何。"""
+    task = dict(task)
+    task["startX"] = source_task.get("startX")
+    task["startY"] = source_task.get("startY")
+    task["startLat"] = source_task.get("startLat")
+    task["startLon"] = source_task.get("startLon")
+    return _refresh_task_geometry(task)
+
+
+def _reanchor_task_end(task, source_task):
+    """把task终点吸附到source_task终点，并同步坐标、经纬度和任务几何。"""
+    task = dict(task)
+    task["endX"] = source_task.get("endX")
+    task["endY"] = source_task.get("endY")
+    task["endLat"] = source_task.get("endLat")
+    task["endLon"] = source_task.get("endLon")
+    return _refresh_task_geometry(task)
+
+
+def _remove_short_transfer_tasks(tasks):
+    """
+    吸收低于导航有效尺度的普通转场，同时保持整条任务链首尾连续。
+
+    典型情况是记录点A6与浮点计算得到的首条清扫线起点实际只差零点几
+    毫米，却因分别取整落在40cm和41cm，形成1cm独立任务。中间短转场
+    被删除时，下一任务起点改为短转场起点；末尾短转场则把上一任务终点
+    延伸到短转场终点。这样不会跳点，也不会删除下一段自身的目标方向。
+    """
+    compacted = [dict(task) for task in (tasks or [])]
+    index = 0
+    while index < len(compacted):
+        task = compacted[index]
+        start = (_number(task.get("startX")), _number(task.get("startY")))
+        end = (_number(task.get("endX")), _number(task.get("endY")))
+        length = None if None in start or None in end else _length_cm(start, end)
+        removable = (
+            int(task.get("mode") or 0) == 2
+            and length is not None
+            and length < MIN_EXECUTABLE_TRANSFER_CM
+            and not task.get("preserveStartStop")
+            and not task.get("preserveEndStop")
+        )
+        if not removable:
+            index += 1
+            continue
+
+        previous = compacted[index - 1] if index > 0 else None
+        following = compacted[index + 1] if index + 1 < len(compacted) else None
+
+        # 中间或开头的短转场：下一任务从短转场起点直接出发。前一任务
+        # 仍会正常停车；下一任务仍按自己的终点重新计算航向。
+        if following is not None:
+            compacted[index + 1] = _reanchor_task_start(following, task)
+            del compacted[index]
+            continue
+
+        # 末尾短转场：上一任务直接落到原短转场终点，保证闭环终点不变。
+        if previous is not None:
+            compacted[index - 1] = _reanchor_task_end(previous, task)
+            del compacted[index]
+            index = max(0, index - 1)
+            continue
+
+        del compacted[index]
+    return compacted
+
+
 def _same_direction_collinear(left, right):
     """判断两个首尾相接的任务段能否作为一条直线连续执行。"""
     if int(left.get("mode") or 0) != int(right.get("mode") or 0):
@@ -441,6 +530,10 @@ def _compact_executable_tasks(tasks):
     区域边界采样点、前端绘图点或连接桥中间点只有在真正形成拐角时才会留下；
     清扫模式发生变化或显式标记为必须停车的位置永远不会被跨越合并。
     """
+    # 先吸收低于导航有效尺度的普通短转场，避免毫米级浮点误差取整后变成
+    # 1厘米独立停车任务。随后再执行原有的共线合并和转角简化。
+    tasks = _remove_short_transfer_tasks(tasks)
+
     # Preserve the old exact-collinear behaviour for every task mode first.
     # This also keeps compatibility with existing saved plans and tests.
     exactly_compacted = []
@@ -784,14 +877,33 @@ def _nearest_boundary_projection(point, anchors):
 
 
 def _boundary_anchor_candidates(projection, anchors):
-    """返回投影所在边上距离投影最近的那个记录角点。"""
+    """
+    返回投影所在边的两个端点，并把较近端点放在前面。
+
+    投影点相当于把原边界边切成了两段。例如连接桥投影 Q 位于 A2--A3
+    中间时，从 A1 前往 Q 既可以沿 A1--A2--Q，也可以沿另一侧边界到
+    A3--Q。旧逻辑只返回离 Q 最近的 A3，会错误地排除 A2 方向，导致
+    小车先到 A3 再折返 Q。两个端点都作为候选后，由完整边界路径长度
+    自动选择较短方向，因此同一规则适用于任意边、任意倾斜区域和返程。
+    """
     for index, anchor in enumerate(anchors):
         if _is_same_point(anchor, projection["point"]):
             return [index]
     edge_index = projection["edgeIndex"]
-    if projection["ratio"] <= 0.5:
+    next_index = (edge_index + 1) % len(anchors)
+
+    # 投影已经落在角点吸附范围内时仍按该角点处理，避免桥头在角点附近
+    # 因几厘米测量误差绕过人工记录的明确拐点。只有真正位于边中部时才
+    # 把边切开，并同时比较经两个端点到达投影点的完整路径。
+    edge_distance = _length_cm(projection["point"], anchors[edge_index])
+    next_distance = _length_cm(projection["point"], anchors[next_index])
+    if edge_distance <= BOUNDARY_CORNER_SNAP_CM:
         return [edge_index]
-    return [(edge_index + 1) % len(anchors)]
+    if next_distance <= BOUNDARY_CORNER_SNAP_CM:
+        return [next_index]
+    if projection["ratio"] <= 0.5:
+        return [edge_index, next_index]
+    return [next_index, edge_index]
 
 
 def _boundary_projection_waypoint(projection, anchor):

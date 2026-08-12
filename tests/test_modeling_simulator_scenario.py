@@ -3,13 +3,16 @@ import unittest
 
 
 class ModelingSimulatorScenarioTest(unittest.TestCase):
-    def test_fixed_points_match_the_recent_tilted_two_area_model(self):
-        from modeling_simulator import SCENARIO_POINTS
+    def test_fixed_points_define_three_tilted_areas_and_two_bridges(self):
+        from modeling_simulator import SCENARIO_NEW_AREA_INDEXES, SCENARIO_POINTS
 
         self.assertEqual(
             [point["pointType"] for point in SCENARIO_POINTS],
-            ["area"] * 4 + ["link"] * 2 + ["area"] * 4,
+            ["area"] * 4 + ["link"] * 2
+            + ["area"] * 4 + ["link"] * 2
+            + ["area"] * 4,
         )
+        self.assertEqual(SCENARIO_NEW_AREA_INDEXES, frozenset((6, 12)))
         self.assertEqual(
             [(point["x"], point["y"]) for point in SCENARIO_POINTS],
             [
@@ -23,10 +26,16 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
                 (23.914, 399.779),
                 (379.429, 363.040),
                 (368.523, 235.322),
+                (373.976, 299.181),
+                (433.516, 299.182),
+                (430.000, 229.707),
+                (437.032, 368.656),
+                (792.547, 331.917),
+                (781.641, 204.199),
             ],
         )
 
-    def test_preloaded_realistic_scenario_generates_four_lanes_per_area(self):
+    def test_preloaded_realistic_scenario_selects_adaptive_lanes_per_area(self):
         from modeling_simulator import ModelingSimulatorController
 
         with tempfile.TemporaryDirectory() as directory:
@@ -34,8 +43,8 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
             result = controller.preload_scenario()
 
             self.assertTrue(result["success"])
-            self.assertEqual(result["data"]["areaPointCount"], 8)
-            self.assertEqual(result["data"]["linkPointCount"], 2)
+            self.assertEqual(result["data"]["areaPointCount"], 12)
+            self.assertEqual(result["data"]["linkPointCount"], 4)
 
             state = controller.session.current()
             draft = controller.store.get_draft(state["modelId"])
@@ -47,11 +56,12 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
                 for sub_area in group.get("subAreas") or []
             ]
 
-            self.assertEqual(lanes, [4, 4])
-            self.assertEqual(plan["summary"]["cleanTaskCount"], 8)
+            self.assertEqual(lanes, [4, 3, 4])
+            self.assertEqual(plan["areaOrder"], [1, 2, 3])
+            self.assertEqual(plan["summary"]["cleanTaskCount"], 11)
             self.assertEqual(
                 [task["areaNumber"] for task in plan["tasks"] if task["mode"] == 1],
-                [2, 2, 2, 2, 1, 1, 1, 1],
+                [1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3],
             )
             self.assertEqual(
                 (plan["tasks"][0]["startX"], plan["tasks"][0]["startY"]),
@@ -62,12 +72,27 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
                 (0, 0),
             )
 
+            saved = controller.save_modeling_task("ordered-route")
+            listed = controller.get_saved_routes()
+
+            self.assertTrue(saved["success"])
+            self.assertTrue(listed["success"])
+            self.assertEqual(
+                listed["data"]["routes"][0]["areaOrder"],
+                [1, 2, 3],
+            )
+
     def test_clear_all_returns_fixed_scenario_to_first_area_and_first_point(self):
         from modeling_simulator import ModelingSimulatorController
 
         with tempfile.TemporaryDirectory() as directory:
             controller = ModelingSimulatorController(directory, now=lambda: 1000)
             controller.start_modeling(restart=True)
+            for _ in range(4):
+                self.assertTrue(controller.sample_modeling_point()["success"])
+            for _ in range(2):
+                self.assertTrue(controller.sample_modeling_link_point()["success"])
+            self.assertTrue(controller.new_modeling_area()["success"])
             for _ in range(4):
                 self.assertTrue(controller.sample_modeling_point()["success"])
             for _ in range(2):

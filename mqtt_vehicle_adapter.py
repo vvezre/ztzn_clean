@@ -23,6 +23,29 @@ from modeling_frontend import (
     frontend_path_points,
 )
 
+try:
+    text_type = unicode
+except NameError:
+    text_type = str
+
+
+def _utf8_query_params(params):
+    """Prepare query parameters for Python 2.7 and Python 3.
+
+    Python 2.7 ``urllib.urlencode`` converts Unicode values through ASCII and
+    fails before sending route names such as ``8.12测试``.  Explicitly encode
+    Unicode keys and values as UTF-8 bytes so ``urlencode`` percent-encodes
+    them correctly.  Numeric and boolean parameters keep their current form.
+    """
+    encoded = {}
+    for key, value in (params or {}).items():
+        if isinstance(key, text_type) and not isinstance(key, bytes):
+            key = key.encode('utf-8')
+        if isinstance(value, text_type) and not isinstance(value, bytes):
+            value = value.encode('utf-8')
+        encoded[key] = value
+    return encoded
+
 # Keep the original helper names for the local-only modeling simulator.
 _frontend_area_points = frontend_area_points
 _frontend_link_points = frontend_link_points
@@ -68,7 +91,7 @@ class VehicleControllerAdapter(object):
         """
         url = self.base_url + path
         if params:
-            url = url + '?' + urlencode(params)
+            url = url + '?' + urlencode(_utf8_query_params(params))
         headers = {}
         payload = None
         if json_data is not None:

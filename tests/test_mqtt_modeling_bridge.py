@@ -432,6 +432,30 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/session/save-task")
         self.assertEqual(adapter.json_data, {"taskName": u"测试6"})
 
+    def test_adapter_utf8_encodes_unicode_current_task_query(self):
+        import io
+        from unittest.mock import patch
+
+        import mqtt_vehicle_adapter as adapter_module
+
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.get_full_url()
+            return io.BytesIO(
+                b'{"success":true,"data":{"taskName":"8.12\\u6d4b\\u8bd5"}}'
+            )
+
+        adapter = adapter_module.VehicleControllerAdapter(
+            base_url="http://127.0.0.1:7899",
+        )
+        with patch.object(adapter_module, "urlopen", side_effect=fake_urlopen):
+            result = adapter.set_current_task(u"8.12\u6d4b\u8bd5")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["taskName"], u"8.12\u6d4b\u8bd5")
+        self.assertIn("taskName=8.12%E6%B5%8B%E8%AF%95", captured["url"])
+
     def test_adapter_preserves_modeling_http_error_payload(self):
         import io
         from unittest.mock import patch

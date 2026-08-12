@@ -420,6 +420,24 @@ class RuntimeStateModelTest(unittest.TestCase):
             worker_body.index("goOutGarage(backLength)"),
         )
 
+    def test_automatic_cleaning_has_no_time_based_scheduler(self):
+        source = read_main_source()
+
+        self.assertNotIn("DynamicCronScheduler", source)
+        self.assertNotIn("dyn_scheduler", source)
+        self.assertNotIn("redis_cli.get('taskCron')", source)
+        self.assertNotIn('@app.route("/vehicle/updateCron"', source)
+
+    def test_direct_auto_drive_worker_cannot_replace_active_task_token(self):
+        source = read_main_source()
+        body = function_body(source, "autoDriveByRTKThread")
+
+        none_guard = body.index("if task_token is None:")
+        startability_check = body.index("if not _can_start_runtime_task():", none_guard)
+        token_creation = body.index("task_token = _begin_runtime_task('auto_drive')", none_guard)
+        self.assertLess(startability_check, token_creation)
+        self.assertIn("with TASK_SWITCH_LOCK:", body[none_guard:token_creation])
+
     def test_go_to_points_failure_cannot_be_reported_as_complete(self):
         source = read_main_source()
         body = function_body(source, "goToPointsThread")
