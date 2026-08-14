@@ -245,6 +245,53 @@ class ModelingPreviewTest(unittest.TestCase):
         # 两条真实边界可以有不同航向，不能再强迫它们绝对平行。
         self.assertNotEqual(lanes[0]["heading"], lanes[-1]["heading"])
 
+    def test_multi_point_boundary_lanes_keep_recorded_folds_and_interior_lanes_are_straight(self):
+        from modeling_preview import build_model_preview
+
+        # 从左下角开始，先沿左侧向上记录；上下两条真实边界都包含人工记录的波动点。
+        points = [
+            _point("p1", 0, 0),
+            _point("p2", 2, 50),
+            _point("p3", 0, 100),
+            _point("p4", 50, 108),
+            _point("p5", 100, 92),
+            _point("p6", 200, 100),
+            _point("p7", 198, 50),
+            _point("p8", 200, 0),
+            _point("p9", 150, -5),
+            _point("p10", 75, 8),
+        ]
+        draft = {
+            "id": "folded-boundary",
+            "recognition": {"confirmed": True},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{"id": "sa1", "pointIds": [point["id"] for point in points]}],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+        lanes = preview["groups"][0]["subAreas"][0]["lanes"]
+
+        self.assertEqual(lanes[0]["laneType"], "boundary")
+        self.assertEqual(lanes[-1]["laneType"], "boundary")
+        self.assertEqual(
+            [(point["x"], point["y"]) for point in lanes[0]["pathPoints"]],
+            [(0.0, 100.0), (50.0, 108.0), (100.0, 92.0), (200.0, 100.0)],
+        )
+        self.assertEqual(
+            [(point["x"], point["y"]) for point in lanes[-1]["pathPoints"]],
+            [(0.0, 0.0), (75.0, 8.0), (150.0, -5.0), (200.0, 0.0)],
+        )
+        self.assertTrue(all(
+            lane["laneType"] == "interior" and len(lane["pathPoints"]) == 2
+            for lane in lanes[1:-1]
+        ))
+
     def test_build_preview_requires_confirmed_recognition(self):
         from modeling_preview import ModelingPreviewError, build_model_preview
 

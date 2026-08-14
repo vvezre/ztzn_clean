@@ -32,6 +32,9 @@ BOUNDARY_CORNER_SNAP_CM = 20.0
 # 局部方向变化达到30度就认为是真实转弯，必须保留为任务端点，让小车停车重新转向。
 # test12 中16～18度的采样摆动可以连续直行，而实际90度连接桥转角一定会被保留。
 TRANSFER_HARD_TURN_DEG = 30.0
+# 同一条边界清扫折线也使用30度作为“必须停车重新转向”的阈值。小于该角度时，
+# 相邻点仍作为真实路径点保留，但执行器连续驶过，不关闭滚刷、不执行原地转向。
+CLEAN_PATH_HARD_TURN_DEG = 30.0
 
 # 小于3厘米的普通转场低于当前RTK点到点导航的有效执行尺度，不应单独形成
 # “移动几乎看不见、但停车并重新下发下一任务”的伪任务。这里只处理mode=2
@@ -118,6 +121,14 @@ def _heading_from_xy(start, end):
 def _length_cm(start, end):
     """使用勾股定理计算两个厘米坐标点之间的直线距离。"""
     return math.hypot(end[0] - start[0], end[1] - start[1])
+
+
+def _polyline_length_cm(points):
+    """计算有序点列的折线总长度；不足两个点时长度为0。"""
+    return sum(
+        _length_cm(points[index], points[index + 1])
+        for index in range(len(points) - 1)
+    )
 
 
 class _CoordinateMapper(object):
@@ -338,6 +349,10 @@ def _same_direction_collinear(left, right):
     if int(left.get("mode") or 0) != int(right.get("mode") or 0):
         return False
     if left.get("preserveEndStop") or right.get("preserveStartStop"):
+        return False
+    # 边界折线中的每个记录点都属于前端和小车共用的真实路径。即使三个点恰好
+    # 共线，也不能在任务压缩阶段删掉；是否停车由 turnAtStart/stopAtEnd 决定。
+    if left.get("continuousPathId") or right.get("continuousPathId"):
         return False
 
     left_end = (_number(left.get("endX")), _number(left.get("endY")))
@@ -574,13 +589,39 @@ def _compact_executable_tasks(tasks):
     return compacted
 
 
+def _lane_path_points(lane, reverse=False):
+    """
+    取出一条清扫线的完整路径。
+
+    新的边界 lane 使用 pathPoints 保存人工记录的折线；内部 lane 以及历史任务仍然
+    只有 start/end。reverse=True 时反转整个点列，而不只是交换首尾点，这样 S 形
+    反向经过边界时仍按相反顺序逐点行驶。
+    """
+    points = []
+    for point in lane.get("pathPoints") or []:
+        if not isinstance(point, dict):
+            continue
+        xy = (_number(point.get("x")), _number(point.get("y")))
+        if None in xy:
+            continue
+        if not points or not _is_same_point(points[-1], xy):
+            points.append(xy)
+
+    if len(points) < 2:
+        start = (_number(lane.get("startX")), _number(lane.get("startY")))
+        end = (_number(lane.get("endX")), _number(lane.get("endY")))
+        if None in start or None in end:
+            return None
+        points = [start, end]
+    return list(reversed(points)) if reverse else points
+
+
 def _lane_points(lane, reverse=False):
-    """取出一条清扫线的起终点；reverse=True 时交换起终点，用于生成 S 形往返。"""
-    start = (_number(lane.get("startX")), _number(lane.get("startY")))
-    end = (_number(lane.get("endX")), _number(lane.get("endY")))
-    if None in start or None in end:
+    """兼容旧调用方：返回完整清扫路径的首点和尾点。"""
+    points = _lane_path_points(lane, reverse=reverse)
+    if not points:
         return None
-    return (end, start) if reverse else (start, end)
+    return points[0], points[-1]
 
 
 def _draft_group_entry(draft, group_id, mapper):
@@ -1038,15 +1079,20 @@ def _select_group_lane_segments(preview, group_id, entry, exit_point):
             for reverse_first in (False, True):
                 segments = []
                 for index, lane in enumerate(ordered):
-                    points = _lane_points(lane, reverse=bool(index % 2) ^ reverse_first)
-                    if points is None:
+                    path = _lane_path_points(
+                        lane,
+                        reverse=bool(index % 2) ^ reverse_first,
+                    )
+                    if not path:
                         continue
                     segments.append({
                         "groupId": group_id,
                         "areaNumber": group.get("areaNumber") or 1,
-                        "start": points[0],
-                        "end": points[1],
+                        "start": path[0],
+                        "end": path[-1],
+                        "path": path,
                         "sourceId": lane.get("id"),
+                        "laneType": lane.get("laneType") or "interior",
                     })
                 if not segments:
                     continue
@@ -1057,7 +1103,9 @@ def _select_group_lane_segments(preview, group_id, entry, exit_point):
                     for index in range(len(segments) - 1)
                 )
                 clean_distance = sum(
-                    _length_cm(segment["start"], segment["end"])
+                    _polyline_length_cm(
+                        segment.get("path") or [segment["start"], segment["end"]]
+                    )
                     for segment in segments
                 )
                 overlap_deviation = sum(
@@ -1161,6 +1209,8 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
                     mapper,
                 )
             else:
+                # 相邻清扫线的端点已经位于同一侧边，保持现有单段换行逻辑；只有
+                # 两条真正的外边界清扫线需要逐点保留人工记录的波动形状。
                 transition_points = [current, segment["start"]]
             task_id = _append_xy_path(
                 tasks,
@@ -1170,20 +1220,78 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
                 task_id,
                 "modeling_transfer",
             )
-        # 真正的清扫线生成mode=1任务；它不会被20厘米直线容差规则合并。
-        task = _segment_task(
-            segment["start"],
-            segment["end"],
-            1,
-            segment["areaNumber"],
-            task_id,
-            mapper,
-            "modeling_clean",
-        )
-        if task is not None:
-            task["sourceLaneId"] = segment.get("sourceId")
-            tasks.append(task)
-            task_id += 1
+        # 内部清扫线只有首尾两个点，仍生成一个mode=1任务。边界清扫线的path则按
+        # 每两个相邻记录点拆段，但所有子段共享continuousPathId，执行时按转角决定
+        # 是连续经过还是停车转向。
+        path = list(segment.get("path") or [segment["start"], segment["end"]])
+        lane_tasks = []
+        for path_index in range(len(path) - 1):
+            task = _segment_task(
+                path[path_index],
+                path[path_index + 1],
+                1,
+                segment["areaNumber"],
+                task_id + len(lane_tasks),
+                mapper,
+                "modeling_clean",
+            )
+            if task is not None:
+                lane_tasks.append(task)
+
+        if lane_tasks:
+            if len(lane_tasks) > 1:
+                continuous_path_id = "{}:{}:{}".format(
+                    segment.get("groupId") or "group",
+                    segment.get("sourceId") or "lane",
+                    task_id,
+                )
+                hard_turns = []
+                for index in range(len(lane_tasks) - 1):
+                    start = (
+                        _number(lane_tasks[index].get("startX")),
+                        _number(lane_tasks[index].get("startY")),
+                    )
+                    middle = (
+                        _number(lane_tasks[index].get("endX")),
+                        _number(lane_tasks[index].get("endY")),
+                    )
+                    end = (
+                        _number(lane_tasks[index + 1].get("endX")),
+                        _number(lane_tasks[index + 1].get("endY")),
+                    )
+                    turn_angle = _turn_angle_degrees(start, middle, end)
+                    hard_turns.append(turn_angle >= CLEAN_PATH_HARD_TURN_DEG)
+
+                for index, task in enumerate(lane_tasks):
+                    task["continuousPathId"] = continuous_path_id
+                    task["continuousPathIndex"] = index + 1
+                    task["continuousPathCount"] = len(lane_tasks)
+                    task["turnAtStart"] = bool(index == 0 or hard_turns[index - 1])
+                    task["stopAtEnd"] = bool(index == len(lane_tasks) - 1 or hard_turns[index])
+                    if index > 0:
+                        task["turnAngleAtStart"] = round(
+                            _turn_angle_degrees(
+                                (
+                                    _number(lane_tasks[index - 1].get("startX")),
+                                    _number(lane_tasks[index - 1].get("startY")),
+                                ),
+                                (
+                                    _number(task.get("startX")),
+                                    _number(task.get("startY")),
+                                ),
+                                (
+                                    _number(task.get("endX")),
+                                    _number(task.get("endY")),
+                                ),
+                            ),
+                            1,
+                        )
+
+            for task in lane_tasks:
+                task["sourceLaneId"] = segment.get("sourceId")
+                task["laneType"] = segment.get("laneType") or "interior"
+                tasks.append(task)
+            task_id += len(lane_tasks)
             clean_count += 1
             current = segment["end"]
     return current, task_id, clean_count
@@ -1367,7 +1475,10 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
         raise ModelingTaskGenerationError("route policy produced no cleaning tasks")
     # 全部几何段生成后再合并近似直行的mode=2中间点，降低无意义停车次数。
     tasks = _compact_executable_tasks(tasks)
-    clean_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
+    # clean_count保持“清扫线数量”的历史含义；一条边界折线虽然会拆成多个连续
+    # mode=1执行子段，但对业务和前端仍然只算一条清扫线。
+    clean_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
+    transfer_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 2)
     _validate_continuous_round_trip(
         tasks,
         (mapper.origin["x"], mapper.origin["y"]),
@@ -1381,7 +1492,8 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
         "summary": {
             "taskCount": len(tasks),
             "cleanTaskCount": clean_count,
-            "transferTaskCount": len(tasks) - clean_count,
+            "cleanSegmentTaskCount": clean_segment_count,
+            "transferTaskCount": transfer_segment_count,
             "totalLengthCm": total_length,
         },
         "tasks": tasks,
@@ -1548,7 +1660,9 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
         )
 
     tasks = _compact_executable_tasks(tasks)
-    clean_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
+    # 边界折线的多个mode=1子段属于同一条清扫线，不能改变cleanTaskCount的历史含义。
+    clean_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
+    transfer_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 2)
     _validate_continuous_round_trip(tasks, origin)
     total_length = sum(int(task.get("length") or 0) for task in tasks)
     return {
@@ -1561,7 +1675,8 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
         "summary": {
             "taskCount": len(tasks),
             "cleanTaskCount": clean_count,
-            "transferTaskCount": len(tasks) - clean_count,
+            "cleanSegmentTaskCount": clean_segment_count,
+            "transferTaskCount": transfer_segment_count,
             "totalLengthCm": total_length,
         },
         "tasks": tasks,
@@ -1582,7 +1697,8 @@ def generate_task_plan(draft, now=None):
     4. 跨区域时按 groupLinks 中的连接点通过。
     5. 最后从末端返回 origin，并执行闭环校验。
 
-    summary.cleanTaskCount 只统计 mode=1 清扫段；
+    summary.cleanTaskCount 统计业务清扫线数量；边界折线拆成多个连续mode=1子段时仍只算一条线。
+    summary.cleanSegmentTaskCount 统计实际mode=1执行子段数量。
     summary.transferTaskCount 统计起点对接、换行、连接桥和回原点等 mode=2 移动段。
     """
     if not isinstance(draft, dict):

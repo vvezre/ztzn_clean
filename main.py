@@ -2991,6 +2991,34 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
         return global_cur_rtk_lat, global_cur_rtk_lon
 
     def navigate(current_lat, current_lon, end_lat, end_lon, runtime_speed, before_drive):
+        # 同一条边界折线的小角度中间点不需要停车原地转向。上一子段已经保持车辆
+        # 和滚刷运行，这里只用实时位置重新计算下一小段航向并更新点到点目标；RTK
+        # 直线控制器会连续修正到新目标。第一段、30度以上拐点和折线终点仍走下面
+        # 的AutoHeading流程，先停车转到正确方向再直行。
+        if segment.get('turnAtStart') is False:
+            distance, heading = util.get_distance_angle(
+                current_lat,
+                current_lon,
+                end_lat,
+                end_lon,
+            )
+            logger.warn(
+                "go to continuous boundary point: taskId={}, distance={:.3f}, heading={:.3f}".format(
+                    segment.get('id'),
+                    float(distance),
+                    float(heading),
+                )
+            )
+            if callable(before_drive):
+                before_drive()
+            return pointToPointByRTK(
+                current_lat,
+                current_lon,
+                end_lat,
+                end_lon,
+                heading,
+                runtime_speed,
+            )
         return pointToPointByRTKAutoHeading(
             current_lat,
             current_lon,

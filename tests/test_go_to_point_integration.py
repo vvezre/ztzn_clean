@@ -72,6 +72,15 @@ class GoToPointIntegrationTest(unittest.TestCase):
             body,
         )
 
+    def test_modeling_boundary_soft_turn_reuses_point_to_point_without_stationary_turn(self):
+        body = read_main()
+        segment_runner = function_body(body, "_run_task_segment_by_point_navigation")
+
+        self.assertIn("segment.get('turnAtStart') is False", segment_runner)
+        self.assertIn("go to continuous boundary point", segment_runner)
+        self.assertIn("return pointToPointByRTK(", segment_runner)
+        self.assertIn("return pointToPointByRTKAutoHeading(", segment_runner)
+
     def test_multi_waypoint_start_accepts_loop_options(self):
         body = read_main()
 

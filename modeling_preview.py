@@ -5,8 +5,8 @@
 
 1. 用区域前两个记录点确定一条边的方向，再旋转90度得到清扫主方向。
 2. 用“滚刷宽度 - 重叠宽度”得到目标线间距，并生成满足最低重叠的奇偶候选。
-3. 四点凸区域走两侧边界插值；其他多边形走平行线与多边形求交。
-4. 输出每条 lane 的起点、终点、航向、长度和实际间距，交给任务生成器排成 S 形。
+3. 按记录顺序把区域边界分为两条侧边和两条边界清扫线；边界清扫线保留全部记录点。
+4. 两条边界线之间生成平行直线，并输出给任务生成器排成 S 形。
 
 坐标约定：x 向东为正，y 向北为正，单位厘米；航向0度沿+y，90度沿+x。
 """
@@ -68,6 +68,25 @@ def _point_xy(point):
 def _distance(start, end):
     """计算两个相对坐标点之间的平面直线距离，返回单位为厘米。"""
     return math.hypot(end[0] - start[0], end[1] - start[1])
+
+
+def _path_length(points):
+    """计算折线路径总长度，单位厘米。"""
+    return sum(
+        _distance(points[index], points[index + 1])
+        for index in range(len(points) - 1)
+    )
+
+
+def _lane_path_payload(points):
+    """把内部浮点坐标整理成可保存、可传给任务生成器的折线点。"""
+    return [
+        {
+            "x": round(point[0], 1),
+            "y": round(point[1], 1),
+        }
+        for point in points
+    ]
 
 
 def _heading_from_points(start, end):
@@ -317,31 +336,131 @@ def _is_convex_quadrilateral(points):
     return all(sign == signs[0] for sign in signs[1:])
 
 
+def _recorded_boundary_paths(polygon_xy, direction, normal):
+    """
+    按人工记录顺序识别两条真正需要清扫的外边界折线。
+
+    区域点按一圈边界依次记录，第一个点位于第一条侧边的起点；自动清扫方向又与
+    第一段边界垂直。因此闭合边界的边序列应当依次呈现：
+
+        第一侧边 -> 第一外边界 -> 第二侧边 -> 第二外边界
+
+    这里不根据某个固定矩形坐标找四个角，而是枚举三个分割位置。每条边分别计算
+    在清扫方向 direction 和跨行方向 normal 上的投影长度，选择与上述四段方向最
+    匹配的分割。这样一条外边界中即使包含上下波动的多个记录点，也只影响折线形状，
+    不会被当成需要平滑或删除的误点。
+
+    返回值按 normal 投影从小到大排列。每条路径均调整为沿 direction 正向行驶，
+    后续 S 形反向由任务生成器处理。
+    """
+    count = len(polygon_xy)
+    if count < 4:
+        return None
+
+    edges = []
+    for index in range(count):
+        start = polygon_xy[index]
+        end = polygon_xy[(index + 1) % count]
+        vector = (end[0] - start[0], end[1] - start[1])
+        length = math.hypot(vector[0], vector[1])
+        if length <= EPSILON:
+            # 重复点仍保留在原始列表中，但零长度边不应左右分段结果。
+            sweep_component = 0.0
+            side_component = 0.0
+        else:
+            sweep_component = abs(direction[0] * vector[0] + direction[1] * vector[1])
+            side_component = abs(normal[0] * vector[0] + normal[1] * vector[1])
+        edges.append((sweep_component, side_component))
+
+    # 前缀和让每一种四段切分都能用常数时间计算方向匹配分数。
+    sweep_prefix = [0.0]
+    side_prefix = [0.0]
+    for sweep_component, side_component in edges:
+        sweep_prefix.append(sweep_prefix[-1] + sweep_component)
+        side_prefix.append(side_prefix[-1] + side_component)
+
+    def score(prefix, start, end):
+        return prefix[end] - prefix[start]
+
+    best = None
+    # 至少为四段各保留一条边：0:a侧边，a:b外边界，b:c侧边，c:n外边界。
+    for first_split in range(1, count - 2):
+        for second_split in range(first_split + 1, count - 1):
+            for third_split in range(second_split + 1, count):
+                matched = (
+                    score(side_prefix, 0, first_split)
+                    + score(sweep_prefix, first_split, second_split)
+                    + score(side_prefix, second_split, third_split)
+                    + score(sweep_prefix, third_split, count)
+                )
+                mismatched = (
+                    score(sweep_prefix, 0, first_split)
+                    + score(side_prefix, first_split, second_split)
+                    + score(sweep_prefix, second_split, third_split)
+                    + score(side_prefix, third_split, count)
+                )
+                candidate = (
+                    matched - mismatched,
+                    matched,
+                    -first_split,
+                    -second_split,
+                    -third_split,
+                    first_split,
+                    second_split,
+                    third_split,
+                )
+                if best is None or candidate[:5] > best[:5]:
+                    best = candidate
+
+    if best is None:
+        return None
+    first_split, second_split, third_split = best[5], best[6], best[7]
+
+    first_boundary = list(polygon_xy[first_split:second_split + 1])
+    second_boundary = list(polygon_xy[third_split:]) + [polygon_xy[0]]
+    if len(first_boundary) < 2 or len(second_boundary) < 2:
+        return None
+
+    def orient(points):
+        start_projection = direction[0] * points[0][0] + direction[1] * points[0][1]
+        end_projection = direction[0] * points[-1][0] + direction[1] * points[-1][1]
+        return list(reversed(points)) if end_projection < start_projection else points
+
+    first_boundary = orient(first_boundary)
+    second_boundary = orient(second_boundary)
+    if _path_length(first_boundary) <= EPSILON or _path_length(second_boundary) <= EPSILON:
+        return None
+
+    def average_normal_offset(points):
+        return sum(
+            normal[0] * point[0] + normal[1] * point[1]
+            for point in points
+        ) / float(len(points))
+
+    paths = [first_boundary, second_boundary]
+    paths.sort(key=average_normal_offset)
+    return paths
+
+
 def _generate_boundary_interpolated_quadrilateral_lanes(
         polygon, sweep_angle, lane_spacing_cm, force_even, max_spacing_cm=None,
         lane_count_override=None):
     """
-    为允许倾斜的凸四边形生成边界保留式清扫线。
+    为按顺序记录的区域生成“外边界折线 + 内部直线”清扫线。
 
-    建模约定前两个点是区域的一侧边界，因此：
-    - 第一条清扫线使用 point[1] -> point[2]，完整保留远端真实边界；
-    - 最后一条清扫线使用 point[0] -> point[3]，完整保留近端真实边界；
-    - 中间清扫线分别在 point[1] -> point[0] 和 point[2] -> point[3]
-      两条侧边上按相同比例插值。
+    建模约定前两个点给出一条侧边方向，清扫线与它垂直。程序按记录顺序识别
+    两条侧边和两条外边界：第一条、最后一条清扫线完整经过对应外边界的全部
+    记录点，中间清扫线保持直线。
 
-    这样不要求首尾边界互相平行。梯形、轻微倾斜或带有真实定位误差的四边区域
-    不会再因为最外侧扫描线只接触一个顶点而丢失首尾清扫线。
+    这样既兼容原有四点梯形，也支持一条边上记录多个点、边界上下波动的区域。
 
     只有 sweep_angle 与“前两个点自动确定的方向”一致时才启用该方法；手工指定
-    其他清扫方向以及四点以上的复杂多边形仍走原有通用扫描线算法。
+    其他清扫方向时仍走原有通用扫描线算法。
     """
-    # 本专用算法只处理严格四点区域；多点区域交给通用多边形扫描算法。
-    if len(polygon) != 4:
-        return None
     polygon_xy = [_point_xy(point) for point in polygon]
     if any(point is None for point in polygon_xy):
         return None
-    if not _is_convex_quadrilateral(polygon_xy):
+    if len(polygon_xy) < 4:
         return None
 
     automatic_angle = _default_sweep_angle(polygon)
@@ -352,21 +471,29 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     radians = math.radians(sweep_angle)
     direction = (math.sin(radians), math.cos(radians))
     normal = (math.cos(radians), -math.sin(radians))
-    # 记录顺序约定：first=P1、second=P2、third=P3、fourth=P4。
-    first, second, third, fourth = polygon_xy
+    boundary_paths = _recorded_boundary_paths(polygon_xy, direction, normal)
+    if boundary_paths is None:
+        return None
+    first_boundary, last_boundary = boundary_paths
 
-    # 清扫宽度使用两条侧边在清扫线法向量上的投影均值。
-    # 与直接取多边形 min/max 投影相比，它不要求上下边界必须完全平行。
-    left_span = abs(
-        normal[0] * (first[0] - second[0])
-        + normal[1] * (first[1] - second[1])
-    )
-    right_span = abs(
-        normal[0] * (fourth[0] - third[0])
-        + normal[1] * (fourth[1] - third[1])
-    )
-    # 左右边可能因 RTK 误差略有差异，取两侧扫宽投影的平均值作为区域跨度D。
-    span = (left_span + right_span) / 2.0
+    offsets = [normal[0] * point[0] + normal[1] * point[1] for point in polygon_xy]
+    min_offset = min(offsets)
+    max_offset = max(offsets)
+    # 四点区域继续使用左右侧边投影均值，保持已验证路线与Python 2/3结果不变；
+    # 多点不规则区域使用完整投影跨度，保证最外侧波动也处于滚刷覆盖范围内。
+    if len(polygon_xy) == 4 and _is_convex_quadrilateral(polygon_xy):
+        first, second, third, fourth = polygon_xy
+        left_span = abs(
+            normal[0] * (first[0] - second[0])
+            + normal[1] * (first[1] - second[1])
+        )
+        right_span = abs(
+            normal[0] * (fourth[0] - third[0])
+            + normal[1] * (fourth[1] - third[1])
+        )
+        span = (left_span + right_span) / 2.0
+    else:
+        span = max_offset - min_offset
     if span <= EPSILON:
         return None
 
@@ -383,24 +510,48 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
 
     lanes = []
     for index in range(lane_count):
-        # ratio从0均匀变化到1，对应从P2/P3一侧逐步移动到P1/P4一侧。
+        # ratio从0均匀变化到1，对应从第一条真实边界移动到第二条真实边界。
         ratio = index / float(lane_count - 1)
-        # 从远端边界向近端边界逐条插值；ratio=0/1 时精确保留两条真实边界。
-        # 左端点公式：start=P2+(P1-P2)*ratio。
-        start = (
-            second[0] + (first[0] - second[0]) * ratio,
-            second[1] + (first[1] - second[1]) * ratio,
-        )
-        # 右端点公式：end=P3+(P4-P3)*ratio。
-        end = (
-            third[0] + (fourth[0] - third[0]) * ratio,
-            third[1] + (fourth[1] - third[1]) * ratio,
-        )
+        if index == 0:
+            lane_path = list(first_boundary)
+            lane_type = "boundary"
+            boundary_side = "min_offset"
+        elif index == lane_count - 1:
+            lane_path = list(last_boundary)
+            lane_type = "boundary"
+            boundary_side = "max_offset"
+        else:
+            # 内部线使用固定法向偏移与多边形求交，因此不跟随外边界波动。
+            offset = min_offset + (max_offset - min_offset) * ratio
+            intersections = _line_polygon_intersections(polygon_xy, normal, offset)
+            ordered = sorted(
+                intersections,
+                key=lambda xy: direction[0] * xy[0] + direction[1] * xy[1],
+            )
+            if len(ordered) < 2:
+                # 极端凹形或退化数据无法得到两个交点时，退回两侧端点线性插值。
+                start = (
+                    first_boundary[0][0] + (last_boundary[0][0] - first_boundary[0][0]) * ratio,
+                    first_boundary[0][1] + (last_boundary[0][1] - first_boundary[0][1]) * ratio,
+                )
+                end = (
+                    first_boundary[-1][0] + (last_boundary[-1][0] - first_boundary[-1][0]) * ratio,
+                    first_boundary[-1][1] + (last_boundary[-1][1] - first_boundary[-1][1]) * ratio,
+                )
+            else:
+                start, end = ordered[0], ordered[-1]
+            lane_path = [start, end]
+            lane_type = "interior"
+            boundary_side = None
+
+        start = lane_path[0]
+        end = lane_path[-1]
         # 保持每条预览线的 start -> end 与统一清扫方向同向，S形反向由任务生成器处理。
         projection = direction[0] * (end[0] - start[0]) + direction[1] * (end[1] - start[1])
         if projection < 0:
-            start, end = end, start
-        if _distance(start, end) <= EPSILON:
+            lane_path = list(reversed(lane_path))
+            start, end = lane_path[0], lane_path[-1]
+        if _path_length(lane_path) <= EPSILON:
             continue
         heading = _normalize_heading(
             math.degrees(math.atan2(end[0] - start[0], end[1] - start[1]))
@@ -412,8 +563,11 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
             "startY": round(start[1], 1),
             "endX": round(end[0], 1),
             "endY": round(end[1], 1),
-            "lengthCm": round(_distance(start, end), 1),
+            "lengthCm": round(_path_length(lane_path), 1),
             "laneSpacingCm": round(actual_spacing, 1),
+            "laneType": lane_type,
+            "boundarySide": boundary_side,
+            "pathPoints": _lane_path_payload(lane_path),
         })
     return lanes
 

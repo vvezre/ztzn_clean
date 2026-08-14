@@ -77,6 +77,35 @@ class RouteSegmentExecutionTest(unittest.TestCase):
         self.assertLess(events.index("turn_complete"), events.index("drive"))
         self.assertEqual(events[-2:], ["brake", "clean_off"])
 
+    def test_soft_boundary_point_continues_without_braking_or_cleaning_toggle(self):
+        from route_segment_execution import run_route_segment
+
+        events = []
+        segment = self._segment(mode=1)
+        segment.update({
+            "continuousPathId": "g1:lane-1:1",
+            "turnAtStart": False,
+            "stopAtEnd": False,
+        })
+
+        def navigate(start_lat, start_lon, end_lat, end_lon, speed, before_drive):
+            events.append("navigate_continuous")
+            before_drive()
+            events.append("drive")
+            return 1
+
+        result = run_route_segment(
+            segment,
+            200,
+            lambda: (32.0, 118.0),
+            navigate,
+            lambda enabled: events.append("clean_on" if enabled else "clean_off"),
+            lambda: events.append("brake"),
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(events, ["navigate_continuous", "clean_on", "drive"])
+
     def test_missing_rtk_blocks_navigation_and_performs_safe_cleanup(self):
         from route_segment_execution import run_route_segment
 

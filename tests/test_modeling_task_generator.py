@@ -915,6 +915,64 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         with self.assertRaises(ModelingTaskGenerationError):
             generate_task_plan(draft, now=2000)
 
+    def test_boundary_lane_keeps_every_point_but_only_stops_for_hard_turns(self):
+        from modeling_frontend import frontend_path_points
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _append_clean_segments,
+            _compact_executable_tasks,
+        )
+
+        draft = {
+            "groups": [{
+                "id": "g1",
+                "points": [{
+                    "id": "origin",
+                    "x": 0,
+                    "y": 0,
+                    "lat": 32.0,
+                    "lon": 118.0,
+                }],
+            }],
+        }
+        mapper = _CoordinateMapper(draft)
+        tasks = []
+        current, next_task_id, clean_count = _append_clean_segments(
+            tasks,
+            [{
+                "groupId": "g1",
+                "areaNumber": 1,
+                "sourceId": "lane-boundary",
+                "laneType": "boundary",
+                "start": (0, 0),
+                "end": (200, 100),
+                # 前两个拐角约11度，应连续经过；最后一个拐角约95度，应停车转向。
+                "path": [(0, 0), (100, 10), (200, 0), (200, 100)],
+            }],
+            None,
+            mapper,
+            1,
+            draft,
+        )
+        tasks = _compact_executable_tasks(tasks)
+
+        self.assertEqual(clean_count, 1)
+        self.assertEqual(next_task_id, 4)
+        self.assertEqual(current, (200, 100))
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual(
+            [(task["startX"], task["startY"], task["endX"], task["endY"]) for task in tasks],
+            [(0, 0, 100, 10), (100, 10, 200, 0), (200, 0, 200, 100)],
+        )
+        self.assertEqual([task["turnAtStart"] for task in tasks], [True, False, True])
+        self.assertEqual([task["stopAtEnd"] for task in tasks], [False, True, True])
+        self.assertEqual(len(set(task["continuousPathId"] for task in tasks)), 1)
+        # 前端接口不需要增加字段；它按既有tasks顺序展开后仍能看到全部折线点。
+        self.assertEqual(
+            [(point["x"], point["y"]) for point in frontend_path_points({"tasks": tasks})],
+            [(0, 0), (100, 10), (200, 0), (200, 100)],
+        )
+
     def test_generate_task_plan_requires_ready_preview(self):
         from modeling_task_generator import ModelingTaskGenerationError, generate_task_plan
 

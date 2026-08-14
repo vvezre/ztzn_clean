@@ -48,7 +48,11 @@ def run_route_segment(
         stop_vehicle,
         on_error=None):
     """
-    按“关清扫 -> 实时点位导航 -> 到点停车 -> 关清扫”执行一段任务。
+    默认按“关清扫 -> 实时点位导航 -> 到点停车 -> 关清扫”执行一段任务。
+
+    边界折线的普通中间点会额外携带 turnAtStart=False、stopAtEnd=False：上一段到点
+    后不刹车、不关滚刷，下一段也不做原地转向，而是直接更新点到点目标继续行驶。
+    30度以上的明显拐点以及折线终点仍使用默认安全流程停车、转向。
 
     navigate 接收六个参数：当前纬度、当前经度、目标纬度、目标经度、速度、
     before_drive 回调。点位导航应先完成转向，再调用 before_drive，最后开始直行。
@@ -69,6 +73,8 @@ def run_route_segment(
     end_lon = _number(segment.get("endLon"))
     runtime_speed = _positive_int(speed)
     mode = _positive_int(segment.get("mode")) or 2
+    turn_at_start = segment.get("turnAtStart") is not False
+    stop_at_end = segment.get("stopAtEnd") is not False
 
     def report_error(error):
         if callable(on_error):
@@ -81,11 +87,15 @@ def run_route_segment(
         set_cleaning(False)
         return False
 
-    set_cleaning(False)
+    # 只有需要停车转向的段才先关闭滚刷。连续折线子段保持上一段的清扫状态，
+    # 避免每经过一个普通边界采样点都反复开关滚刷。
+    if turn_at_start:
+        set_cleaning(False)
 
     def before_drive():
         set_cleaning(mode == 1)
 
+    succeeded = False
     try:
         result = navigate(
             position[0],
@@ -95,10 +105,14 @@ def run_route_segment(
             runtime_speed,
             before_drive,
         )
-        return result is True or result == 1
+        succeeded = result is True or result == 1
+        return succeeded
     except Exception as error:
         report_error(error)
         return False
     finally:
-        stop_vehicle()
-        set_cleaning(False)
+        # 失败时无条件安全停车。成功经过普通折线中间点时保持车辆和滚刷运行；
+        # 明显转角、折线终点以及所有历史普通任务仍按原逻辑停车并关闭清扫。
+        if not succeeded or stop_at_end:
+            stop_vehicle()
+            set_cleaning(False)
