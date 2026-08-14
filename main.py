@@ -2988,6 +2988,7 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
     清扫，到达正确朝向后才根据 mode 决定是否开启清扫；到点后停车并关闭清扫。
     """
     def read_position():
+        # 读取RTK线程持续更新的全局实时位置，作为当前任务段的真实起点。
         return global_cur_rtk_lat, global_cur_rtk_lon
 
     def navigate(current_lat, current_lon, end_lat, end_lon, runtime_speed, before_drive):
@@ -2996,6 +2997,8 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
         # 直线控制器会连续修正到新目标。第一段、30度以上拐点和折线终点仍走下面
         # 的AutoHeading流程，先停车转到正确方向再直行。
         if segment.get('turnAtStart') is False:
+            # soft boundary point不做原地转向，但仍按新的终点重新计算距离和目标航向，
+            # 因此小车会由RTK直线控制持续修正并经过这个真实边界记录点。
             distance, heading = util.get_distance_angle(
                 current_lat,
                 current_lon,
@@ -3010,7 +3013,9 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
                 )
             )
             if callable(before_drive):
+                # 连续清扫子段会再次确认mode=1清扫状态，但不会关闭后重开滚刷。
                 before_drive()
+            # 直接更新点到点终点并继续直线控制，不调用turn()、不主动刹车。
             return pointToPointByRTK(
                 current_lat,
                 current_lon,
@@ -3019,6 +3024,8 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
                 heading,
                 runtime_speed,
             )
+        # 普通任务、边界首段、30°以上硬拐点和折线终点走完整安全流程：
+        # 实时算航向 -> 原地转向 -> before_drive开/关滚刷 -> 点到点直行。
         return pointToPointByRTKAutoHeading(
             current_lat,
             current_lon,
@@ -5450,8 +5457,11 @@ def pointToPointByRTKAutoHeading(
         segment_index=None,
         task_id=None):
     """按实时起点计算目标方向，完成转向后再执行点到点直行。"""
+    # 根据执行瞬间的真实RTK起点和规划终点计算距离、绝对航向；
+    # 保存文件中的heading仅供预览/核对，不作为此次转向控制输入。
     distance, heading = util.get_distance_angle(current_start_lat, current_start_lon, endLat, endLon)
     logger.warn("go to point auto heading: distance={:.3f}, heading={:.3f}".format(float(distance), float(heading)))
+    # 下位机转向协议使用0.1°单位，所以把heading乘10；target_heading保留度数供闭环判断。
     turn_result = turn(
         ser,
         heading * 10,
@@ -5461,10 +5471,13 @@ def pointToPointByRTKAutoHeading(
         task_id=task_id,
     )
     if turn_result != 1:
+        # 转向失败不能开始直行或开启滚刷，立即制动并把失败返回上层。
         sendBraking()
         return 0
     if callable(before_drive):
+        # 只有确认朝向正确后才根据mode设置滚刷，避免原地转向时执行清扫。
         before_drive()
+    # 使用相同的实时起点、终点和刚计算的heading进入RTK直线纠偏控制。
     return pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)
 
 

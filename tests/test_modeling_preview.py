@@ -292,6 +292,51 @@ class ModelingPreviewTest(unittest.TestCase):
             for lane in lanes[1:-1]
         ))
 
+    def test_side_fluctuation_uses_the_whole_first_side_for_sweep_direction(self):
+        from modeling_preview import build_model_preview
+
+        # A1->A2整条侧边总体竖直，但第一小段明显向右偏。旧逻辑只看p1->p2，
+        # 会把全部清扫线带歪；新逻辑应识别p1..p4为完整第一侧边并得到90度清扫方向。
+        points = [
+            _point("p1", 0, 0),
+            _point("p2", 25, 30),
+            _point("p3", -20, 70),
+            _point("p4", 0, 120),
+            _point("p5", 100, 128),
+            _point("p6", 200, 110),
+            _point("p7", 300, 120),
+            _point("p8", 320, 80),
+            _point("p9", 282, 40),
+            _point("p10", 300, 0),
+            _point("p11", 200, -10),
+            _point("p12", 100, 8),
+        ]
+        draft = {
+            "id": "all-edges-fluctuate",
+            "recognition": {"confirmed": True},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{"id": "sa1", "pointIds": [point["id"] for point in points]}],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+        sub_area = preview["groups"][0]["subAreas"][0]
+        lanes = sub_area["lanes"]
+
+        self.assertEqual(sub_area["sweepAngle"], 90.0)
+        self.assertGreaterEqual(len(lanes), 2)
+        self.assertEqual(lanes[0]["laneType"], "boundary")
+        self.assertEqual(lanes[-1]["laneType"], "boundary")
+        self.assertTrue(all(
+            lane["laneType"] == "interior" and len(lane["pathPoints"]) == 2
+            for lane in lanes[1:-1]
+        ))
+
     def test_build_preview_requires_confirmed_recognition(self):
         from modeling_preview import ModelingPreviewError, build_model_preview
 

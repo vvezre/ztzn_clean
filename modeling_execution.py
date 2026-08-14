@@ -75,6 +75,8 @@ def build_execution_plan(model_id, task_plan, speed=None, now=None):
     if not isinstance(tasks, list) or not tasks:
         raise ModelingExecutionError("task plan has no executable segments")
 
+    # 把保存任务中的每个task复制并标准化，统一补充index、运行速度和数值类型。
+    # 列表顺序就是唯一执行顺序，运行时不会重新规划或跳过成功任务。
     segments = [
         _normalize_segment(task, index, speed)
         for index, task in enumerate(tasks)
@@ -114,11 +116,15 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
 
     update_progress = update_progress if callable(update_progress) else (lambda state: None)
     should_stop = should_stop if callable(should_stop) else (lambda: False)
+    # 复制任务段列表，避免执行期间其他线程修改原计划对象。
     segments = list(plan.get("segments") or [])
+    # completed只统计已经明确返回成功的任务段，用于前端进度和中断恢复诊断。
     completed = 0
 
+    # 在执行第一段之前先发布running状态，total等于待执行总段数。
     update_progress(_progress_payload(plan, "running", 0, None, "modeling task started"))
     for index, segment in enumerate(segments):
+        # 每段开始前检查停止请求，确保用户点“停止”后不会继续启动下一段。
         if should_stop():
             result = _progress_payload(plan, "stopped", completed, segment, "modeling task stopped")
             result["code"] = "MODELING_TASK_STOPPED"
@@ -127,8 +133,10 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
             update_progress(result)
             return result
 
+        # 上报即将执行的任务序号、taskId和mode，便于前端显示实时进度并定位故障段。
         update_progress(_progress_payload(plan, "running", index, segment, "segment running"))
         try:
+            # run_segment接入真车RTK、转向、电机、滚刷和刹车；返回True/1才算成功。
             ok = run_segment(segment)
         except Exception as exc:
             ok = False
@@ -136,6 +144,7 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
         else:
             error_message = ""
         if not ok:
+            # 单段失败后不允许继续后续路线；根据是否收到人工停止区分stopped/blocked。
             if should_stop():
                 result = _progress_payload(plan, "stopped", completed, segment, "modeling task stopped")
                 result["code"] = "MODELING_TASK_STOPPED"
@@ -150,9 +159,11 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
             update_progress(result)
             return result
 
+        # 只有本段成功才递增completed并发布segment complete。
         completed += 1
         update_progress(_progress_payload(plan, "running", completed, segment, "segment complete"))
 
+    # 所有任务段均成功后才发布complete；因此complete同时表示已按闭环路线返回原点。
     result = _progress_payload(plan, "complete", completed, None, "modeling task complete")
     result["code"] = "MODELING_TASK_COMPLETE"
     result["completedCount"] = completed

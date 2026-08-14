@@ -68,11 +68,17 @@ def run_route_segment(
         if not callable(callback):
             raise RouteSegmentExecutionError("{} callback is required".format(name))
 
+    # 每一段开始时重新读取真车当前RTK位置，不沿用任务文件里的startLat/startLon，
+    # 因为上一段到点误差和定位漂移会使实际起点与理论起点存在少量偏差。
     position = _position_pair(read_position())
+    # 终点经纬度来自规划任务，是本段唯一必须到达的空间目标。
     end_lat = _number(segment.get("endLat"))
     end_lon = _number(segment.get("endLon"))
+    # speed必须是正整数；非法速度不能下发给电机控制。
     runtime_speed = _positive_int(speed)
+    # mode=1表示清扫，mode=2表示只移动；历史任务缺失mode时安全回退为不清扫移动。
     mode = _positive_int(segment.get("mode")) or 2
+    # 字段缺失时均按True处理，保证历史任务仍执行“先转向、到点停车”的安全默认流程。
     turn_at_start = segment.get("turnAtStart") is not False
     stop_at_end = segment.get("stopAtEnd") is not False
 
@@ -82,6 +88,7 @@ def run_route_segment(
 
     # 即使输入无效也执行安全收尾，保证测试和真车行为一致。
     if position is None or end_lat is None or end_lon is None or runtime_speed is None:
+        # RTK、终点或速度任一无效都不允许尝试行驶；先上报错误，再执行制动和关清扫。
         report_error(RouteSegmentExecutionError("RTK position, endpoint or speed is invalid"))
         stop_vehicle()
         set_cleaning(False)
@@ -90,13 +97,17 @@ def run_route_segment(
     # 只有需要停车转向的段才先关闭滚刷。连续折线子段保持上一段的清扫状态，
     # 避免每经过一个普通边界采样点都反复开关滚刷。
     if turn_at_start:
+        # 硬拐点/普通任务开始前必须确保滚刷关闭，避免原地转向时滚刷工作。
         set_cleaning(False)
 
     def before_drive():
+        # navigate会在完成原地转向后、真正直行前调用这里：
+        # mode=1开启滚刷，mode=2明确保持关闭。
         set_cleaning(mode == 1)
 
     succeeded = False
     try:
+        # navigate内部根据“实时position -> 规划终点”计算本段真实航向并执行点到点导航。
         result = navigate(
             position[0],
             position[1],
@@ -105,6 +116,7 @@ def run_route_segment(
             runtime_speed,
             before_drive,
         )
+        # 兼容布尔True和原有硬件函数返回值1；其他值一律视为失败。
         succeeded = result is True or result == 1
         return succeeded
     except Exception as error:
@@ -114,5 +126,7 @@ def run_route_segment(
         # 失败时无条件安全停车。成功经过普通折线中间点时保持车辆和滚刷运行；
         # 明显转角、折线终点以及所有历史普通任务仍按原逻辑停车并关闭清扫。
         if not succeeded or stop_at_end:
+            # 失败永远制动；成功到硬拐点/折线终点也制动。
+            # 只有成功通过soft boundary point时才不进入这里，从而连续行驶。
             stop_vehicle()
             set_cleaning(False)

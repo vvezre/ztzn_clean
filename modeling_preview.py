@@ -14,11 +14,14 @@ import math
 import time
 
 
-# 机器人一次通过能覆盖的有效滚刷宽度。
+# 机器人一次直线通过时，滚刷在“垂直于行驶方向”上能够覆盖的有效宽度 W。
+# 单位统一使用厘米；当前设备实测/业务配置为 W=116cm。
 BRUSH_WIDTH_CM = 116.0
-# 相邻两条清扫线的目标重叠宽度，不是清扫线间距。
+# 相邻两次滚刷覆盖区域希望重复覆盖的目标宽度 O_target。
+# 注意：53cm 是“重叠宽度”，不是两条清扫中心线之间的距离。
 DEFAULT_OVERLAP_CM = 53.0
-# 实际路线允许偏离目标重叠，但任何方案都不能低于30厘米重叠。
+# 最低允许重叠 O_min。整数条清扫线无法保证实际重叠恰好等于目标值，
+# 但所有候选都必须满足 O_actual>=30cm，这是路线覆盖完整性的硬约束。
 MIN_OVERLAP_CM = 30.0
 # 浮点几何判断误差，避免把几乎相等的坐标误判成不同点。
 EPSILON = 1e-6
@@ -111,13 +114,15 @@ def _default_sweep_angle(points):
     """
     自动确定清扫主方向。
 
-    当前约定用户打的前两个区域点表示希望的首段方向，
-    后续生成的所有清扫线都与这个方向平行。
+    用户从第一条侧边的起点开始，沿侧边连续记录到第一个角点。侧边中间允许
+    存在任意数量的真实浮动点，因此不能再用“第一个点 -> 第二个点”这一小段
+    代表整条侧边。这里先用第一小段取得初始方向，再识别完整的第一侧边，最终
+    使用“侧边首点 -> 侧边末点”的总体方向生成与它垂直的清扫线方向。
     """
     # 没有两个点就无法得到边界方向。
     if len(points) < 2:
         return None
-    # 记录顺序有业务含义：points[0] -> points[1] 就是用户先记录的区域侧边。
+    # 第一小段只用于给四段边界识别提供初始方向，不能直接作为最终清扫方向。
     start_xy = _point_xy(points[0])
     end_xy = _point_xy(points[1])
     if start_xy is None or end_xy is None:
@@ -131,9 +136,35 @@ def _default_sweep_angle(points):
     # 与边界产生轻微夹角，最终漏掉首尾两条清扫线。展示时再统一保留0.1°。
     # 本项目0度沿+y，所以航向角使用 atan2(dx,dy)。
     first_edge = math.degrees(math.atan2(dx, dy)) % 360.0
-    # 清扫线与该侧边垂直，因此统一沿顺时针方向旋转90度。
-    # 旋转后的反方向仍属于同一组平行线；真正从哪一端出发由 S 形排序阶段决定。
-    return (first_edge + 90.0) % 360.0
+    # 清扫线与侧边垂直，因此初始值沿顺时针方向旋转90度。
+    sweep_angle = (first_edge + 90.0) % 360.0
+
+    # 浮动点可能让第一小段偏斜几十度。使用当前方向识别四段边界后，再用完整
+    # 第一侧边的首尾弦方向修正；重复两次可让分段和最终方向稳定一致。
+    polygon_xy = [_point_xy(point) for point in points]
+    polygon_xy = [point for point in polygon_xy if point is not None]
+    for _ in range(2):
+        radians = math.radians(sweep_angle)
+        direction = (math.sin(radians), math.cos(radians))
+        normal = (math.cos(radians), -math.sin(radians))
+        sections = _recorded_boundary_sections(polygon_xy, direction, normal)
+        if sections is None:
+            break
+        first_side = sections.get("firstSide") or []
+        if len(first_side) < 2:
+            break
+        side_dx = first_side[-1][0] - first_side[0][0]
+        side_dy = first_side[-1][1] - first_side[0][1]
+        if abs(side_dx) < EPSILON and abs(side_dy) < EPSILON:
+            break
+        side_heading = math.degrees(math.atan2(side_dx, side_dy)) % 360.0
+        refined = (side_heading + 90.0) % 360.0
+        if _angle_difference(refined, sweep_angle) <= 1e-7:
+            sweep_angle = refined
+            break
+        sweep_angle = refined
+    # 旋转后的反方向仍属于同一组平行线；从哪一端出发由S形候选阶段决定。
+    return sweep_angle
 
 
 def _group_sweep_angle(group, polygon):
@@ -222,12 +253,17 @@ def _line_polygon_intersections(polygon_xy, normal, offset):
 
 
 def _minimum_lane_count(span, max_spacing):
-    """Return the smallest lane count whose actual spacing does not exceed max_spacing."""
+    """计算满足最大线间距约束的最少清扫线条数。
+
+    设区域跨行宽度为 D=span，清扫线数量为 N。第一条和最后一条分别落在
+    区域两侧，因此 N 条线只有 N-1 个间隔：S_actual=D/(N-1)。要求
+    S_actual<=S_max，移项得到 N>=D/S_max+1；N 必须为整数，所以向上取整。
+    """
     if span <= EPSILON:
         return 0
-    # 至少保留1厘米的正间距，避免配置错误造成除零。
+    # 将配置转成浮点数，同时把异常的0或负值钳制为1cm，避免后面除零。
     spacing_limit = max(float(max_spacing), 1.0)
-    # N条线有N-1个间隔，因此 N >= ceil(span/max_spacing)+1。
+    # 公式：N_min=ceil(D/S_max)+1；max(2, ...)保证至少能形成一个有效间隔。
     return max(2, int(math.ceil(span / spacing_limit)) + 1)
 
 
@@ -277,17 +313,27 @@ def _lane_count_candidates(span, target_spacing, max_spacing=None):
     """
     if span <= EPSILON:
         return []
+    # S_target=W-O_target；当前默认是116-53=63cm。
     spacing = max(float(target_spacing), 1.0)
+    # 连续数学条件下的理论条数 N*=D/S_target+1，通常不是整数。
     ideal = span / spacing + 1.0
+    # 没有最低重叠限制时至少需要两条线；配置max_spacing后会重新计算下限。
     minimum = 2
     if max_spacing is not None:
+        # max_spacing=W-O_min；当前为116-30=86cm。
+        # 从 N_min 开始枚举，保证每个候选的实际重叠都不会低于30cm。
         minimum = _minimum_lane_count(span, max_spacing)
+    # 理论条数上方再保留一个整数候选，使入口/出口需要相反奇偶性时仍有选择，
+    # 但不无限增加清扫线，避免只为改变出口方向而产生过密路线。
     maximum = max(minimum, int(math.ceil(ideal)) + 1)
     candidates = []
     for count in range(minimum, maximum + 1):
+        # 对当前整数条数重新均分完整跨度，得到真实中心线间距。
         actual_spacing = span / float(count - 1)
+        # 再做一次硬约束检查，防止浮点或边界条件把不合格候选带入后续评分。
         if max_spacing is not None and actual_spacing > float(max_spacing) + EPSILON:
             continue
+        # 这里不筛奇偶，因此结果同时包含奇数和偶数方案。
         candidates.append(count)
     return candidates
 
@@ -336,9 +382,9 @@ def _is_convex_quadrilateral(points):
     return all(sign == signs[0] for sign in signs[1:])
 
 
-def _recorded_boundary_paths(polygon_xy, direction, normal):
+def _recorded_boundary_sections(polygon_xy, direction, normal):
     """
-    按人工记录顺序识别两条真正需要清扫的外边界折线。
+    按人工记录顺序识别“侧边、外边界、侧边、外边界”四段折线。
 
     区域点按一圈边界依次记录，第一个点位于第一条侧边的起点；自动清扫方向又与
     第一段边界垂直。因此闭合边界的边序列应当依次呈现：
@@ -350,27 +396,38 @@ def _recorded_boundary_paths(polygon_xy, direction, normal):
     匹配的分割。这样一条外边界中即使包含上下波动的多个记录点，也只影响折线形状，
     不会被当成需要平滑或删除的误点。
 
-    返回值按 normal 投影从小到大排列。每条路径均调整为沿 direction 正向行驶，
-    后续 S 形反向由任务生成器处理。
+    返回四段原始点列，同时提供按 normal 投影排序、沿 direction 正向排列的两条
+    外边界。第一侧边的完整首尾方向也用于抵消第一个浮动点对清扫角度的影响。
     """
+    # count 是沿区域边界依次记录的有效点数；闭环的最后一条边由末点连回首点。
     count = len(polygon_xy)
     if count < 4:
+        # 少于四点无法可靠分成“侧边/外边界/侧边/外边界”四个非空部分。
         return None
 
+    # edges[i]=(沿清扫方向投影长度, 沿跨行方向投影长度)。
+    # 它只描述第i条边更像“横向清扫边”还是“纵向侧边”，不会改变原始点位。
     edges = []
+    edge_lengths = []
     for index in range(count):
+        # 区域按闭环处理，所以最后一个点的下一点重新取 polygon_xy[0]。
         start = polygon_xy[index]
         end = polygon_xy[(index + 1) % count]
+        # 当前记录边向量 e=P(i+1)-Pi。
         vector = (end[0] - start[0], end[1] - start[1])
+        # |e|只用于识别重复点/零长度边，不参与后面的方向评分。
         length = math.hypot(vector[0], vector[1])
         if length <= EPSILON:
             # 重复点仍保留在原始列表中，但零长度边不应左右分段结果。
             sweep_component = 0.0
             side_component = 0.0
         else:
+            # a_i=|d·e_i|：边在清扫方向d上的绝对投影长度。
             sweep_component = abs(direction[0] * vector[0] + direction[1] * vector[1])
+            # b_i=|n·e_i|：边在跨行法向n上的绝对投影长度。
             side_component = abs(normal[0] * vector[0] + normal[1] * vector[1])
         edges.append((sweep_component, side_component))
+        edge_lengths.append(length)
 
     # 前缀和让每一种四段切分都能用常数时间计算方向匹配分数。
     sweep_prefix = [0.0]
@@ -378,8 +435,12 @@ def _recorded_boundary_paths(polygon_xy, direction, normal):
     for sweep_component, side_component in edges:
         sweep_prefix.append(sweep_prefix[-1] + sweep_component)
         side_prefix.append(side_prefix[-1] + side_component)
+    length_prefix = [0.0]
+    for length in edge_lengths:
+        length_prefix.append(length_prefix[-1] + length)
 
     def score(prefix, start, end):
+        # prefix[end]-prefix[start] 等于半开区间[start,end)内全部投影分量之和。
         return prefix[end] - prefix[start]
 
     best = None
@@ -387,19 +448,81 @@ def _recorded_boundary_paths(polygon_xy, direction, normal):
     for first_split in range(1, count - 2):
         for second_split in range(first_split + 1, count - 1):
             for third_split in range(second_split + 1, count):
+                # 先用四段首尾弦判断“对边平行、邻边近似垂直”，这一步完全不依赖
+                # 第一个短线段的方向，因此第一侧边有较大浮动时仍能找到真正角点。
+                chord_vectors = (
+                    (
+                        polygon_xy[first_split][0] - polygon_xy[0][0],
+                        polygon_xy[first_split][1] - polygon_xy[0][1],
+                    ),
+                    (
+                        polygon_xy[second_split][0] - polygon_xy[first_split][0],
+                        polygon_xy[second_split][1] - polygon_xy[first_split][1],
+                    ),
+                    (
+                        polygon_xy[third_split][0] - polygon_xy[second_split][0],
+                        polygon_xy[third_split][1] - polygon_xy[second_split][1],
+                    ),
+                    (
+                        polygon_xy[0][0] - polygon_xy[third_split][0],
+                        polygon_xy[0][1] - polygon_xy[third_split][1],
+                    ),
+                )
+                chord_lengths = [math.hypot(vector[0], vector[1]) for vector in chord_vectors]
+                if any(length <= EPSILON for length in chord_lengths):
+                    continue
+                unit_vectors = [
+                    (vector[0] / length, vector[1] / length)
+                    for vector, length in zip(chord_vectors, chord_lengths)
+                ]
+
+                def absolute_dot(left, right):
+                    return abs(left[0] * right[0] + left[1] * right[1])
+
+                def absolute_cross(left, right):
+                    return abs(left[0] * right[1] - left[1] * right[0])
+
+                # 对边同轴得分最大为2；四个相邻角接近90度得分最大为4。
+                axis_score = (
+                    absolute_dot(unit_vectors[0], unit_vectors[2])
+                    + absolute_dot(unit_vectors[1], unit_vectors[3])
+                    + sum(
+                        absolute_cross(unit_vectors[index], unit_vectors[(index + 1) % 4])
+                        for index in range(4)
+                    )
+                )
+                section_path_lengths = (
+                    length_prefix[first_split] - length_prefix[0],
+                    length_prefix[second_split] - length_prefix[first_split],
+                    length_prefix[third_split] - length_prefix[second_split],
+                    length_prefix[count] - length_prefix[third_split],
+                )
+                # chord/path越接近1，说明切分没有把一个真实拐角错误包进同一段。
+                straightness_score = sum(
+                    chord_lengths[index] / max(section_path_lengths[index], EPSILON)
+                    for index in range(4)
+                )
+                geometry_score = axis_score + straightness_score
+                # 正确匹配分数：第一/第三段应沿normal，第二/第四段应沿direction。
                 matched = (
                     score(side_prefix, 0, first_split)
                     + score(sweep_prefix, first_split, second_split)
                     + score(side_prefix, second_split, third_split)
                     + score(sweep_prefix, third_split, count)
                 )
+                # 反向分量是“侧边沿清扫方向、外边界沿跨行方向”的总长度，属于惩罚项。
                 mismatched = (
                     score(sweep_prefix, 0, first_split)
                     + score(side_prefix, first_split, second_split)
                     + score(sweep_prefix, second_split, third_split)
                     + score(side_prefix, third_split, count)
                 )
+                # 主评分=matched-mismatched；相同时再比较matched以及更靠前的稳定切分位置。
+                # 最后三个正整数只用于在选中候选后取回实际分割下标。
                 candidate = (
+                    geometry_score,
+                    axis_score,
+                    straightness_score,
                     matched - mismatched,
                     matched,
                     -first_split,
@@ -409,21 +532,28 @@ def _recorded_boundary_paths(polygon_xy, direction, normal):
                     second_split,
                     third_split,
                 )
-                if best is None or candidate[:5] > best[:5]:
+                if best is None or candidate[:8] > best[:8]:
                     best = candidate
 
     if best is None:
         return None
-    first_split, second_split, third_split = best[5], best[6], best[7]
+    first_split, second_split, third_split = best[8], best[9], best[10]
 
+    # 第一段和第三段是两条短边；它们同样保留全部人工记录点，供换行路线使用。
+    first_side = list(polygon_xy[:first_split + 1])
+    second_side = list(polygon_xy[second_split:third_split + 1])
+    # 第二段即第一条外边界，包含两个分割端点，保留其中全部人工记录点。
     first_boundary = list(polygon_xy[first_split:second_split + 1])
+    # 第四段跨过闭环尾部，所以需要显式把首点补回，形成完整的另一条外边界。
     second_boundary = list(polygon_xy[third_split:]) + [polygon_xy[0]]
     if len(first_boundary) < 2 or len(second_boundary) < 2:
         return None
 
     def orient(points):
+        # 比较折线首尾在清扫方向d上的投影，统一让预览路径沿+d排列。
         start_projection = direction[0] * points[0][0] + direction[1] * points[0][1]
         end_projection = direction[0] * points[-1][0] + direction[1] * points[-1][1]
+        # 这里只统一数据方向；执行时是否反向由S形候选算法决定。
         return list(reversed(points)) if end_projection < start_projection else points
 
     first_boundary = orient(first_boundary)
@@ -432,14 +562,31 @@ def _recorded_boundary_paths(polygon_xy, direction, normal):
         return None
 
     def average_normal_offset(points):
+        # 用整条折线所有记录点在n方向上的平均投影判断它位于区域哪一侧。
         return sum(
             normal[0] * point[0] + normal[1] * point[1]
             for point in points
         ) / float(len(points))
 
+    # 固定按跨行投影从小到大排列，确保lane-1/lane-N的顺序稳定且可复现。
     paths = [first_boundary, second_boundary]
     paths.sort(key=average_normal_offset)
-    return paths
+    return {
+        "firstSide": first_side,
+        "firstBoundary": first_boundary,
+        "secondSide": second_side,
+        "secondBoundary": second_boundary,
+        "boundaryPaths": paths,
+        "splits": (first_split, second_split, third_split),
+    }
+
+
+def _recorded_boundary_paths(polygon_xy, direction, normal):
+    """兼容原调用方：只返回按跨行方向排序后的两条真实外边界折线。"""
+    sections = _recorded_boundary_sections(polygon_xy, direction, normal)
+    if sections is None:
+        return None
+    return sections.get("boundaryPaths")
 
 
 def _generate_boundary_interpolated_quadrilateral_lanes(
@@ -467,16 +614,20 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     if automatic_angle is None or _angle_difference(sweep_angle, automatic_angle) > 1e-4:
         return None
 
-    # 航向角转换为单位方向向量和与它垂直的法向量。
+    # 将清扫航向角θ转换为两个正交单位向量：
+    # d=(sinθ,cosθ)沿小车清扫行驶方向；n=(cosθ,-sinθ)沿相邻清扫线的跨行方向。
     radians = math.radians(sweep_angle)
     direction = (math.sin(radians), math.cos(radians))
     normal = (math.cos(radians), -math.sin(radians))
+    # 根据人工记录顺序识别两条外边界折线。识别失败时返回None，让调用方使用通用扫描算法。
     boundary_paths = _recorded_boundary_paths(polygon_xy, direction, normal)
     if boundary_paths is None:
         return None
     first_boundary, last_boundary = boundary_paths
 
+    # q_i=n·P_i。每个q_i表示顶点Pi在跨行轴上的位置。
     offsets = [normal[0] * point[0] + normal[1] * point[1] for point in polygon_xy]
+    # q_min/q_max给出区域在跨行轴上的两侧边界。
     min_offset = min(offsets)
     max_offset = max(offsets)
     # 四点区域继续使用左右侧边投影均值，保持已验证路线与Python 2/3结果不变；
@@ -491,8 +642,10 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
             normal[0] * (fourth[0] - third[0])
             + normal[1] * (fourth[1] - third[1])
         )
+        # D=(D_left+D_right)/2：四点梯形用左右侧边扫宽平均值抑制轻微RTK误差。
         span = (left_span + right_span) / 2.0
     else:
+        # 多点不规则区域必须覆盖最外侧记录点，所以D=q_max-q_min。
         span = max_offset - min_offset
     if span <= EPSILON:
         return None
@@ -505,25 +658,30 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
         lane_count = _nearest_even_lane_count(span, spacing, max_spacing=max_spacing_cm)
     else:
         lane_count = _nearest_lane_count(span, spacing, max_spacing=max_spacing_cm)
-    # N条线把整个区域跨度分成N-1份，实际间距=D/(N-1)。
+    # N条线把整个区域跨度D分成N-1份，实际间距S_actual=D/(N-1)。
     actual_spacing = span / float(lane_count - 1)
 
     lanes = []
     for index in range(lane_count):
-        # ratio从0均匀变化到1，对应从第一条真实边界移动到第二条真实边界。
+        # ratio=i/(N-1)，从0均匀变化到1；它表示第i条线处于整个跨行宽度的比例位置。
         ratio = index / float(lane_count - 1)
         if index == 0:
+            # 第一条线不做直线化，直接使用第一条真实外边界折线及其全部记录点。
             lane_path = list(first_boundary)
             lane_type = "boundary"
             boundary_side = "min_offset"
         elif index == lane_count - 1:
+            # 最后一条线同样保留另一侧真实外边界折线。
             lane_path = list(last_boundary)
             lane_type = "boundary"
             boundary_side = "max_offset"
         else:
             # 内部线使用固定法向偏移与多边形求交，因此不跟随外边界波动。
+            # 内部第i条无限扫描线方程：n·P=q_i，q_i=q_min+(q_max-q_min)*ratio。
             offset = min_offset + (max_offset - min_offset) * ratio
+            # 求该无限扫描线与闭合区域每条边的交点。
             intersections = _line_polygon_intersections(polygon_xy, normal, offset)
+            # 交点沿清扫方向d排序，最前和最后交点构成区域内部的可清扫直线段。
             ordered = sorted(
                 intersections,
                 key=lambda xy: direction[0] * xy[0] + direction[1] * xy[1],
@@ -546,7 +704,8 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
 
         start = lane_path[0]
         end = lane_path[-1]
-        # 保持每条预览线的 start -> end 与统一清扫方向同向，S形反向由任务生成器处理。
+        # dot(d,end-start)>0表示当前点列沿+d；若为负则反转完整点列。
+        # 这里只统一预览数据方向，S形候选阶段仍可再次整体反转。
         projection = direction[0] * (end[0] - start[0]) + direction[1] * (end[1] - start[1])
         if projection < 0:
             lane_path = list(reversed(lane_path))
@@ -688,6 +847,7 @@ def _generate_lane_candidates(
     if len(polygon_xy) < 3 or sweep_angle is None:
         return []
 
+    # 与实际生成清扫线使用相同的跨行法向量，确保候选条数计算的D与几何结果一致。
     radians = math.radians(sweep_angle)
     normal = (math.cos(radians), -math.sin(radians))
     if len(polygon_xy) == 4 and _is_convex_quadrilateral(polygon_xy):
@@ -699,6 +859,7 @@ def _generate_lane_candidates(
         offsets = [normal[0] * x + normal[1] * y for x, y in polygon_xy]
         span = max(offsets) - min(offsets)
 
+    # 对每个满足最低重叠的整数N都真正生成一次几何线路；几何生成不足N条时丢弃候选。
     result = []
     for lane_count in _lane_count_candidates(
             span, lane_spacing_cm, max_spacing=max_spacing_cm):
@@ -712,11 +873,13 @@ def _generate_lane_candidates(
         )
         if len(lanes) != lane_count:
             continue
+        # S_actual=D/(N-1)。实际重叠由滚刷宽度减去实际中心线间距得到。
         actual_spacing = span / float(lane_count - 1)
         result.append({
             "laneCount": lane_count,
             "parity": "even" if lane_count % 2 == 0 else "odd",
             "laneSpacingCm": round(actual_spacing, 1),
+            # O_actual=W-S_actual；候选生成阶段已确保O_actual>=O_min。
             "actualOverlapCm": round(float(brush_width_cm) - actual_spacing, 1),
             "lanes": lanes,
         })
@@ -775,13 +938,13 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
     if not isinstance(recognition, dict) or not recognition.get("confirmed"):
         raise ModelingPreviewError("区域识别结果未确认，不能生成路径预览")
 
-    # 有效滚刷宽度W=116厘米。
+    # 有效滚刷宽度W=116厘米，是一次通过实际能够覆盖的横向宽度。
     brush_width = float(brush_width_cm)
     # 目标重叠O默认53厘米，并强制不能配置到30厘米以下。
     overlap = max(float(overlap_cm), MIN_OVERLAP_CM)
-    # 清扫线间距 = 滚刷宽度 - 重叠宽度。当前默认为 116 - 53 = 63cm。
+    # 目标中心线间距 S_target=W-O_target，当前为116-53=63cm。
     lane_spacing = max(brush_width - overlap, 1.0)
-    # 最大允许间距=116-30=86厘米，用于保证实际重叠始终不少于30厘米。
+    # 最大允许间距 S_max=W-O_min=116-30=86cm；候选若超过它就违反最低重叠硬约束。
     max_lane_spacing = max(brush_width - MIN_OVERLAP_CM, 1.0)
 
     group_previews = []
@@ -807,6 +970,8 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
             ]
             polygon = _clean_polygon_points(polygon)
             sweep_angle = _group_sweep_angle(group, polygon)
+            # 这里得到的不只是一个预览结果，而是目标条数附近全部合法奇偶方案；
+            # 任务生成器稍后还会结合当前区域的入口桥头和出口桥头做最终选择。
             lane_candidates = _generate_lane_candidates(
                 polygon,
                 sweep_angle,
@@ -821,6 +986,8 @@ def build_model_preview(draft, now=None, brush_width_cm=BRUSH_WIDTH_CM, overlap_
                 ]
             else:
                 compatible = list(lane_candidates)
+            # 预览阶段先展示最接近63cm目标间距的候选；最终执行路线允许在
+            # laneCandidates中选择另一个奇偶方案，以便更靠近连接桥并减少无效转场。
             selected_candidate = min(
                 compatible or lane_candidates,
                 key=lambda candidate: (

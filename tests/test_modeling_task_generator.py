@@ -497,11 +497,16 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             index for index, task in enumerate(tasks)
             if task["mode"] == 1 and task["areaNumber"] == 2
         ]
-        bridge_return = tasks[remote_clean_indexes[-1] + 1]
-        self.assertEqual(bridge_return["mode"], 2)
+        bridge_return = tasks[remote_clean_indexes[-1] + 1:]
+        self.assertTrue(bridge_return)
+        self.assertTrue(all(task["mode"] == 2 for task in bridge_return))
         self.assertEqual(
-            (bridge_return["startX"], bridge_return["startY"], bridge_return["endX"], bridge_return["endY"]),
-            (36, 284, 0, 0),
+            (bridge_return[0]["startX"], bridge_return[0]["startY"]),
+            (36, 284),
+        )
+        self.assertEqual(
+            (bridge_return[-1]["endX"], bridge_return[-1]["endY"]),
+            (0, 0),
         )
 
         connector_coordinates = {(31, 178), (34, 231)}
@@ -510,7 +515,8 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         } | {
             (task["endX"], task["endY"]) for task in tasks
         }
-        self.assertTrue(connector_coordinates.isdisjoint(executable_endpoints))
+        # 返回原点必须严格经过两个人工连接点，不能从区域2斜切回区域1。
+        self.assertTrue(connector_coordinates.issubset(executable_endpoints))
 
     def test_test12_area_order_two_then_one_has_no_one_centimeter_pseudo_task(self):
         """test12按[2,1]执行时，A6直接作为区域2第一条清扫线起点。"""
@@ -574,15 +580,24 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         tasks = plan["tasks"]
 
         self.assertEqual(plan["areaOrder"], [2, 1])
-        self.assertEqual(plan["summary"]["taskCount"], 16)
         self.assertEqual(plan["summary"]["cleanTaskCount"], 8)
-        self.assertEqual(
-            (tasks[0]["startX"], tasks[0]["startY"], tasks[0]["endX"], tasks[0]["endY"]),
-            (0, 0, 40, 416),
+        first_clean_index = next(
+            index for index, task in enumerate(tasks)
+            if int(task.get("mode") or 0) == 1
         )
-        self.assertEqual(tasks[1]["mode"], 1)
         self.assertEqual(
-            (tasks[1]["startX"], tasks[1]["startY"], tasks[1]["endX"], tasks[1]["endY"]),
+            (tasks[0]["startX"], tasks[0]["startY"]),
+            (0, 0),
+        )
+        # A6与浮点求交起点相差不足3cm时，清扫线直接吸附到A6，不生成1cm伪转场。
+        self.assertEqual(first_clean_index, 5)
+        self.assertEqual(
+            (
+                tasks[first_clean_index]["startX"],
+                tasks[first_clean_index]["startY"],
+                tasks[first_clean_index]["endX"],
+                tasks[first_clean_index]["endY"],
+            ),
             (40, 416, 403, 382),
         )
         self.assertFalse([
@@ -621,6 +636,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                     {"id": "p1", "x": 0, "y": 0, "lat": 32.0, "lon": 118.0},
                     {"id": "p2", "x": 0, "y": 100, "lat": 32.000009, "lon": 118.0},
                     {"id": "p3", "x": 100, "y": 100, "lat": 32.000009, "lon": 118.0000106},
+                    {"id": "p4", "x": 100, "y": 0, "lat": 32.0, "lon": 118.0000106},
                 ],
             }],
         }
@@ -972,6 +988,146 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             [(point["x"], point["y"]) for point in frontend_path_points({"tasks": tasks})],
             [(0, 0), (100, 10), (200, 0), (200, 100)],
         )
+
+    def test_lane_changes_preserve_every_recorded_short_side_point(self):
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _append_clean_segments,
+            _compact_executable_tasks,
+        )
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        # 两条短边均包含反复浮动点。四条清扫线之间的三次换行必须沿短边逐点走，
+        # 不能再被直接连成三条竖直线，也不能被20cm转场简化删除。
+        recorded = [
+            point("A1", 0, 0),
+            point("L1", 8, 20),
+            point("L2", -10, 40),
+            point("L3", 0, 60),
+            point("L4", 7, 80),
+            point("L5", -9, 100),
+            point("L6", 0, 120),
+            point("L7", 8, 140),
+            point("L8", -10, 160),
+            point("A2", 0, 180),
+            point("A3", 300, 180),
+            point("R1", 310, 160),
+            point("R2", 292, 140),
+            point("R3", 300, 120),
+            point("R4", 307, 100),
+            point("R5", 291, 80),
+            point("R6", 300, 60),
+            point("R7", 308, 40),
+            point("R8", 294, 20),
+            point("A4", 300, 0),
+        ]
+        draft = {"groups": [{"id": "g1", "areaNumber": 1, "points": recorded}]}
+        mapper = _CoordinateMapper(draft)
+        segments = [
+            {"groupId": "g1", "areaNumber": 1, "sourceId": "lane-1", "start": (0, 0), "end": (300, 0)},
+            {"groupId": "g1", "areaNumber": 1, "sourceId": "lane-2", "start": (300, 60), "end": (0, 60)},
+            {"groupId": "g1", "areaNumber": 1, "sourceId": "lane-3", "start": (0, 120), "end": (300, 120)},
+            {"groupId": "g1", "areaNumber": 1, "sourceId": "lane-4", "start": (300, 180), "end": (0, 180)},
+        ]
+
+        tasks = []
+        _append_clean_segments(tasks, segments, None, mapper, 1, draft)
+        tasks = _compact_executable_tasks(tasks)
+
+        transfer_tasks = [task for task in tasks if int(task.get("mode") or 0) == 2]
+        transfer_endpoints = {
+            (task["endX"], task["endY"])
+            for task in transfer_tasks
+        }
+        expected_side_points = {
+            (294, 20), (308, 40), (300, 60),
+            (7, 80), (-9, 100), (0, 120),
+            (292, 140), (310, 160), (300, 180),
+        }
+        self.assertTrue(expected_side_points.issubset(transfer_endpoints))
+        self.assertTrue(all(task.get("preserveRecordedPath") for task in transfer_tasks))
+        self.assertTrue(all(task.get("continuousPathId") for task in transfer_tasks))
+
+    def test_all_four_fluctuating_edges_generate_one_continuous_round_trip(self):
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        # 四条边都包含人工记录的波动点：左右短边负责换行，上下长边本身就是
+        # 两条边界清扫线。完整规划必须经过所有记录点，并且内部线仍是一段直线。
+        points = [
+            point("p1", 0, 0),
+            point("p2", 25, 30),
+            point("p3", -20, 70),
+            point("p4", 0, 120),
+            point("p5", 100, 128),
+            point("p6", 200, 110),
+            point("p7", 300, 120),
+            point("p8", 320, 80),
+            point("p9", 282, 40),
+            point("p10", 300, 0),
+            point("p11", 200, -10),
+            point("p12", 100, 8),
+        ]
+        draft = {
+            "id": "all-four-edges-fluctuate",
+            "recognition": {"confirmed": True},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{
+                    "id": "sa1",
+                    "pointIds": [item["id"] for item in points],
+                }],
+            }],
+            "groupLinks": [],
+        }
+        draft["taskPreview"] = build_model_preview(draft, now=1000)
+
+        plan = generate_task_plan(draft, now=2000)
+        tasks = plan["tasks"]
+        visited = {
+            (task[prefix + "X"], task[prefix + "Y"])
+            for task in tasks
+            for prefix in ("start", "end")
+        }
+        expected = {(int(item["x"]), int(item["y"])) for item in points}
+
+        self.assertEqual(plan["status"], "ready")
+        self.assertTrue(expected.issubset(visited))
+        self.assertTrue(all(
+            (left["endX"], left["endY"]) == (right["startX"], right["startY"])
+            for left, right in zip(tasks, tasks[1:])
+        ))
+        self.assertEqual(
+            (tasks[0]["startX"], tasks[0]["startY"]),
+            (tasks[-1]["endX"], tasks[-1]["endY"]),
+        )
+        interior_lane_ids = [
+            task.get("sourceLaneId")
+            for task in tasks
+            if int(task.get("mode") or 0) == 1 and task.get("laneType") == "interior"
+        ]
+        # 每条内部线只生成一个首尾任务段，说明它没有继承边界波动而变成折线。
+        self.assertEqual(len(interior_lane_ids), len(set(interior_lane_ids)))
 
     def test_generate_task_plan_requires_ready_preview(self):
         from modeling_task_generator import ModelingTaskGenerationError, generate_task_plan

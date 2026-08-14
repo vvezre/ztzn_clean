@@ -310,7 +310,8 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             (17, 261), (24, 400), (379, 363), (369, 235),
         }
         self.assertTrue(expected_area_anchors.issubset(visited))
-        self.assertTrue({(10, 171), (11, 204)}.isdisjoint(visited))
+        # 跨区域路线必须经过两个人工连接点，而不是把桥两端直接斜连省略。
+        self.assertTrue({(10, 171), (11, 204)}.issubset(visited))
         _assert_continuous_round_trip(self, tasks)
         for index in range(1, len(tasks)):
             self.assertFalse(_same_direction_collinear(tasks[index - 1], tasks[index]), index)
