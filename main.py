@@ -127,6 +127,7 @@ from modeling_execution import (
     execute_modeling_plan,
 )
 from route_segment_execution import run_route_segment
+from continuous_route import CONTINUATION_KEY, attach_continuations, collect_continuous_run
 from route_start_guard import RouteStartGuardError, validate_route_start
 
 app = Flask(__name__)
@@ -2992,6 +2993,7 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
         return global_cur_rtk_lat, global_cur_rtk_lon
 
     def navigate(current_lat, current_lon, end_lat, end_lon, runtime_speed, before_drive):
+        continuous_segments = list(segment.get(CONTINUATION_KEY) or [])
         # 同一条边界折线的小角度中间点不需要停车原地转向。上一子段已经保持车辆
         # 和滚刷运行，这里只用实时位置重新计算下一小段航向并更新点到点目标；RTK
         # 直线控制器会连续修正到新目标。第一段、30度以上拐点和折线终点仍走下面
@@ -3023,6 +3025,7 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
                 end_lon,
                 heading,
                 runtime_speed,
+                continuous_segments=continuous_segments,
             )
         # 普通任务、边界首段、30°以上硬拐点和折线终点走完整安全流程：
         # 实时算航向 -> 原地转向 -> before_drive开/关滚刷 -> 点到点直行。
@@ -3036,6 +3039,7 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
             source=source,
             segment_index=segment_index,
             task_id=segment.get('id'),
+            continuous_segments=continuous_segments,
         )
 
     def set_cleaning(enabled):
@@ -4437,8 +4441,15 @@ def autoDriveByRTKThread(task_token=None):
     runtime_speed = _coerce_int(redis_cli.get('forwardSpeed'), 350)
     if runtime_speed is None or runtime_speed <= 0:
         runtime_speed = 350
-    # 执行任务
-    for index,task in enumerate(taskList):
+    # 执行任务。相同continuousPathId中的普通浮动点会合并成一次连续直行；
+    # 路径文件仍保留原始分段，前端绘图数据和保存格式均不改变。
+    index = 0
+    while index < len(taskList):
+        continuous_run = collect_continuous_run(taskList, index)
+        if not continuous_run:
+            continuous_run = [taskList[index]]
+        task = attach_continuations(continuous_run)
+        run_count = len(continuous_run)
         # 每段开始前都检查一次停止信号，保证急停或任务切换能尽快生效。
         if _runtime_task_should_stop(task_token, 'auto_drive'):
             global_doCleanThreadStop = 1
@@ -4466,14 +4477,17 @@ def autoDriveByRTKThread(task_token=None):
             )
             break
 
-        # 倒数第二段完成后，下一段就是最后一段；RTK纠偏回调会据此在接近终点时降速。
-        if index == len(taskList) - 2:
+        # 当前连续折线之后只剩最后一段时，RTK纠偏回调会据此在接近终点时降速。
+        if index + run_count == len(taskList) - 1:
             redis_cli.set("lastTask", 1)
         else:
             redis_cli.set("lastTask", 0)
-        # 只有导航真正成功后才弹出任务，失败段保留给状态查询和故障排查。
-        logger.warn("删除任务{}".format(index + 1))
-        redis_cli.lpop("taskList")
+        # 整条连续折线真正成功后才一次性弹出其中所有原始任务段；执行中断时全部保留，
+        # 避免续跑从浮动点后的错误位置开始。
+        for completed_offset in range(run_count):
+            logger.warn("删除任务{}".format(index + completed_offset + 1))
+            redis_cli.lpop("taskList")
+        index += run_count
     logger.warn("自动行驶结束")
     redis_cli.incr("doTaskCounter")
     if not _is_current_runtime_task(task_token):
@@ -5399,16 +5413,78 @@ def moveByRTK(endLat, endLon,heading=0):
         time.sleep(0.1)
     sendBraking()
     global_go = 0
+def _advance_continuous_target(current_lat, current_lon):
+    """切换到同一折线的下一个软目标，且不停车、不重启前进命令。"""
+    global global_cur_taskPoint, global_last_cte, global_last_distance_to_target
+
+    continuous_targets = list(global_cur_taskPoint.get('continuousTargets') or [])
+    if not continuous_targets:
+        return None
+
+    next_target = continuous_targets.pop(0)
+    previous_end_lat = global_cur_taskPoint.get('endLat')
+    previous_end_lon = global_cur_taskPoint.get('endLon')
+    next_end_lat = float(next_target['endLat'])
+    next_end_lon = float(next_target['endLon'])
+    _, next_heading = util.get_distance_angle(
+        current_lat,
+        current_lon,
+        next_end_lat,
+        next_end_lon,
+    )
+    next_start_lat = _coerce_float(next_target.get('startLat'), previous_end_lat)
+    next_start_lon = _coerce_float(next_target.get('startLon'), previous_end_lon)
+    previous_speed = global_cur_taskPoint.get('speed')
+    global_cur_taskPoint = {
+        'heading': next_heading,
+        'startLat': next_start_lat,
+        'startLon': next_start_lon,
+        'endLat': next_end_lat,
+        'endLon': next_end_lon,
+        'speed': _coerce_int(next_target.get('speed'), previous_speed),
+        'continuousTargets': continuous_targets,
+    }
+    # 新子段使用自己的目标直线重新建立滤波坐标系，但保持global_go、电机前进命令
+    # 和滚刷状态不变，因此经过浮动点时不会出现刹车、重新启动造成的停顿。
+    global_rtk_tracking_filter.reset()
+    global_last_cte = 0.0
+    global_last_distance_to_target = None
+    return {
+        'taskId': next_target.get('taskId'),
+        'remaining': len(continuous_targets),
+    }
+
+
 # 通过RTK实现从一个点直线移动到另一个点，返回结果0：表示该任务未执行完成，1：表示执行完成
-def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
+def pointToPointByRTK(startLat, startLon, endLat, endLon, heading, speed=200,
+                      continuous_segments=None):
     global global_cur_taskPoint,global_interval
     global global_go
 
     # 返回结果，0：不成功，1：任务执行成功
     result = 1
     global_interval = 0
+    # continuousTargets只存在于运行时，不写回任务文件。第一段到达普通浮动点时，
+    # RTK回调会直接把这里的目标替换成队列中的下一段，并保持global_go=1。
+    continuous_targets = []
+    for item in list(continuous_segments or []):
+        if not isinstance(item, dict):
+            continue
+        next_end_lat = _coerce_float(item.get('endLat'), None)
+        next_end_lon = _coerce_float(item.get('endLon'), None)
+        if next_end_lat is None or next_end_lon is None:
+            continue
+        continuous_targets.append({
+            'taskId': item.get('id'),
+            'startLat': _coerce_float(item.get('startLat'), None),
+            'startLon': _coerce_float(item.get('startLon'), None),
+            'endLat': next_end_lat,
+            'endLon': next_end_lon,
+            'speed': _coerce_int(item.get('speed'), speed),
+        })
     global_cur_taskPoint = {"heading": heading, "startLat": startLat, "startLon": startLon,
-                            "endLat": endLat, "endLon": endLon, "speed": speed}
+                            "endLat": endLat, "endLon": endLon, "speed": speed,
+                            "continuousTargets": continuous_targets}
     global_rtk_tracking_filter.reset()
     # 开启RTK纠偏
     global_go = 1
@@ -5427,6 +5503,17 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon,heading,speed=200):
         if global_edge_trigger_latch.consume(getEdge()):
             edge_action = _handle_edge_stop_for_current_task('pointToPointByRTK')
             if edge_action == EDGE_STOP_ACTION_TARGET:
+                # 若碰边发生在同一折线的普通浮动点附近，它只代表当前软目标已到达，
+                # 继续切换到下一个目标；只有整条折线终点才真正结束本次直行。
+                advanced = _advance_continuous_target(global_cur_rtk_lat, global_cur_rtk_lon)
+                if advanced:
+                    logger.warn(
+                        "edge accepted at continuous point; keep driving: nextTaskId={}, remaining={}".format(
+                            advanced.get('taskId'),
+                            advanced.get('remaining'),
+                        )
+                    )
+                    continue
                 global_go = 0
                 _publish_global_go(global_go)
                 break
@@ -5455,7 +5542,8 @@ def pointToPointByRTKAutoHeading(
         before_drive=None,
         source='point_to_point_auto_heading',
         segment_index=None,
-        task_id=None):
+        task_id=None,
+        continuous_segments=None):
     """按实时起点计算目标方向，完成转向后再执行点到点直行。"""
     # 根据执行瞬间的真实RTK起点和规划终点计算距离、绝对航向；
     # 保存文件中的heading仅供预览/核对，不作为此次转向控制输入。
@@ -5478,7 +5566,15 @@ def pointToPointByRTKAutoHeading(
         # 只有确认朝向正确后才根据mode设置滚刷，避免原地转向时执行清扫。
         before_drive()
     # 使用相同的实时起点、终点和刚计算的heading进入RTK直线纠偏控制。
-    return pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)
+    return pointToPointByRTK(
+        current_start_lat,
+        current_start_lon,
+        endLat,
+        endLon,
+        heading,
+        speed,
+        continuous_segments=continuous_segments,
+    )
 
 
 def goToPointThread(task_token=None, plan=None):
@@ -6096,6 +6192,7 @@ def observer_go_correct(data):
     if redis_cli.get('openLog') == '1':
         logger.info(data)
     global global_cur_rtk_lat, global_cur_rtk_lon, global_cur_rtk_heading, global_cur_rtk_heading_at, global_go
+    global global_cur_taskPoint
     global_cur_rtk_lat = data.lat
     global_cur_rtk_lon = data.lon
     if data.heading is not None:
@@ -6192,6 +6289,19 @@ def observer_go_correct(data):
             signed_remaining,
             cte,
         ):
+            advanced = _advance_continuous_target(data.lat, data.lon)
+            if advanced:
+                # 普通浮动点不是一段驾驶任务的终点。保持global_go=1和当前前进命令，
+                # 只把纠偏目标切换到同一条连续折线的下一个记录点。
+                logger.warn(
+                    "连续折线经过浮动点，保持行驶并切换目标: nextTaskId={}, remaining={}".format(
+                        advanced.get('taskId'),
+                        advanced.get('remaining'),
+                    )
+                )
+                time.sleep(0.01)
+                return
+
             global_go = 0
             _publish_global_go(global_go)
             redis_cli.set("correct", "false")

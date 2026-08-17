@@ -1,6 +1,8 @@
 # coding=utf-8
 import time
 
+from continuous_route import attach_continuations, collect_continuous_run
+
 
 class ModelingExecutionError(Exception):
     pass
@@ -123,7 +125,13 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
 
     # 在执行第一段之前先发布running状态，total等于待执行总段数。
     update_progress(_progress_payload(plan, "running", 0, None, "modeling task started"))
-    for index, segment in enumerate(segments):
+    index = 0
+    while index < len(segments):
+        run = collect_continuous_run(segments, index)
+        if not run:
+            run = [segments[index]]
+        segment = attach_continuations(run)
+        run_count = len(run)
         # 每段开始前检查停止请求，确保用户点“停止”后不会继续启动下一段。
         if should_stop():
             result = _progress_payload(plan, "stopped", completed, segment, "modeling task stopped")
@@ -133,7 +141,8 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
             update_progress(result)
             return result
 
-        # 上报即将执行的任务序号、taskId和mode，便于前端显示实时进度并定位故障段。
+        # 连续折线只调用一次底层直行控制。其余子段作为运行时目标队列附加在首段，
+        # 到普通浮动点时只切换目标，不结束电机控制，也不重新发送启动命令。
         update_progress(_progress_payload(plan, "running", index, segment, "segment running"))
         try:
             # run_segment接入真车RTK、转向、电机、滚刷和刹车；返回True/1才算成功。
@@ -159,9 +168,10 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
             update_progress(result)
             return result
 
-        # 只有本段成功才递增completed并发布segment complete。
-        completed += 1
+        # 整条连续折线成功后，按其中真实包含的任务段数量更新进度。
+        completed += run_count
         update_progress(_progress_payload(plan, "running", completed, segment, "segment complete"))
+        index += run_count
 
     # 所有任务段均成功后才发布complete；因此complete同时表示已按闭环路线返回原点。
     result = _progress_payload(plan, "complete", completed, None, "modeling task complete")

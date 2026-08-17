@@ -39,12 +39,32 @@ class ModelingExecutionMainTest(unittest.TestCase):
         thread_body = function_body(source, "_modelingTaskThread")
         self.assertIn("_run_task_segment_by_point_navigation", runner_body)
         self.assertIn("pointToPointByRTKAutoHeading", shared_runner_body)
+        self.assertIn("continuous_segments=continuous_segments", shared_runner_body)
         self.assertIn("global_cur_rtk_lat", shared_runner_body)
         self.assertIn("global_cur_rtk_lon", shared_runner_body)
         self.assertIn("_mark_runtime_running", thread_body)
         self.assertIn("_mark_runtime_complete", thread_body)
         self.assertIn("_mark_runtime_blocked", thread_body)
         self.assertIn("execute_modeling_plan", thread_body)
+
+    def test_auto_drive_groups_soft_points_before_starting_navigation(self):
+        source = read_main()
+        body = function_body(source, "autoDriveByRTKThread")
+
+        self.assertIn("collect_continuous_run(taskList, index)", body)
+        self.assertIn("attach_continuations(continuous_run)", body)
+        self.assertIn("for completed_offset in range(run_count)", body)
+
+    def test_rtk_observer_switches_continuous_target_without_stopping(self):
+        source = read_main()
+        body = function_body(source, "observer_go_correct")
+        advance_helper = function_body(source, "_advance_continuous_target")
+
+        self.assertIn("continuousTargets", advance_helper)
+        self.assertIn("_advance_continuous_target(data.lat, data.lon)", body)
+        self.assertIn("保持行驶并切换目标", body)
+        self.assertIn("global_rtk_tracking_filter.reset()", advance_helper)
+        self.assertIn("_advance_continuous_target(global_cur_rtk_lat, global_cur_rtk_lon)", source)
 
     def test_modeling_task_runtime_exposes_progress_stop_and_preflight(self):
         source = read_main()

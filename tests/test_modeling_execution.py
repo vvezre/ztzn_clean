@@ -91,6 +91,39 @@ class ModelingExecutionTest(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["code"], "MODELING_SEGMENT_FAILED")
 
+    def test_execute_modeling_plan_runs_soft_points_as_one_continuous_run(self):
+        from continuous_route import CONTINUATION_KEY
+        from modeling_execution import build_execution_plan, execute_modeling_plan
+
+        tasks = []
+        for index in range(3):
+            tasks.append({
+                "id": index + 1,
+                "mode": 1,
+                "startLat": 32.0,
+                "startLon": 118.0 + index * 0.0001,
+                "endLat": 32.0,
+                "endLon": 118.0001 + index * 0.0001,
+                "heading": 90,
+                "length": 1000,
+                "continuousPathId": "g1:boundary:1",
+                "turnAtStart": index == 0,
+                "stopAtEnd": index == 2,
+            })
+        plan = build_execution_plan("model-a", {"status": "ready", "tasks": tasks}, speed=300)
+        calls = []
+
+        result = execute_modeling_plan(
+            plan,
+            run_segment=lambda segment: calls.append(segment) or True,
+        )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["completedCount"], 3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["id"] for item in calls[0][CONTINUATION_KEY]], [2, 3])
+        self.assertTrue(calls[0]["stopAtEnd"])
+
     def test_execute_modeling_plan_reports_stopped_when_segment_is_interrupted(self):
         from modeling_execution import build_execution_plan, execute_modeling_plan
 

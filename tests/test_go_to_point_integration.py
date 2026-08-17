@@ -44,7 +44,8 @@ class GoToPointIntegrationTest(unittest.TestCase):
         self.assertIn("build_go_to_point_plan(", body)
         self.assertIn("def pointToPointByRTKAutoHeading(", body)
         self.assertIn("util.get_distance_angle(current_start_lat, current_start_lon, endLat, endLon)", body)
-        self.assertIn("pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)", body)
+        self.assertIn("return pointToPointByRTK(", body)
+        self.assertIn("continuous_segments=continuous_segments", body)
         self.assertIn("pointToPointByRTKAutoHeading(", body)
         self.assertNotIn('data["heading"],\n            data["speed"],', body)
         self.assertIn("'action': 'go_to_point'", body)
@@ -67,10 +68,8 @@ class GoToPointIntegrationTest(unittest.TestCase):
         self.assertIn("heading * 10,", body)
         self.assertIn("source='point_to_point_auto_heading'", body)
         self.assertIn("if turn_result != 1:", body)
-        self.assertIn(
-            "return pointToPointByRTK(current_start_lat, current_start_lon, endLat, endLon, heading, speed)",
-            body,
-        )
+        self.assertIn("return pointToPointByRTK(", body)
+        self.assertIn("continuous_segments=continuous_segments", body)
 
     def test_modeling_boundary_soft_turn_reuses_point_to_point_without_stationary_turn(self):
         body = read_main()
