@@ -102,6 +102,8 @@ class MQTTCommandHandler(object):
             'start_modeling': self._handle_start_modeling,
             'newModelingArea': self._handle_new_modeling_area,
             'new_modeling_area': self._handle_new_modeling_area,
+            'newModelingLink': self._handle_new_modeling_link,
+            'new_modeling_link': self._handle_new_modeling_link,
             'finishModeling': self._handle_finish_modeling,
             'finish_modeling': self._handle_finish_modeling,
             'replanModelingRoute': self._handle_replan_modeling_route,
@@ -162,6 +164,7 @@ class MQTTCommandHandler(object):
             'sample_modeling_link_point': self._handle_sample_modeling_link_point,
             'start_modeling': self._handle_start_modeling,
             'new_modeling_area': self._handle_new_modeling_area,
+            'new_modeling_link': self._handle_new_modeling_link,
             'finish_modeling': self._handle_finish_modeling,
             'replan_modeling_route': self._handle_replan_modeling_route,
             'get_modeling_state': self._handle_get_modeling_state,
@@ -533,6 +536,11 @@ class MQTTCommandHandler(object):
     def _handle_new_modeling_area(self, params):
         # 连接点记录完成后显式创建下一区域；区域编号由 FSM 自动递增。
         return self._call_controller('new_modeling_area', 'new modeling area created')
+
+    def _handle_new_modeling_link(self, params):
+        # 显式切换到一条新的连接桥；这里只建立逻辑分组，不读取 RTK 点位。
+        # 后续每次 sample_modeling_link_point 才真正记录一个连接点。
+        return self._call_controller('new_modeling_link', 'new modeling link created')
 
     def _handle_finish_modeling(self, params):
         # 完成打点后依次执行：区域识别 -> 清扫线预览 -> 机器人 taskPlan 生成。

@@ -332,6 +332,13 @@ class VehicleControllerAdapter(object):
             'new modeling area created',
         )
 
+    def new_modeling_link(self):
+        """Select a new connection bridge; no RTK point is sampled here."""
+        return self._normalize_modeling_response(
+            self._call('/modeling/session/new-link', json_data={}),
+            'new modeling link created',
+        )
+
     def undo_modeling_point(self, point_type=None):
         payload = {}
         if point_type:

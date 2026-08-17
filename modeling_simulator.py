@@ -73,6 +73,10 @@ SCENARIO_POINTS = (
 # makes the manual MQTT flow and the automatic preload flow identical.
 SCENARIO_NEW_AREA_INDEXES = frozenset((6, 12))
 
+# Before the first point of each bridge, perform the same explicit
+# ``new_modeling_link`` operation that the mini-program now performs.
+SCENARIO_NEW_LINK_INDEXES = frozenset((4, 10))
+
 
 class ModelingSimulatorError(Exception):
     def __init__(self, code, message):
@@ -422,12 +426,17 @@ class ModelingSimulatorController(object):
     def new_modeling_area(self):
         return self._call("simulation modeling area created", self.session.new_area)
 
+    def new_modeling_link(self):
+        return self._call("simulation modeling link created", self.session.new_link)
+
     def preload_scenario(self):
         """Create the complete fixed two-area scenario before MQTT starts."""
         def action():
             self.player.cancel()
             started = self.session.start("simulator-two-areas", restart=True)
             for index, spec in enumerate(SCENARIO_POINTS):
+                if index in SCENARIO_NEW_LINK_INDEXES:
+                    self.session.new_link()
                 if index in SCENARIO_NEW_AREA_INDEXES:
                     self.session.new_area()
                 if spec["pointType"] == "area":

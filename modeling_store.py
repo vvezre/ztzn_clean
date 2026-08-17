@@ -166,6 +166,16 @@ class ModelingStore(object):
                 pass
         return (max(numbers) if numbers else 0) + 1
 
+    def _next_link_number(self, links):
+        """Return the next stable, user-facing connection number."""
+        numbers = []
+        for index, link in enumerate(links or [], start=1):
+            try:
+                numbers.append(int(link.get("linkNumber") or index))
+            except (TypeError, ValueError):
+                numbers.append(index)
+        return (max(numbers) if numbers else 0) + 1
+
     def _normalize_group(self, payload, group_id=None, area_number=None, now=None):
         if not isinstance(payload, dict):
             raise InvalidModelPayloadError("group payload must be an object")
@@ -400,8 +410,10 @@ class ModelingStore(object):
         if start_group_id == end_group_id:
             raise InvalidModelPayloadError("group link requires two different groups")
 
+        links = list(draft.get("groupLinks") or [])
         link = {
             "id": self._validate_model_id(payload.get("id") or self._new_group_link_id()),
+            "linkNumber": self._next_link_number(links),
             "type": "group_connector",
             "name": _text(payload.get("name") or u"{} -> {}".format(start_group.get("name"), end_group.get("name"))),
             "startGroupId": start_group_id,
@@ -411,7 +423,6 @@ class ModelingStore(object):
             "createdAt": current_time,
             "updatedAt": current_time,
         }
-        links = list(draft.get("groupLinks") or [])
         links.append(link)
         draft["groupLinks"] = links
         self._clear_task_outputs(draft)
@@ -429,8 +440,10 @@ class ModelingStore(object):
         groups = draft.get("groups") or []
         start_index = self._find_group_index(draft, start_group_id)
         start_group = groups[start_index]
+        links = list(draft.get("groupLinks") or [])
         link = {
             "id": self._new_group_link_id(),
+            "linkNumber": self._next_link_number(links),
             "type": "group_connector",
             "name": _text(u"{} -> 待新增区域".format(start_group.get("name"))),
             "startGroupId": start_group.get("id"),
@@ -440,7 +453,6 @@ class ModelingStore(object):
             "createdAt": current_time,
             "updatedAt": current_time,
         }
-        links = list(draft.get("groupLinks") or [])
         links.append(link)
         draft["groupLinks"] = links
         self._clear_task_outputs(draft)

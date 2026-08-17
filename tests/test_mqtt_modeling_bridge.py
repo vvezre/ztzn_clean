@@ -110,6 +110,12 @@ class _FakeController(object):
     def new_modeling_area(self):
         return {"success": True, "data": {"areaNumber": 2, "groupCount": 2}}
 
+    def new_modeling_link(self):
+        return {
+            "success": True,
+            "data": {"modelId": "active-model", "linkNumber": 1, "linkPointCount": 0},
+        }
+
     def finish_modeling(self):
         return {"success": True, "data": {"modelId": "active-model", "taskPlan": {"status": "ready"}}}
 
@@ -209,6 +215,15 @@ class _StubAdapter(object):
                 "data": {
                     "areaNumber": 2,
                     "groupCount": 2,
+                },
+            }
+        if path == "/modeling/session/new-link":
+            return {
+                "success": True,
+                "data": {
+                    "modelId": "model-1",
+                    "linkNumber": 1,
+                    "linkPointCount": 0,
                 },
             }
         if path == "/modeling/session/replan":
@@ -650,6 +665,7 @@ class MqttModelingBridgeTest(unittest.TestCase):
             "id": "lp1",
             "name": "连接点1",
             "sequence": 1,
+            "linkNumber": 1,
             "x": 0,
             "y": 100,
             "lat": 32.0365,
@@ -884,6 +900,10 @@ class MqttModelingBridgeTest(unittest.TestCase):
         created_area = handler.handle({"command": "new_modeling_area", "params": {}})
         self.assertTrue(created_area["success"])
         self.assertEqual(created_area["data"], {"areaNumber": 2, "groupCount": 2})
+        created_link = handler.handle({"command": "new_modeling_link", "params": {}})
+        self.assertTrue(created_link["success"])
+        self.assertEqual(created_link["data"]["linkNumber"], 1)
+        self.assertEqual(created_link["data"]["linkPointCount"], 0)
         self.assertTrue(handler.handle({"command": "get_modeling_state", "params": {}})["success"])
         self.assertTrue(handler.handle({"command": "undo_modeling_point", "params": {"pointType": "link"}})["success"])
         self.assertTrue(handler.handle({"command": "clear_modeling_points", "params": {"pointType": "area"}})["success"])
@@ -902,6 +922,18 @@ class MqttModelingBridgeTest(unittest.TestCase):
         self.assertEqual(adapter.path, "/modeling/session/new-area")
         self.assertEqual(adapter.json_data, {})
         self.assertEqual(result["data"], {"areaNumber": 2, "groupCount": 2})
+
+    def test_adapter_calls_explicit_new_link_endpoint(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        adapter = _StubAdapter()
+        result = VehicleControllerAdapter.new_modeling_link(adapter)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(adapter.path, "/modeling/session/new-link")
+        self.assertEqual(adapter.json_data, {})
+        self.assertEqual(result["data"]["linkNumber"], 1)
+        self.assertEqual(result["data"]["linkPointCount"], 0)
 
     def test_modeling_live_position_uses_first_task_segment_as_coordinate_anchor(self):
         import math

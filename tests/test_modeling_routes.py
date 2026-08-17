@@ -114,6 +114,18 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(recorded.get_json()["data"]["pointNo"], 1)
         self.assertEqual(current.get_json()["data"]["areaPointCount"], 1)
 
+    def test_session_new_link_route_selects_empty_bridge(self):
+        self.client.post("/modeling/session/start", json={"name": "bridge-route"})
+        for _ in range(4):
+            self.client.post("/modeling/session/record-area-point", json={})
+
+        created = self.client.post("/modeling/session/new-link", json={})
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.get_json()["data"]["linkNumber"], 1)
+        self.assertEqual(created.get_json()["data"]["linkPointCount"], 0)
+        self.assertEqual(created.get_json()["data"]["session"]["currentLinkNumber"], 1)
+
     def test_session_save_task_requires_ready_path_and_delegates_named_plan(self):
         from modeling_routes import register_modeling_routes
 

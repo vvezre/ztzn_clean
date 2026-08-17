@@ -4,7 +4,11 @@ import unittest
 
 class ModelingSimulatorScenarioTest(unittest.TestCase):
     def test_fixed_points_define_three_tilted_areas_and_two_bridges(self):
-        from modeling_simulator import SCENARIO_NEW_AREA_INDEXES, SCENARIO_POINTS
+        from modeling_simulator import (
+            SCENARIO_NEW_AREA_INDEXES,
+            SCENARIO_NEW_LINK_INDEXES,
+            SCENARIO_POINTS,
+        )
 
         self.assertEqual(
             [point["pointType"] for point in SCENARIO_POINTS],
@@ -13,6 +17,7 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
             + ["area"] * 4,
         )
         self.assertEqual(SCENARIO_NEW_AREA_INDEXES, frozenset((6, 12)))
+        self.assertEqual(SCENARIO_NEW_LINK_INDEXES, frozenset((4, 10)))
         self.assertEqual(
             [(point["x"], point["y"]) for point in SCENARIO_POINTS],
             [
@@ -90,11 +95,13 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
             controller.start_modeling(restart=True)
             for _ in range(4):
                 self.assertTrue(controller.sample_modeling_point()["success"])
+            self.assertTrue(controller.new_modeling_link()["success"])
             for _ in range(2):
                 self.assertTrue(controller.sample_modeling_link_point()["success"])
             self.assertTrue(controller.new_modeling_area()["success"])
             for _ in range(4):
                 self.assertTrue(controller.sample_modeling_point()["success"])
+            self.assertTrue(controller.new_modeling_link()["success"])
             for _ in range(2):
                 self.assertTrue(controller.sample_modeling_link_point()["success"])
             self.assertTrue(controller.new_modeling_area()["success"])

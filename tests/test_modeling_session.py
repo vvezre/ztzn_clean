@@ -132,6 +132,58 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(finished["taskPlan"]["status"], "ready")
         self.assertGreater(finished["taskPlan"]["summary"]["transferTaskCount"], 0)
 
+    def test_explicit_new_link_selects_bridge_without_sampling_a_point(self):
+        from modeling_session import ModelingSession, ModelingSessionError
+        from modeling_store import ModelingStore
+
+        provider = _PointProvider([
+            _point("a1", 0, 0),
+            _point("a2", 0, 200),
+            _point("a3", 400, 200),
+            _point("a4", 400, 0),
+            _point("l1", 0, 220),
+            _point("l2", 0, 280),
+            _point("b1", 0, 300),
+            _point("b2", 0, 500),
+            _point("b3", 300, 500),
+            _point("b4", 300, 300),
+        ])
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        started = session.start("explicit-new-link")
+
+        for _ in range(3):
+            session.record_area_point()
+        with self.assertRaises(ModelingSessionError) as incomplete_area:
+            session.new_link()
+        self.assertEqual(incomplete_area.exception.code, "MODELING_AREA_INCOMPLETE")
+
+        session.record_area_point()
+        created = session.new_link()
+        created_again = session.new_link()
+        draft_before_sampling = store.get_draft(started["modelId"])
+
+        self.assertEqual(created["linkNumber"], 1)
+        self.assertEqual(created["linkPointCount"], 0)
+        self.assertEqual(created_again["linkNumber"], 1)
+        self.assertEqual(draft_before_sampling["groupLinks"], [])
+        with self.assertRaises(ModelingSessionError) as wrong_point_type:
+            session.record_area_point()
+        self.assertEqual(wrong_point_type.exception.code, "MODELING_LINK_POINT_REQUIRED")
+
+        first = session.record_link_point()
+        second = session.record_link_point()
+        self.assertEqual(first["point"]["id"], "l1")
+        self.assertEqual(first["linkNumber"], 1)
+        self.assertEqual(second["linkNumber"], 1)
+
+        session.new_area()
+        for _ in range(4):
+            session.record_area_point()
+        second_bridge = session.new_link()
+        self.assertEqual(second_bridge["linkNumber"], 2)
+        self.assertEqual(second_bridge["session"]["currentLinkNumber"], 2)
+
     def test_connection_source_uses_nearest_area_for_branched_topology(self):
         """区域2完成后回到区域1记录连接点，应创建区域1到区域3的桥。"""
         from modeling_session import ModelingSession

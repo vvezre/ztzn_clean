@@ -133,6 +133,14 @@ def register_modeling_routes(app, storage_dir=None, store=None, sample_point_pro
         except Exception as error:
             return _handle_store_error(error)
 
+    @app.route("/modeling/session/new-link", methods=["POST"])
+    def modeling_session_new_link():
+        """Select a new logical connection bridge without recording a point."""
+        try:
+            return _ok(modeling_session.new_link())
+        except Exception as error:
+            return _handle_store_error(error)
+
     @app.route("/modeling/session/undo", methods=["POST"])
     def modeling_session_undo():
         payload = request.get_json(silent=True) or {}

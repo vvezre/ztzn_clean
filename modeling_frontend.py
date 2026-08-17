@@ -94,11 +94,13 @@ def frontend_link_points(draft):
     """
     # 先建立 id -> 点对象索引，保证列表里的 id 唯一。
     points_by_id = {}
+    link_number_by_point_id = {}
     fallback_point_ids = []
 
-    for link in draft.get('groupLinks') or []:
+    for fallback_link_number, link in enumerate(draft.get('groupLinks') or [], start=1):
         if not isinstance(link, dict):
             continue
+        link_number = link.get('linkNumber') or fallback_link_number
         for point in link.get('points') or []:
             if not isinstance(point, dict):
                 continue
@@ -106,6 +108,7 @@ def frontend_link_points(draft):
             if not point_id or point_id in points_by_id:
                 continue
             points_by_id[point_id] = point
+            link_number_by_point_id[point_id] = link_number
             fallback_point_ids.append(point_id)
 
     # 只读取 pointType=link 的记录事件，区域点不会混入连接点接口。
@@ -134,6 +137,7 @@ def frontend_link_points(draft):
             'id': point_id,
             'name': u'\u8fde\u63a5\u70b9{}'.format(sequence),
             'sequence': sequence,
+            'linkNumber': link_number_by_point_id.get(point_id),
             'x': point.get('x'),
             'y': point.get('y'),
             'lat': point.get('lat'),

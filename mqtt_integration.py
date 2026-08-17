@@ -213,7 +213,7 @@ class MQTTIntegration:
                 'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
                 'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
                 'supported_actions': [
-                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path', 'get_modeling_points', 'new_modeling_area', 'replan_modeling_route'
+                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path', 'get_modeling_points', 'new_modeling_link', 'new_modeling_area', 'replan_modeling_route'
                 ],
                 'supported_params': ['taskName', 'modelId', 'speed', 'tracking', 'path'],
                 'supported_status_fields': [

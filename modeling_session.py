@@ -244,6 +244,7 @@ class ModelingSession(object):
         state["status"] = "recording"
         state["currentGroupId"] = first_group.get("id")
         state["currentLinkId"] = None
+        state["pendingLinkNumber"] = None
         state["previousGroupId"] = None
         state["pendingGroupId"] = None
         state["captureMode"] = None
@@ -272,6 +273,11 @@ class ModelingSession(object):
             "name": state.get("name") or draft.get("name") or "",
             "currentGroupId": state.get("currentGroupId"),
             "currentLinkId": state.get("currentLinkId"),
+            "currentLinkNumber": (
+                current_link.get("linkNumber")
+                if current_link
+                else state.get("pendingLinkNumber")
+            ),
             "currentAreaNumber": current_group.get("areaNumber"),
             "currentPointType": state.get("currentPointType"),
             "areaPointCount": len(current_group.get("points") or []),
@@ -299,6 +305,7 @@ class ModelingSession(object):
                 "name": model.get("name"),
                 "currentGroupId": group["id"],
                 "currentLinkId": None,
+                "pendingLinkNumber": None,
                 "pendingGroupId": None,
                 "captureMode": None,
                 "currentPointType": "area",
@@ -355,6 +362,7 @@ class ModelingSession(object):
             state["previousGroupId"] = source_group.get("id")
             state["currentGroupId"] = next_group.get("id")
             state["currentLinkId"] = None
+            state["pendingLinkNumber"] = None
             state["pendingGroupId"] = None
             state["captureMode"] = None
             state["currentPointType"] = "area"
@@ -366,11 +374,73 @@ class ModelingSession(object):
                 "groupCount": summary.get("groupCount"),
             }
 
+    def new_link(self):
+        """Prepare a new connection bridge without consuming an RTK sample."""
+        with self._lock:
+            state = self._require_state()
+            model_id = state["modelId"]
+            draft = self.store.get_draft(model_id)
+            current_group = self._find_group(draft, state.get("currentGroupId"))
+            if current_group is None:
+                raise ModelingSessionError("MODELING_GROUP_MISSING", "current modeling area is missing")
+            if len(current_group.get("points") or []) < 4:
+                raise ModelingSessionError(
+                    "MODELING_AREA_INCOMPLETE",
+                    "record at least four area points before creating a connection bridge",
+                )
+
+            active_link = self._find_link(draft, state.get("currentLinkId"))
+            if active_link is not None:
+                active_points = list(active_link.get("points") or [])
+                if active_points:
+                    raise ModelingSessionError(
+                        "MODELING_NEW_AREA_REQUIRED",
+                        "create the next area before creating another connection bridge",
+                    )
+                link_number = active_link.get("linkNumber") or len(draft.get("groupLinks") or [])
+                state["captureMode"] = "link"
+                state["currentPointType"] = "link"
+                state["pendingLinkNumber"] = link_number
+                state = self._write_state(state)
+                return {
+                    "modelId": model_id,
+                    "linkNumber": link_number,
+                    "linkPointCount": 0,
+                    "session": self._summary(state, draft),
+                }
+
+            # Do not choose the source area yet. The first recorded bridge point selects
+            # the nearest area, preserving branched layouts such as area 1 -> area 3.
+            if state.get("captureMode") == "link" and state.get("pendingLinkNumber"):
+                link_number = state.get("pendingLinkNumber")
+            else:
+                link_number = len(draft.get("groupLinks") or []) + 1
+            state["currentLinkId"] = None
+            state["pendingLinkNumber"] = link_number
+            state["captureMode"] = "link"
+            state["currentPointType"] = "link"
+            state = self._write_state(state)
+            return {
+                "modelId": model_id,
+                "linkNumber": link_number,
+                "linkPointCount": 0,
+                "session": self._summary(state, draft),
+            }
+
     def record_area_point(self):
         with self._lock:
             state = self._require_state()
             model_id = state["modelId"]
             draft = self.store.get_draft(model_id)
+            if (
+                state.get("captureMode") == "link"
+                and state.get("pendingLinkNumber")
+                and not state.get("currentLinkId")
+            ):
+                raise ModelingSessionError(
+                    "MODELING_LINK_POINT_REQUIRED",
+                    "record connection points after creating a connection bridge",
+                )
             active_link = self._find_link(draft, state.get("currentLinkId"))
             if active_link is not None and (active_link.get("points") or []):
                 raise ModelingSessionError(
@@ -432,6 +502,7 @@ class ModelingSession(object):
                 )
                 link_id = created["groupLink"]["id"]
                 state["currentLinkId"] = link_id
+                state["pendingLinkNumber"] = None
                 draft = created["draft"]
             else:
                 sampled_point = self._sample()
@@ -446,10 +517,12 @@ class ModelingSession(object):
                 result["point"],
             )
             state["currentPointType"] = "link"
+            state["captureMode"] = "link"
             state = self._write_state(state)
             return {
                 "modelId": model_id,
                 "linkId": link_id,
+                "linkNumber": (result.get("groupLink") or {}).get("linkNumber"),
                 "pointType": "link",
                 "pointNo": result["point"].get("sequence"),
                 "point": result["point"],
