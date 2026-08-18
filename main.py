@@ -127,7 +127,15 @@ from modeling_execution import (
     execute_modeling_plan,
 )
 from route_segment_execution import run_route_segment
-from continuous_route import CONTINUATION_KEY, attach_continuations, collect_continuous_run
+from continuous_route import (
+    CONTINUATION_KEY,
+    DEFAULT_CORRIDOR_M,
+    DEFAULT_LOOKAHEAD_M,
+    attach_continuations,
+    build_continuous_polyline,
+    collect_continuous_run,
+    compute_polyline_guidance,
+)
 from route_start_guard import RouteStartGuardError, validate_route_start
 
 app = Flask(__name__)
@@ -2994,13 +3002,55 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
 
     def navigate(current_lat, current_lon, end_lat, end_lon, runtime_speed, before_drive):
         continuous_segments = list(segment.get(CONTINUATION_KEY) or [])
-        # 同一条边界折线的小角度中间点不需要停车原地转向。上一子段已经保持车辆
-        # 和滚刷运行，这里只用实时位置重新计算下一小段航向并更新点到点目标；RTK
-        # 直线控制器会连续修正到新目标。第一段、30度以上拐点和折线终点仍走下面
-        # 的AutoHeading流程，先停车转到正确方向再直行。
+        polyline_points = build_continuous_polyline(segment, continuous_segments)
+        # 相同continuousPathId的多个记录点作为一整条折线执行。普通中间点仍完整
+        # 保留在polyline_points里，但不再逐点停止、重置滤波器或直接瞄准十几厘米外
+        # 的短目标；observer_go_correct会沿折线投影并选择受走廊约束的前视点。
+        if continuous_segments and len(polyline_points) >= 2:
+            final_point = polyline_points[-1]
+            if segment.get('turnAtStart') is False:
+                guidance = compute_polyline_guidance(
+                    polyline_points,
+                    current_lat,
+                    current_lon,
+                )
+                if not guidance:
+                    return 0
+                logger.warn(
+                    "start continuous polyline without stop-turn: taskId={}, points={}, heading={:.3f}, lookahead={:.3f}".format(
+                        segment.get('id'),
+                        len(polyline_points),
+                        float(guidance['heading']),
+                        float(guidance['lookaheadM']),
+                    )
+                )
+                if callable(before_drive):
+                    before_drive()
+                return pointToPointByRTK(
+                    current_lat,
+                    current_lon,
+                    final_point['lat'],
+                    final_point['lon'],
+                    guidance['heading'],
+                    runtime_speed,
+                    polyline_points=polyline_points,
+                )
+            return pointToPointByRTKAutoHeading(
+                current_lat,
+                current_lon,
+                final_point['lat'],
+                final_point['lon'],
+                runtime_speed,
+                before_drive=before_drive,
+                source=source,
+                segment_index=segment_index,
+                task_id=segment.get('id'),
+                polyline_points=polyline_points,
+            )
+
+        # 非连续任务保持原有安全流程。历史任务若显式标记turnAtStart=False，仍不
+        # 原地转向，但这种单段任务的终点较远，不涉及短点位放大航向的问题。
         if segment.get('turnAtStart') is False:
-            # soft boundary point不做原地转向，但仍按新的终点重新计算距离和目标航向，
-            # 因此小车会由RTK直线控制持续修正并经过这个真实边界记录点。
             distance, heading = util.get_distance_angle(
                 current_lat,
                 current_lon,
@@ -3025,7 +3075,6 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
                 end_lon,
                 heading,
                 runtime_speed,
-                continuous_segments=continuous_segments,
             )
         # 普通任务、边界首段、30°以上硬拐点和折线终点走完整安全流程：
         # 实时算航向 -> 原地转向 -> before_drive开/关滚刷 -> 点到点直行。
@@ -3039,7 +3088,6 @@ def _run_task_segment_by_point_navigation(segment, speed, source, segment_index)
             source=source,
             segment_index=segment_index,
             task_id=segment.get('id'),
-            continuous_segments=continuous_segments,
         )
 
     def set_cleaning(enabled):
@@ -5413,78 +5461,27 @@ def moveByRTK(endLat, endLon,heading=0):
         time.sleep(0.1)
     sendBraking()
     global_go = 0
-def _advance_continuous_target(current_lat, current_lon):
-    """切换到同一折线的下一个软目标，且不停车、不重启前进命令。"""
-    global global_cur_taskPoint, global_last_cte, global_last_distance_to_target
-
-    continuous_targets = list(global_cur_taskPoint.get('continuousTargets') or [])
-    if not continuous_targets:
-        return None
-
-    next_target = continuous_targets.pop(0)
-    previous_end_lat = global_cur_taskPoint.get('endLat')
-    previous_end_lon = global_cur_taskPoint.get('endLon')
-    next_end_lat = float(next_target['endLat'])
-    next_end_lon = float(next_target['endLon'])
-    _, next_heading = util.get_distance_angle(
-        current_lat,
-        current_lon,
-        next_end_lat,
-        next_end_lon,
-    )
-    next_start_lat = _coerce_float(next_target.get('startLat'), previous_end_lat)
-    next_start_lon = _coerce_float(next_target.get('startLon'), previous_end_lon)
-    previous_speed = global_cur_taskPoint.get('speed')
-    global_cur_taskPoint = {
-        'heading': next_heading,
-        'startLat': next_start_lat,
-        'startLon': next_start_lon,
-        'endLat': next_end_lat,
-        'endLon': next_end_lon,
-        'speed': _coerce_int(next_target.get('speed'), previous_speed),
-        'continuousTargets': continuous_targets,
-    }
-    # 新子段使用自己的目标直线重新建立滤波坐标系，但保持global_go、电机前进命令
-    # 和滚刷状态不变，因此经过浮动点时不会出现刹车、重新启动造成的停顿。
-    global_rtk_tracking_filter.reset()
-    global_last_cte = 0.0
-    global_last_distance_to_target = None
-    return {
-        'taskId': next_target.get('taskId'),
-        'remaining': len(continuous_targets),
-    }
-
-
 # 通过RTK实现从一个点直线移动到另一个点，返回结果0：表示该任务未执行完成，1：表示执行完成
 def pointToPointByRTK(startLat, startLon, endLat, endLon, heading, speed=200,
-                      continuous_segments=None):
+                      polyline_points=None):
     global global_cur_taskPoint,global_interval
     global global_go
 
     # 返回结果，0：不成功，1：任务执行成功
     result = 1
     global_interval = 0
-    # continuousTargets只存在于运行时，不写回任务文件。第一段到达普通浮动点时，
-    # RTK回调会直接把这里的目标替换成队列中的下一段，并保持global_go=1。
-    continuous_targets = []
-    for item in list(continuous_segments or []):
-        if not isinstance(item, dict):
-            continue
-        next_end_lat = _coerce_float(item.get('endLat'), None)
-        next_end_lon = _coerce_float(item.get('endLon'), None)
-        if next_end_lat is None or next_end_lon is None:
-            continue
-        continuous_targets.append({
-            'taskId': item.get('id'),
-            'startLat': _coerce_float(item.get('startLat'), None),
-            'startLon': _coerce_float(item.get('startLon'), None),
-            'endLat': next_end_lat,
-            'endLon': next_end_lon,
-            'speed': _coerce_int(item.get('speed'), speed),
-        })
+    runtime_polyline = [dict(item) for item in list(polyline_points or []) if isinstance(item, dict)]
+    if runtime_polyline:
+        # 碰边判断和最终完成判断必须指向整条折线的最后一个停车点，不能指向前视
+        # 虚拟目标或中间软点，否则会再次出现“离最终点很远却提前完成”的问题。
+        endLat = float(runtime_polyline[-1]['lat'])
+        endLon = float(runtime_polyline[-1]['lon'])
     global_cur_taskPoint = {"heading": heading, "startLat": startLat, "startLon": startLon,
                             "endLat": endLat, "endLon": endLon, "speed": speed,
-                            "continuousTargets": continuous_targets}
+                            "polylinePoints": runtime_polyline,
+                            "polylineProgressM": 0.0,
+                            "polylineDeviationStartedAt": None,
+                            "polylineFailed": False}
     global_rtk_tracking_filter.reset()
     # 开启RTK纠偏
     global_go = 1
@@ -5503,17 +5500,8 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon, heading, speed=200,
         if global_edge_trigger_latch.consume(getEdge()):
             edge_action = _handle_edge_stop_for_current_task('pointToPointByRTK')
             if edge_action == EDGE_STOP_ACTION_TARGET:
-                # 若碰边发生在同一折线的普通浮动点附近，它只代表当前软目标已到达，
-                # 继续切换到下一个目标；只有整条折线终点才真正结束本次直行。
-                advanced = _advance_continuous_target(global_cur_rtk_lat, global_cur_rtk_lon)
-                if advanced:
-                    logger.warn(
-                        "edge accepted at continuous point; keep driving: nextTaskId={}, remaining={}".format(
-                            advanced.get('taskId'),
-                            advanced.get('remaining'),
-                        )
-                    )
-                    continue
+                # 此时endLat/endLon始终是整条折线的最终停车点，因此只有真正接近
+                # 最终目标时，碰边才可以作为本次连续路径完成。
                 global_go = 0
                 _publish_global_go(global_go)
                 break
@@ -5529,6 +5517,8 @@ def pointToPointByRTK(startLat, startLon, endLat, endLon, heading, speed=200,
         # 获取时间间隔
         global_interval = endTime-startTime
         time.sleep(0.1)
+    if global_cur_taskPoint.get('polylineFailed'):
+        result = 0
     _publish_global_go(global_go)
     return result
 
@@ -5543,12 +5533,32 @@ def pointToPointByRTKAutoHeading(
         source='point_to_point_auto_heading',
         segment_index=None,
         task_id=None,
-        continuous_segments=None):
+        polyline_points=None):
     """按实时起点计算目标方向，完成转向后再执行点到点直行。"""
-    # 根据执行瞬间的真实RTK起点和规划终点计算距离、绝对航向；
-    # 保存文件中的heading仅供预览/核对，不作为此次转向控制输入。
-    distance, heading = util.get_distance_angle(current_start_lat, current_start_lon, endLat, endLon)
-    logger.warn("go to point auto heading: distance={:.3f}, heading={:.3f}".format(float(distance), float(heading)))
+    guidance = None
+    if polyline_points:
+        guidance = compute_polyline_guidance(
+            polyline_points,
+            current_start_lat,
+            current_start_lon,
+        )
+    if guidance:
+        # 连续折线的初始转向使用沿折线前方的前视方向，而不是直接瞄准最近的短点。
+        # 真实停车位置即使偏离理论起点十几厘米，也不会把几度方向放大成七十多度。
+        distance = guidance['remainingM']
+        heading = guidance['heading']
+        logger.warn(
+            "go to polyline auto heading: remaining={:.3f}, heading={:.3f}, crossTrack={:.3f}, lookahead={:.3f}".format(
+                float(distance),
+                float(heading),
+                float(guidance['crossTrackM']),
+                float(guidance['lookaheadM']),
+            )
+        )
+    else:
+        # 普通单段任务继续按实时位置直接计算目标航向。
+        distance, heading = util.get_distance_angle(current_start_lat, current_start_lon, endLat, endLon)
+        logger.warn("go to point auto heading: distance={:.3f}, heading={:.3f}".format(float(distance), float(heading)))
     # 下位机转向协议使用0.1°单位，所以把heading乘10；target_heading保留度数供闭环判断。
     turn_result = turn(
         ser,
@@ -5573,7 +5583,7 @@ def pointToPointByRTKAutoHeading(
         endLon,
         heading,
         speed,
-        continuous_segments=continuous_segments,
+        polyline_points=polyline_points,
     )
 
 
@@ -6223,16 +6233,41 @@ def observer_go_correct(data):
         if data.heading is None:
             logger.warning("RTK经纬度已更新，但当前无有效航向角，暂不执行直行纠偏...")
             return
-        start_lat = global_cur_taskPoint['startLat']
-        start_lon = global_cur_taskPoint['startLon']
-        target_lat = global_cur_taskPoint['endLat']
-        target_lon = global_cur_taskPoint['endLon']
-        target_heading = float(global_cur_taskPoint['heading'])
+        polyline_guidance = None
+        polyline_points = list(global_cur_taskPoint.get('polylinePoints') or [])
+        if polyline_points:
+            polyline_guidance = compute_polyline_guidance(
+                polyline_points,
+                data.lat,
+                data.lon,
+                previous_progress_m=global_cur_taskPoint.get('polylineProgressM', 0.0),
+                lookahead_m=DEFAULT_LOOKAHEAD_M,
+                corridor_m=DEFAULT_CORRIDOR_M,
+            )
+            if not polyline_guidance:
+                logger.error("continuous polyline guidance unavailable; stop route")
+                global_cur_taskPoint['polylineFailed'] = True
+                global_go = 0
+                _publish_global_go(global_go)
+                redis_cli.set("correct", "false")
+                sendBraking()
+                return
+            global_cur_taskPoint['polylineProgressM'] = polyline_guidance['progressM']
+            global_cur_taskPoint['heading'] = polyline_guidance['heading']
+            start_lat = polyline_guidance['referenceLat']
+            start_lon = polyline_guidance['referenceLon']
+            target_lat = polyline_guidance['targetLat']
+            target_lon = polyline_guidance['targetLon']
+            target_heading = float(polyline_guidance['heading'])
+        else:
+            start_lat = global_cur_taskPoint['startLat']
+            start_lon = global_cur_taskPoint['startLon']
+            target_lat = global_cur_taskPoint['endLat']
+            target_lon = global_cur_taskPoint['endLon']
+            target_heading = float(global_cur_taskPoint['heading'])
 
-        # 第四步：计算纠偏命令。
-        # build_tracking_command 内部先用 global_rtk_tracking_filter 对当前 RTK 坐标做 Kalman 滤波，
-        # 再用 global_straight_line_controller 按“起点 -> 终点”这条目标直线计算控制量。
-        # 返回值包含到终点距离、航向误差、横向偏差 cte，以及要下发给下位机的转向输出 z_speed。
+        # 连续折线模式把“当前位置投影点->受走廊约束的前视点”作为本帧纠偏线；
+        # 普通单段任务仍使用保存的起点和终点。两者共用原有RTK直线控制器。
         tracking_command = build_tracking_command(
             global_rtk_tracking_filter,
             global_straight_line_controller,
@@ -6245,29 +6280,52 @@ def observer_go_correct(data):
             vehicle_heading=data.heading,
             target_heading=target_heading,
             timestamp=now,
+            # 连续折线的前视点固定在0.8m以内，不能沿用普通短距离任务的±5度
+            # 航向限制，否则全过程都无法充分纠偏。20度仍保留限幅，避免猛打方向。
+            short_range_heading_limit_deg=20.0 if polyline_guidance else None,
         )
-        distance_to_target = tracking_command.distance_to_target_m
+        steering_distance = tracking_command.distance_to_target_m
         heading_error = tracking_command.heading_error_deg
         cte = tracking_command.cte_m
         z_speed = tracking_command.z_speed
+        if polyline_guidance:
+            distance_to_target = polyline_guidance['distanceToFinalM']
+            signed_remaining = polyline_guidance['remainingM']
+            route_cross_track = polyline_guidance['crossTrackM']
+        else:
+            distance_to_target = steering_distance
+            signed_remaining = tracking_command.signed_remaining_m
+            route_cross_track = abs(cte)
+
+        if polyline_guidance and polyline_guidance.get('terminalMissed'):
+            # 已经越过最终点且超出15cm可接受制动范围时，继续向前只会把误差扩大，
+            # 最终触发30cm硬限位。这里立即失败停车，由上层明确报告本段未完成。
+            logger.error(
+                "continuous polyline passed final target; stop route: overshoot={:.3f}, distance={:.3f}, cte={:.3f}".format(
+                    polyline_guidance.get('overshootM') or 0.0,
+                    distance_to_target,
+                    route_cross_track,
+                )
+            )
+            global_cur_taskPoint['polylineFailed'] = True
+            global_go = 0
+            _publish_global_go(global_go)
+            redis_cli.set("correct", "false")
+            sendBraking()
+            return
+
         setZSpeed(z_speed)
         duplicateWriteCmd(ser, command)
         logger.info(
-            "kalman p correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} last_cte={:.2f} distance={:.2f}m z={}".format(
-                target_heading, data.heading, heading_error, cte, global_last_cte, distance_to_target,
-                z_speed
+            "kalman p correction target={:.2f} current={:.2f} heading_error={:.2f} cte={:.2f} routeCte={:.2f} distance={:.2f}m z={}".format(
+                target_heading, data.heading, heading_error, cte, route_cross_track,
+                distance_to_target, z_speed
             )
         )
-
-        # 打印状态
-        logger.info("航向角:{:.2f} | 当前航向角:{:.2f} | heading_error:{:.2f}横向偏差:{:.2f}上次横向偏差:{:.2f}距离目标:{:.2f}m | 转向输出: {:.2f}"
-                    .format(target_heading, data.heading, heading_error, cte, global_last_cte,distance_to_target,
-                            z_speed))
         global_last_cte = cte
         if distance_to_target <= 2 and redis_cli.get('lastTask') == '1':
             sendCommandSetXSpeed(200)
 
-        signed_remaining = tracking_command.signed_remaining_m
         _publish_correction_debug(
             heading_error,
             cte,
@@ -6281,35 +6339,72 @@ def observer_go_correct(data):
                 'rawLon': tracking_command.raw_lon,
                 'filteredLat': tracking_command.filtered_lat,
                 'filteredLon': tracking_command.filtered_lon,
-                'controlSource': tracking_command.source,
+                'controlSource': 'polyline_lookahead' if polyline_guidance else tracking_command.source,
+                'routeCrossTrack': route_cross_track,
+                'lookahead': polyline_guidance.get('lookaheadM') if polyline_guidance else None,
+                'routeProgress': polyline_guidance.get('progressM') if polyline_guidance else None,
             }
         )
-        if util.should_finish_point_to_point(
-            distance_to_target,
-            signed_remaining,
-            cte,
-        ):
-            advanced = _advance_continuous_target(data.lat, data.lon)
-            if advanced:
-                # 普通浮动点不是一段驾驶任务的终点。保持global_go=1和当前前进命令，
-                # 只把纠偏目标切换到同一条连续折线的下一个记录点。
-                logger.warn(
-                    "连续折线经过浮动点，保持行驶并切换目标: nextTaskId={}, remaining={}".format(
-                        advanced.get('taskId'),
-                        advanced.get('remaining'),
-                    )
-                )
-                time.sleep(0.01)
-                return
 
+        if polyline_guidance:
+            # 10厘米走廊用于限制前视线抹平真实折线。超过后控制器继续主动纠偏；
+            # 偏差达到30厘米，或20厘米以上持续5秒仍未恢复，才安全停车并报告失败。
+            if route_cross_track > DEFAULT_CORRIDOR_M:
+                deviation_started_at = global_cur_taskPoint.get('polylineDeviationStartedAt')
+                if deviation_started_at is None:
+                    deviation_started_at = now
+                    global_cur_taskPoint['polylineDeviationStartedAt'] = now
+                last_log_at = global_cur_taskPoint.get('polylineLastDeviationLogAt') or 0.0
+                if now - last_log_at >= 1.0:
+                    logger.warn(
+                        "polyline deviation correction: cte={:.3f}, corridor={:.3f}, progress={:.3f}, remaining={:.3f}".format(
+                            route_cross_track,
+                            DEFAULT_CORRIDOR_M,
+                            polyline_guidance['progressM'],
+                            polyline_guidance['remainingM'],
+                        )
+                    )
+                    global_cur_taskPoint['polylineLastDeviationLogAt'] = now
+                hard_deviation = route_cross_track >= 0.30
+                persistent_deviation = (
+                    route_cross_track >= 0.20 and
+                    now - deviation_started_at >= 5.0
+                )
+                if hard_deviation or persistent_deviation:
+                    reason = 'hard_limit' if hard_deviation else 'persistent'
+                    logger.error(
+                        "polyline deviation unsafe; stop route: reason={}, cte={:.3f}, elapsed={:.2f}".format(
+                            reason,
+                            route_cross_track,
+                            now - deviation_started_at,
+                        )
+                    )
+                    global_cur_taskPoint['polylineFailed'] = True
+                    global_go = 0
+                    _publish_global_go(global_go)
+                    redis_cli.set("correct", "false")
+                    sendBraking()
+                    return
+            else:
+                global_cur_taskPoint['polylineDeviationStartedAt'] = None
+
+            finished = bool(polyline_guidance['complete'])
+        else:
+            finished = util.should_finish_point_to_point(
+                distance_to_target,
+                signed_remaining,
+                cte,
+            )
+
+        if finished:
             global_go = 0
             _publish_global_go(global_go)
             redis_cli.set("correct", "false")
             logger.warn(
-                "路径直行结束 distance={:.3f} signed={:.3f} cte={:.3f}".format(
+                "路径直行结束 distance={:.3f} remaining={:.3f} cte={:.3f}".format(
                     distance_to_target,
                     signed_remaining,
-                    cte,
+                    route_cross_track,
                 )
             )
         global_last_distance_to_target = distance_to_target

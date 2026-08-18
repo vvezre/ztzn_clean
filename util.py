@@ -1333,24 +1333,25 @@ def signed_along_track_distance(start_lat, start_lon, end_lat, end_lon, current_
 
 
 def should_finish_point_to_point(distance_to_target, signed_remaining, cte,
-                                 target_tolerance_m=0.03, cte_tolerance_m=0.30):
-    """判断当前点到点直行是否可以结束。
+                                 target_tolerance_m=0.10, cte_tolerance_m=0.10,
+                                 passed_distance_limit_m=0.15):
+    """判断普通单段点到点直行是否真正到达终点。
 
-    distance_to_target 是当前点到终点的真实距离；
-    signed_remaining 是沿目标路径方向还剩多少米，小于等于 0 表示已经到达或越过终点投影；
-    cte 是横向偏差，表示当前点距离目标直线有多远。
+    仅仅越过终点横截线不能算完成：车辆还必须靠近终点并且横向偏差处于允许范围。
+    这可以阻止“距离目标仍有一米多，但因斜着越过投影线而提前完成”的情况。
     """
-
-    # 第一种完成条件：车辆已经非常接近终点，直接认为当前路径段完成。
-    if distance_to_target is not None and float(distance_to_target) <= target_tolerance_m:
+    if distance_to_target is None:
+        return False
+    distance_to_target = float(distance_to_target)
+    if distance_to_target <= float(target_tolerance_m):
         return True
-
-    # 如果没有沿路径剩余距离或横向偏差，就无法判断是否已经越过终点。
     if signed_remaining is None or cte is None:
         return False
-
-    # 第二种完成条件：车辆已经沿路径方向到达/越过终点，并且横向偏差仍在允许范围内。
-    return float(signed_remaining) <= 0 and abs(float(cte)) <= cte_tolerance_m
+    return (
+        float(signed_remaining) <= 0 and
+        abs(float(cte)) <= float(cte_tolerance_m) and
+        distance_to_target <= float(passed_distance_limit_m)
+    )
 
 def calculate_perpendicular_point(lat1, lon1, lat2, lon2, distance_meters, side='left'):
     """

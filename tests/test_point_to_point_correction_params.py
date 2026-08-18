@@ -20,6 +20,8 @@ class PointToPointCorrectionParamsTest(unittest.TestCase):
         self.assertIn("global_straight_line_controller", source)
         self.assertNotIn("global_pure_pursuit_tracker", source)
         self.assertNotIn("pure pursuit correction", source)
+        self.assertIn("short_range_heading_limit_deg=20.0 if polyline_guidance else None", source)
+        self.assertIn("polyline_guidance.get('terminalMissed')", source)
 
     def test_runtime_correction_debug_is_published_for_dev_console(self):
         source = read_main()

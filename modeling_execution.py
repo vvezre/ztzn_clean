@@ -141,8 +141,9 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
             update_progress(result)
             return result
 
-        # 连续折线只调用一次底层直行控制。其余子段作为运行时目标队列附加在首段，
-        # 到普通浮动点时只切换目标，不结束电机控制，也不重新发送启动命令。
+        # 连续折线只调用一次底层直行控制。其余子段作为运行时折线数据附加在首段，
+        # 车辆通过投影和前视点连续跟踪整条折线；经过普通浮动点时不结束电机控制，
+        # 也不会重新发送启动命令或重新按短距离目标计算航向。
         update_progress(_progress_payload(plan, "running", index, segment, "segment running"))
         try:
             # run_segment接入真车RTK、转向、电机、滚刷和刹车；返回True/1才算成功。

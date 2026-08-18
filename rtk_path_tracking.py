@@ -247,7 +247,8 @@ class StraightLinePController(object):
         self.max_z_speed = int(max_z_speed)
 
     def compute(self, start_lat, start_lon, end_lat, end_lon, current_lat, current_lon,
-                vehicle_heading, target_heading=None, raw_lat=None, raw_lon=None):
+                vehicle_heading, target_heading=None, raw_lat=None, raw_lon=None,
+                short_range_heading_limit_deg=None):
         # 以路径起点为局部坐标原点，把终点和当前点都转换成米制坐标。
         end_x, end_y = _latlon_to_local_m(start_lat, start_lon, end_lat, end_lon)
         cur_x, cur_y = _latlon_to_local_m(start_lat, start_lon, current_lat, current_lon)
@@ -285,7 +286,15 @@ class StraightLinePController(object):
         heading_error = _normalize_heading_delta(desired_heading, vehicle_heading)
         if distance_to_target < 1.0:
             # 接近终点时限制航向误差，避免为追求角度而在终点附近剧烈摆动。
-            limit = abs(self.short_range_heading_limit_deg)
+            # 连续折线的控制目标本来就是0.8m以内的动态前视点，如果仍固定使用
+            # 默认5度，整条路线都会被误判成“临近终点”，横向偏差无法及时修正。
+            # 调用方可为连续折线传入更大的安全限幅；普通单段仍保持历史5度。
+            limit_value = (
+                self.short_range_heading_limit_deg
+                if short_range_heading_limit_deg is None
+                else short_range_heading_limit_deg
+            )
+            limit = abs(float(limit_value))
             heading_error = max(-limit, min(limit, heading_error))
         # Matches the server backup active observer: compute_linear_steering(...)
         # was negated before being sent to setZSpeed.
@@ -311,7 +320,7 @@ class StraightLinePController(object):
 
 def build_tracking_command(rtk_filter, tracker, start_lat, start_lon, end_lat, end_lon,
                            current_lat, current_lon, vehicle_heading, target_heading=None,
-                           timestamp=None):
+                           timestamp=None, short_range_heading_limit_deg=None):
     """直行纠偏总入口。
 
     observer_go_correct() 每收到一帧 RTK 数据都会调用这里：
@@ -334,6 +343,7 @@ def build_tracking_command(rtk_filter, tracker, start_lat, start_lon, end_lat, e
         target_heading=target_heading,
         raw_lat=current_lat,
         raw_lon=current_lon,
+        short_range_heading_limit_deg=short_range_heading_limit_deg,
     )
     command.source = "kalman_p_control"
     return command

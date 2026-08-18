@@ -8,7 +8,7 @@
 3. 把 groupLinks 当作双向图，通过连接点寻找任意区域之间的可达路径。
 4. 区域内沿人工记录边界比较正反两个方向，不允许用斜线穿过区域。
 5. 每两个连续路径点生成一条任务：mode=1 是清扫，mode=2 是对接、换行或连接桥移动。
-6. 合并近似直行的普通移动点，但保留30度以上的真实转弯；清扫线本身绝不做容差合并。
+6. 合并近似直行的普通移动点；清扫折线仅合并5cm内同位点和30cm内明确直行/折返近点。
 7. 输出前强制检查起点、终点和每一段连续性，防止小车执行断裂路线。
 
 坐标单位为厘米；航向角约定0度=+y、90度=+x、180度=-y、270度=-x。
@@ -28,6 +28,22 @@ TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
 # 边界投影点距离记录角点不超过20cm时直接吸附到角点，避免让小车为RTK抖动
 # 产生的很短边界段额外停车；超过该距离时必须保留投影点，禁止斜切到角点。
 BOUNDARY_CORNER_SNAP_CM = 20.0
+# 只有当前点和目标点本身都贴在边界上，才允许使用“同边直达”。连接桥可能
+# 位于区域外侧，即使两个最近投影碰巧落在同一边，也仍须经过人工边界锚点。
+SAME_EDGE_DIRECT_MAX_OFFSET_CM = 2.0
+# 清扫线求交端点距真实记录点5cm以内时直接使用记录点。这样既保留人工点，
+# 又不会为了回到只差几厘米的角点额外生成停车掉头任务。
+LANE_ENDPOINT_ANCHOR_SNAP_CM = 5.0
+
+# 跨区域转场会把“区域边界路径、连接桥点、下一片区域边界路径”拼成一条折线。
+# 不同几何步骤可能把同一个物理位置算成相差几厘米的两个点；如果原样落成任务，
+# 小车会为这些 RTK/投影误差停车、掉头，甚至形成 A->B->A 的短距离往返。
+# 5cm 内视为同一个物理连接点。相邻的两个普通中间点若相距不超过30cm，
+# 会组成一个近点簇，并比较保留簇内哪个点能让前后局部路线最短；原点、目标点
+# 和人工连接桥点属于保护点，永远不参加近点删除。孤立的短直角仍按转角规则保留。
+TRANSITION_DUPLICATE_POINT_CM = 5.0
+TRANSITION_NEAR_POINT_CM = 30.0
+TRANSITION_BACKTRACK_DEG = 150.0
 
 # 局部方向变化达到30度就认为是真实转弯，必须保留为任务端点，让小车停车重新转向。
 # test12 中16～18度的采样摆动可以连续直行，而实际90度连接桥转角一定会被保留。
@@ -35,6 +51,14 @@ TRANSFER_HARD_TURN_DEG = 30.0
 # 同一条边界清扫折线也使用30度作为“必须停车重新转向”的阈值。小于该角度时，
 # 相邻点仍作为真实路径点保留，但执行器连续驶过，不关闭滚刷、不执行原地转向。
 CLEAN_PATH_HARD_TURN_DEG = 30.0
+
+# 人工记录的边界清扫折线中，两点不超过5cm时视为同一物理位置，
+# 禁止拆成“停车转向 -> 行走1cm -> 再停车”的独立清扫任务。5～30cm
+# 只有当其中一点在上下文中属于近似直行或明显原路折返时才删除；
+# 真实的90度短边仍然保留。这些阈值只作用于边界 laneType=boundary。
+CLEAN_DUPLICATE_POINT_CM = 5.0
+CLEAN_NEAR_POINT_CM = 30.0
+CLEAN_BACKTRACK_DEG = 150.0
 
 # 小于3厘米的普通转场低于当前RTK点到点导航的有效执行尺度，不应单独形成
 # “移动几乎看不见、但停车并重新下发下一任务”的伪任务。这里只处理mode=2
@@ -350,6 +374,56 @@ def _remove_short_transfer_tasks(tasks):
     return compacted
 
 
+def _remove_short_task_backtracks(tasks):
+    """删除跨任务类型边界形成的短距离 A->B->A 原路往返。
+
+    一条边界清扫折线可能以 A->B 结束，而紧接着的自动转场又从 B 返回 A。
+    这种折返无法在单独构建转场点列时发现，因为第一段属于 mode=1、第二段属于
+    mode=2。只有两段都不超过30cm、首尾回到5cm内，并且属于“两个自动转场”
+    或“连续边界清扫末段+自动转场”时才删除；独立清扫线、真实90度转角和较长
+    连接桥不会命中。
+    """
+    compacted = [dict(task) for task in (tasks or [])]
+    index = 0
+    while index + 1 < len(compacted):
+        outbound = compacted[index]
+        inbound = compacted[index + 1]
+        outbound_start = (_number(outbound.get("startX")), _number(outbound.get("startY")))
+        outbound_end = (_number(outbound.get("endX")), _number(outbound.get("endY")))
+        inbound_start = (_number(inbound.get("startX")), _number(inbound.get("startY")))
+        inbound_end = (_number(inbound.get("endX")), _number(inbound.get("endY")))
+        if None in outbound_start or None in outbound_end or None in inbound_start or None in inbound_end:
+            index += 1
+            continue
+        contiguous = _is_same_point(outbound_end, inbound_start)
+        returns_to_start = _length_cm(outbound_start, inbound_end) <= TRANSITION_DUPLICATE_POINT_CM
+        outbound_length = _length_cm(outbound_start, outbound_end)
+        inbound_length = _length_cm(inbound_start, inbound_end)
+        short_pair = max(outbound_length, inbound_length) <= TRANSITION_NEAR_POINT_CM
+        outbound_mode = int(outbound.get("mode") or 0)
+        inbound_mode = int(inbound.get("mode") or 0)
+        removable_pair = (
+            (outbound_mode == 2 and inbound_mode == 2) or
+            (
+                outbound_mode == 1 and
+                inbound_mode == 2 and
+                bool(outbound.get("continuousPathId"))
+            )
+        )
+        if not (contiguous and returns_to_start and short_pair and removable_pair):
+            index += 1
+            continue
+
+        # 下一任务从折返前的A点继续，前一任务（若存在）本来就结束在A点。
+        following = compacted[index + 2] if index + 2 < len(compacted) else None
+        if following is not None:
+            compacted[index + 2] = _reanchor_task_start(following, outbound)
+        del compacted[index:index + 2]
+        if index > 0:
+            index -= 1
+    return compacted
+
+
 def _same_direction_collinear(left, right):
     """判断两个首尾相接的任务段能否作为一条直线连续执行。"""
     if int(left.get("mode") or 0) != int(right.get("mode") or 0):
@@ -557,8 +631,9 @@ def _compact_executable_tasks(tasks):
     区域边界采样点、前端绘图点或连接桥中间点只有在真正形成拐角时才会留下；
     清扫模式发生变化或显式标记为必须停车的位置永远不会被跨越合并。
     """
-    # 先吸收低于导航有效尺度的普通短转场，避免毫米级浮点误差取整后变成
-    # 1厘米独立停车任务。随后再执行原有的共线合并和转角简化。
+    # 先删除跨“清扫末段/转场首段”边界的短距离原路折返，再吸收低于导航
+    # 有效尺度的普通短转场；随后执行原有的共线合并和转角简化。
+    tasks = _remove_short_task_backtracks(tasks)
     tasks = _remove_short_transfer_tasks(tasks)
 
     # Preserve the old exact-collinear behaviour for every task mode first.
@@ -807,6 +882,11 @@ def _append_transition_tasks(
     若两个区域没有可达的连接桥，直接报错，不允许机器人跨空直线行驶。
     """
     route_edges = _link_route_between(preview, from_group_id, to_group_id, mapper)
+    # 连接桥点是人工明确记录的跨区通道，不能被30cm近点规则删掉。首尾任务点
+    # 也会在简化函数内部自动保护；这里收集路线经过的全部桥点作为额外保护点。
+    protected_transition_points = []
+    for edge in route_edges or []:
+        protected_transition_points.extend(edge.get("points") or [])
     if from_group_id != to_group_id and route_edges is None:
         raise ModelingTaskGenerationError(
             "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
@@ -843,6 +923,13 @@ def _append_transition_tasks(
         path_points = _dedupe_xy_path(path_points + arrival[1:])
     else:
         path_points = [current, target]
+    # 跨模块拼接完成后再统一清理，才能识别“区域边界末点 -> 桥头 -> 同一边界末点”
+    # 这种单个模块内部看不出的局部折返。清理后 _append_xy_path 会重新计算每段
+    # 航向、长度以及 turnAtStart/stopAtEnd，不沿用旧任务的停车标记。
+    path_points = _simplify_transition_path_points(
+        path_points,
+        protected_points=protected_transition_points,
+    )
     return _append_xy_path(
         tasks,
         path_points,
@@ -888,6 +975,166 @@ def _dedupe_xy_path(points):
         if not result or not _is_same_point(result[-1], xy):
             result.append(xy)
     return result
+
+
+def _is_protected_transition_point(point, protected_points):
+    """判断一个转场坐标是否属于原点、目标点或人工连接桥保护点。"""
+    return any(_is_same_point(point, protected) for protected in protected_points or [])
+
+
+def _collapse_near_transition_clusters(points, protected_points):
+    """把30cm内的普通近点簇压缩为局部路线代价最低的一个代表点。
+
+    对于 ``P -> A -> B -> N`` 且 ``|A-B| <= 30cm`` 的情况，同时比较：
+
+    - 删除A、保留B：``|P-B| + |B-N|``；
+    - 保留A、删除B：``|P-A| + |A-N|``。
+
+    选择局部总长更小的方案。若连续三个以上普通点都两两相近，则把它们作为
+    一个近点簇统一比较，避免结果依赖从左到右的扫描顺序。首点、尾点和人工
+    连接桥点会把近点簇截断，因此真实入口、出口和桥头不会被删除。
+    """
+    if len(points) < 4:
+        return list(points)
+
+    result = [points[0]]
+    index = 1
+    final_index = len(points) - 1
+    while index < final_index:
+        point = points[index]
+        if _is_protected_transition_point(point, protected_points):
+            result.append(point)
+            index += 1
+            continue
+
+        cluster_end = index
+        while cluster_end + 1 < final_index:
+            next_point = points[cluster_end + 1]
+            if _is_protected_transition_point(next_point, protected_points):
+                break
+            if _length_cm(points[cluster_end], next_point) > TRANSITION_NEAR_POINT_CM:
+                break
+            cluster_end += 1
+
+        if cluster_end == index:
+            result.append(point)
+            index += 1
+            continue
+
+        previous_point = result[-1]
+        next_point = points[cluster_end + 1]
+        candidates = []
+        for candidate_index in range(index, cluster_end + 1):
+            candidate = points[candidate_index]
+            local_cost = (
+                _length_cm(previous_point, candidate)
+                + _length_cm(candidate, next_point)
+            )
+            # 成本按0.001cm量化，保证小车Python2和电脑Python3选择一致；
+            # 完全同成本时优先保留记录顺序更靠后的点，删除前方多余短任务。
+            candidates.append((
+                _stable_cost_key(local_cost),
+                -candidate_index,
+                candidate,
+            ))
+        result.append(min(candidates, key=lambda item: item[:2])[2])
+        index = cluster_end + 1
+
+    result.append(points[-1])
+    return _dedupe_xy_path(result)
+
+
+def _simplify_transition_path_points(points, protected_points=None):
+    """清理跨区域转场里的重复点、局部折返和短距离直线冗余点。
+
+    该函数只用于规划器自动拼接出来的 mode=2 转场，不处理用户记录的区域清扫
+    边界，也不处理最终回原点之外的整条任务序列。因此它不会把真实边界波动抹平。
+
+    处理顺序：
+
+    1. 精确重复点先由 ``_dedupe_xy_path`` 删除；
+    2. 新点回到最近几个历史点 5cm 内时，删除中间局部环路，例如 A->B->A；
+    3. 30cm内、连续出现的普通中间点按局部路线总代价选择一个代表点；
+    4. 其余孤立短段只在小于30度的近似直行或大于150度的明显折返时合并；
+    5. 始终把首尾重新固定为原始 current/target，保证任务接口坐标不漂移。
+    """
+    normalized = _dedupe_xy_path(points)
+    if len(normalized) < 3:
+        return normalized
+
+    # 原始首尾和所有人工连接桥点都属于不可删除点。首尾自动加入保护集合，
+    # 即使调用方没有传protected_points，也不会因距离近而丢失任务真实端点。
+    protected = list(protected_points or [])
+    protected.extend((normalized[0], normalized[-1]))
+
+    # 先做局部环路消除。只回看最近8个点，避免把较长、合法的闭环返回路线误判
+    # 为局部重复；连接桥附近的 A->B->A 和 A->B->C->B 都会被消除。但若
+    # 中间已经经过人工连接桥保护点，则禁止截断该段，避免把真实桥路线删掉。
+    loop_free = []
+    for point in normalized:
+        match_index = None
+        if not _is_protected_transition_point(point, protected):
+            search_start = max(0, len(loop_free) - 8)
+            for index in range(len(loop_free) - 1, search_start - 1, -1):
+                crosses_protected_point = any(
+                    _is_protected_transition_point(item, protected)
+                    for item in loop_free[index + 1:]
+                )
+                if crosses_protected_point:
+                    continue
+                if _length_cm(loop_free[index], point) <= TRANSITION_DUPLICATE_POINT_CM:
+                    match_index = index
+                    break
+        if match_index is not None:
+            loop_free = loop_free[:match_index + 1]
+            continue
+        loop_free.append(point)
+
+    loop_free = _collapse_near_transition_clusters(loop_free, protected)
+
+    if len(loop_free) < 3:
+        result = loop_free
+    else:
+        result = list(loop_free)
+        changed = True
+        while changed and len(result) >= 3:
+            changed = False
+            index = 1
+            while index < len(result) - 1:
+                previous_point = result[index - 1]
+                current_point = result[index]
+                next_point = result[index + 1]
+                if _is_protected_transition_point(current_point, protected):
+                    index += 1
+                    continue
+                incoming_length = _length_cm(previous_point, current_point)
+                outgoing_length = _length_cm(current_point, next_point)
+                turn_angle = _turn_angle_degrees(previous_point, current_point, next_point)
+
+                # 小于5cm是同一个物理点；5～30cm只有结合上下文才能删除。
+                duplicate = min(incoming_length, outgoing_length) <= TRANSITION_DUPLICATE_POINT_CM
+                near_segment = min(incoming_length, outgoing_length) <= TRANSITION_NEAR_POINT_CM
+                nearly_straight = turn_angle < TRANSFER_HARD_TURN_DEG
+                clear_backtrack = turn_angle >= TRANSITION_BACKTRACK_DEG
+                if duplicate or (near_segment and (nearly_straight or clear_backtrack)):
+                    del result[index]
+                    changed = True
+                    if index > 1:
+                        index -= 1
+                    continue
+                index += 1
+
+    # 环路消除可能用“距离原点不足5cm”的历史点代替真实终点。重新固定首尾，
+    # 使前端预览、保存坐标和小车最终停车目标仍与本次规划请求完全一致。
+    if not result:
+        return [normalized[0], normalized[-1]]
+    result[0] = normalized[0]
+    if len(result) == 1:
+        if not _is_same_point(result[0], normalized[-1]):
+            result.append(normalized[-1])
+    else:
+        result[-1] = normalized[-1]
+    return _dedupe_xy_path(result)
 
 
 def _pin_path_endpoints(path, current, target):
@@ -1032,17 +1279,42 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
     candidates = []
     start_indexes = _boundary_anchor_candidates(current_projection, anchors)
     end_indexes = _boundary_anchor_candidates(target_projection, anchors)
-    # 两点落在同一条记录边上时，最短合法路径就是沿这条边直接前往目标投影。
-    # 旧逻辑会强制先绕到该边某个端点，矩形换行时因此产生“向上折返再向下”的
-    # 多余任务。若两端分别已吸附到该边两个明确角点，仍保留角点路径语义。
-    snapped_to_opposite_corners = (
-        len(start_indexes) == 1
-        and len(end_indexes) == 1
-        and start_indexes[0] != end_indexes[0]
+    # 两点落在同一条记录边上时，最短且不会反向的合法路径就是沿这条边直接
+    # 前往目标投影。这里不能再使用“距离角点20cm就吸附”的候选结果决定是否
+    # 绕角点：清扫线起点可能恰好距角点17cm，若先吸附到角点再回到起点，就会
+    # 生成“越过目标 -> 原地掉头 -> 返回目标”的错误换行任务。即使两点本身正好
+    # 是该边两端的角点，直接连接也仍然完整地沿着这条真实边界行驶。
+    current_boundary_offset = _length_cm(current, current_projection["point"])
+    target_boundary_offset = _length_cm(target, target_projection["point"])
+    current_edge_index = current_projection["edgeIndex"]
+    target_edge_index = target_projection["edgeIndex"]
+    # 角点同时属于前后两条相邻边。最近投影为保证稳定会选择编号较小的边，
+    # 例如右上角可能归到“上边”，而紧接着的换行目标归到“右边”。只比较边号
+    # 会误判成不同边并绕到右下角；若一个投影点正好是另一条边的端点，也应
+    # 视为可以从这个共享角点直接进入该边。
+    current_is_target_edge_endpoint = any(
+        _is_same_point(current_projection["point"], anchors[index])
+        for index in (
+            target_edge_index,
+            (target_edge_index + 1) % len(anchors),
+        )
+    )
+    target_is_current_edge_endpoint = any(
+        _is_same_point(target_projection["point"], anchors[index])
+        for index in (
+            current_edge_index,
+            (current_edge_index + 1) % len(anchors),
+        )
+    )
+    same_or_shared_edge = (
+        current_edge_index == target_edge_index
+        or current_is_target_edge_endpoint
+        or target_is_current_edge_endpoint
     )
     if (
-            current_projection["edgeIndex"] == target_projection["edgeIndex"]
-            and not snapped_to_opposite_corners):
+            same_or_shared_edge
+            and current_boundary_offset <= SAME_EDGE_DIRECT_MAX_OFFSET_CM
+            and target_boundary_offset <= SAME_EDGE_DIRECT_MAX_OFFSET_CM):
         direct_path = _dedupe_xy_path([
             current,
             current_projection["point"],
@@ -1258,6 +1530,157 @@ def _group_lane_segments(preview, group_id, entry, exit_point):
     return _select_group_lane_segments(preview, group_id, entry, exit_point)["segments"]
 
 
+def _clean_turn_can_remove_point(previous_point, current_point, next_point):
+    """判断一个5～30cm近点能否在不破坏真实边界的前提下删除。
+
+    ``previous -> current -> next`` 的方向变化小于30度，说明current
+    只是近似直线上的密集采样点；方向变化大于等于150度，说明它
+    形成了很短的原路折返。两种情况都可以删除。30～150度之间视为
+    真实边界拐点，即使相邻段很短也不能抹掉。
+    """
+    turn_angle = _turn_angle_degrees(previous_point, current_point, next_point)
+    return (
+        turn_angle < CLEAN_PATH_HARD_TURN_DEG
+        or turn_angle >= CLEAN_BACKTRACK_DEG
+    )
+
+
+def _collapse_duplicate_clean_point_clusters(points):
+    """将5cm内连续记录点簇压缩成一个代表点。
+
+    清扫线首点和尾点同时是区域进出口，所以点簇位于首端时保留
+    原首点，位于尾端时保留原尾点，防止清扫线与前后转场脱节。
+    中间点簇则比较“前一点 -> 候选点 -> 后一点”的局部总距离，
+    保留路线代价最小的候选点。
+    """
+    if len(points) < 2:
+        return list(points)
+
+    collapsed = []
+    index = 0
+    final_index = len(points) - 1
+    while index <= final_index:
+        cluster_end = index
+        while (
+                cluster_end < final_index
+                and _length_cm(points[cluster_end], points[cluster_end + 1])
+                <= CLEAN_DUPLICATE_POINT_CM):
+            cluster_end += 1
+
+        if cluster_end == index:
+            collapsed.append(points[index])
+            index += 1
+            continue
+
+        if index == 0:
+            # 首端点簇保留已被区域顺序算法选中的原清扫起点。
+            representative = points[index]
+        elif cluster_end == final_index:
+            # 尾端点簇保留原清扫终点，让下一段转场从真实出口出发。
+            representative = points[cluster_end]
+        else:
+            previous_point = collapsed[-1]
+            next_point = points[cluster_end + 1]
+            candidates = []
+            for candidate_index in range(index, cluster_end + 1):
+                candidate = points[candidate_index]
+                local_cost = (
+                    _length_cm(previous_point, candidate)
+                    + _length_cm(candidate, next_point)
+                )
+                candidates.append((
+                    _stable_cost_key(local_cost),
+                    -candidate_index,
+                    candidate,
+                ))
+            representative = min(candidates, key=lambda item: item[:2])[2]
+
+        collapsed.append(representative)
+        index = cluster_end + 1
+    return _dedupe_xy_path(collapsed)
+
+
+def _simplify_clean_path_points(points):
+    """在拆分mode=1任务前，清理边界清扫折线里的无意义近点。
+
+    处理顺序：
+
+    1. 删除坐标完全相同的相邻点；
+    2. 将相邻距离不超过5cm的点簇视为同一物理位置；
+    3. 对5～30cm短段，只删除近似直行中间点或明显折返点；
+    4. 每次删点后重新检查相邻关系，直到结果稳定。
+
+    首尾点不参与5～30cm的上下文删除，真实短直角也会完整保留。
+    """
+    result = _collapse_duplicate_clean_point_clusters(_dedupe_xy_path(points))
+    if len(result) < 3:
+        return result
+
+    changed = True
+    while changed and len(result) >= 3:
+        changed = False
+        pair_index = 0
+        while pair_index < len(result) - 1:
+            left_point = result[pair_index]
+            right_point = result[pair_index + 1]
+            distance = _length_cm(left_point, right_point)
+            if distance > CLEAN_NEAR_POINT_CM:
+                pair_index += 1
+                continue
+
+            removable_indexes = []
+            if (
+                    pair_index > 0
+                    and _clean_turn_can_remove_point(
+                        result[pair_index - 1], left_point, right_point
+                    )):
+                removable_indexes.append(pair_index)
+            if (
+                    pair_index + 2 < len(result)
+                    and _clean_turn_can_remove_point(
+                        left_point, right_point, result[pair_index + 2]
+                    )):
+                removable_indexes.append(pair_index + 1)
+
+            if not removable_indexes:
+                pair_index += 1
+                continue
+
+            # 两点都可删时，对比删除后整条折线长度；代价相同时
+            # 优先删记录顺序靠前的点，使 Python 2/3 结果完全一致。
+            choices = []
+            for remove_index in removable_indexes:
+                candidate = result[:remove_index] + result[remove_index + 1:]
+                choices.append((
+                    _stable_cost_key(_polyline_length_cm(candidate)),
+                    remove_index,
+                    candidate,
+                ))
+            result = min(choices, key=lambda item: item[:2])[2]
+            changed = True
+            pair_index = max(0, pair_index - 1)
+
+    return _dedupe_xy_path(result)
+
+
+def _simplify_clean_segments(segments):
+    """清理所有边界清扫线，并把线段首尾同步到清理后的点列。"""
+    simplified_segments = []
+    for original in segments or []:
+        segment = dict(original)
+        path = list(segment.get("path") or [segment.get("start"), segment.get("end")])
+        path = _dedupe_xy_path(path)
+        if segment.get("laneType") == "boundary" and len(path) >= 3:
+            path = _simplify_clean_path_points(path)
+        if len(path) < 2:
+            raise ModelingTaskGenerationError("cleaning lane contains fewer than two usable points")
+        segment["path"] = path
+        segment["start"] = path[0]
+        segment["end"] = path[-1]
+        simplified_segments.append(segment)
+    return simplified_segments
+
+
 def _mark_continuous_path_tasks(path_tasks, continuous_path_id):
     """保留一条人工折线的全部点，仅在30度以上硬拐点停车重新转向。"""
     if not path_tasks:
@@ -1360,6 +1783,9 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
     如果 current 不在下一条清扫线起点，先插入 mode=2 换行段；
     然后再插入 mode=1 清扫段。返回最终位置、下一个任务 ID 和新增清扫段数量。
     """
+    # 拆分mode=1任务前先清理边界近点。这里再做一次是为了保护
+    # 历史调用方；新版区域顺序规划在首段转场前已经做过同样处理。
+    segments = _simplify_clean_segments(segments)
     # clean_count既用于汇总，也用于判断“进入第一条线”是否需要沿人工锚点走。
     clean_count = 0
     # segments已经按照选中的S形方案排序，不能在这里重新改变顺序或方向。
@@ -1468,16 +1894,17 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
                 tasks.append(task)
             task_id += len(lane_tasks)
             clean_count += 1
-            current = segment["end"]
+            # 必须使用清理后的真实终点，下一条线的转场才不会又回到已删除的近点。
+            current = path[-1]
     return current, task_id, clean_count
 
 
 def _snap_lane_endpoints_to_recorded_anchors(segments, draft, mapper):
-    """将3cm内的清扫线端点吸附到同一区域的真实记录点。
+    """将5cm内的清扫线端点吸附到同一区域的真实记录点。
 
     扫描线与边界求交会产生浮点坐标。例如真实角点A6为40.466cm，求交结果
     可能是40.501cm；两者几何上几乎重合，但协议取整后会得到40cm和41cm，
-    从而生成没有实际意义的1cm停车任务。只有当端点确实位于人工记录点3cm
+    从而生成没有实际意义的短距离停车任务。只有当端点确实位于人工记录点5cm
     范围内时才吸附，区域内部正常清扫线和较远的真实边界折线均保持不变。
     """
     snapped_segments = []
@@ -1496,7 +1923,7 @@ def _snap_lane_endpoints_to_recorded_anchors(segments, draft, mapper):
                 continue
             nearest = min(anchors, key=lambda anchor: _length_cm(endpoint, anchor))
             distance = _length_cm(endpoint, nearest)
-            if distance < MIN_EXECUTABLE_TRANSFER_CM:
+            if distance < LANE_ENDPOINT_ANCHOR_SNAP_CM:
                 segment[key] = nearest
                 if path:
                     path[path_index] = nearest
@@ -1528,6 +1955,22 @@ def _validate_continuous_round_trip(tasks, origin):
     """
     if not tasks:
         raise ModelingTaskGenerationError("generated task path is empty")
+
+    # 最终防线：边界近点应在拆任务前已被合并。如果这里仍出现
+    # 5cm以内的mode=1清扫段，说明某条新生成链路绕过了统一清理；
+    # 此时宁可拒绝保存，也不把“转向-走1cm-再转向”任务交给实车。
+    for task in tasks:
+        if int(task.get("mode") or 0) != 1 or task.get("source") != "modeling_clean":
+            continue
+        clean_start = _task_xy(task, "start")
+        clean_end = _task_xy(task, "end")
+        if _length_cm(clean_start, clean_end) <= CLEAN_DUPLICATE_POINT_CM:
+            raise ModelingTaskGenerationError(
+                "generated cleaning task {} is not longer than {}cm".format(
+                    task.get("id"),
+                    int(CLEAN_DUPLICATE_POINT_CM),
+                )
+            )
 
     rounded_origin = (_round_int(origin[0]), _round_int(origin[1]))
     if _task_xy(tasks[0], "start") != rounded_origin:
@@ -1837,6 +2280,9 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
         segments = _snap_lane_endpoints_to_recorded_anchors(
             selected["segments"], draft, mapper
         )
+        # 首条清扫线的起点同时是下方转场的目标点。因此近点清理
+        # 必须在生成首段转场之前完成，不能等mode=1拆任务时才修改。
+        segments = _simplify_clean_segments(segments)
         selection = dict(selected["selection"])
         selection["order"] = index + 1
         selections.append(selection)

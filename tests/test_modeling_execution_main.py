@@ -39,7 +39,7 @@ class ModelingExecutionMainTest(unittest.TestCase):
         thread_body = function_body(source, "_modelingTaskThread")
         self.assertIn("_run_task_segment_by_point_navigation", runner_body)
         self.assertIn("pointToPointByRTKAutoHeading", shared_runner_body)
-        self.assertIn("continuous_segments=continuous_segments", shared_runner_body)
+        self.assertIn("polyline_points=polyline_points", shared_runner_body)
         self.assertIn("global_cur_rtk_lat", shared_runner_body)
         self.assertIn("global_cur_rtk_lon", shared_runner_body)
         self.assertIn("_mark_runtime_running", thread_body)
@@ -55,16 +55,16 @@ class ModelingExecutionMainTest(unittest.TestCase):
         self.assertIn("attach_continuations(continuous_run)", body)
         self.assertIn("for completed_offset in range(run_count)", body)
 
-    def test_rtk_observer_switches_continuous_target_without_stopping(self):
+    def test_rtk_observer_tracks_entire_polyline_without_soft_point_restart(self):
         source = read_main()
         body = function_body(source, "observer_go_correct")
-        advance_helper = function_body(source, "_advance_continuous_target")
 
-        self.assertIn("continuousTargets", advance_helper)
-        self.assertIn("_advance_continuous_target(data.lat, data.lon)", body)
-        self.assertIn("保持行驶并切换目标", body)
-        self.assertIn("global_rtk_tracking_filter.reset()", advance_helper)
-        self.assertIn("_advance_continuous_target(global_cur_rtk_lat, global_cur_rtk_lon)", source)
+        self.assertIn("compute_polyline_guidance", body)
+        self.assertIn("polylineProgressM", body)
+        self.assertIn("polyline deviation correction", body)
+        self.assertIn("polyline deviation unsafe", body)
+        self.assertNotIn("_advance_continuous_target", source)
+        self.assertNotIn("continuousTargets", source)
 
     def test_modeling_task_runtime_exposes_progress_stop_and_preflight(self):
         source = read_main()

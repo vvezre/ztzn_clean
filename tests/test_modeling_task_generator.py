@@ -3,6 +3,141 @@ import unittest
 
 
 class ModelingTaskGeneratorTest(unittest.TestCase):
+    def test_transition_path_removes_local_out_and_back_loop(self):
+        from modeling_task_generator import _simplify_transition_path_points
+
+        # 对应真实日志中的“到桥头附近13cm -> 原路返回 -> 再继续”结构。
+        simplified = _simplify_transition_path_points([
+            (0.0, 0.0),
+            (6.0, 11.0),
+            (0.0, 0.0),
+            (-13.0, -19.0),
+            (-20.0, -80.0),
+        ])
+
+        self.assertEqual(simplified, [(0.0, 0.0), (-20.0, -80.0)])
+
+    def test_transition_path_keeps_short_real_right_angle(self):
+        from modeling_task_generator import _simplify_transition_path_points
+
+        # 13cm 本身不能作为删除理由；形成90度真实拐角时必须留下停车转向点。
+        simplified = _simplify_transition_path_points([
+            (0.0, 0.0),
+            (0.0, 13.0),
+            (100.0, 13.0),
+        ])
+
+        self.assertEqual(simplified, [
+            (0.0, 0.0),
+            (0.0, 13.0),
+            (100.0, 13.0),
+        ])
+
+    def test_transition_path_merges_short_nearly_straight_jitter(self):
+        from modeling_task_generator import _simplify_transition_path_points
+
+        simplified = _simplify_transition_path_points([
+            (0.0, 0.0),
+            (1.0, 15.0),
+            (3.0, 100.0),
+        ])
+
+        self.assertEqual(simplified, [(0.0, 0.0), (3.0, 100.0)])
+
+    def test_transition_near_pairs_keep_lower_cost_later_points(self):
+        """真实近点对应删除A3-9/A2-10，而不是按扫描顺序固定删后点。"""
+        from modeling_task_generator import _simplify_transition_path_points
+
+        l2_2 = (822.80, 175.61)
+        a3_9 = (836.19, 194.78)
+        a3_1 = (829.93, 205.93)
+        a3_2 = (838.99, 272.33)
+        region_three = _simplify_transition_path_points([
+            l2_2, a3_9, a3_1, a3_2,
+        ])
+
+        l1_2 = (18.17, 230.43)
+        a2_10 = (5.77, 271.35)
+        a2_1 = (20.66, 278.88)
+        a2_2 = (24.30, 340.20)
+        region_two = _simplify_transition_path_points([
+            l1_2, a2_10, a2_1, a2_2,
+        ])
+
+        self.assertEqual(region_three, [l2_2, a3_1, a3_2])
+        self.assertNotIn(a3_9, region_three)
+        self.assertEqual(region_two, [l1_2, a2_1, a2_2])
+        self.assertNotIn(a2_10, region_two)
+
+    def test_transition_near_cluster_never_removes_explicit_bridge_points(self):
+        """桥上两个点即使不足30cm也必须全部经过，不能被近点优化跨越。"""
+        from modeling_task_generator import _simplify_transition_path_points
+
+        start = (-100.0, 0.0)
+        bridge_start = (0.0, 0.0)
+        bridge_end = (0.0, 20.0)
+        target = (100.0, 20.0)
+        simplified = _simplify_transition_path_points(
+            [start, bridge_start, bridge_end, target],
+            protected_points=[bridge_start, bridge_end],
+        )
+
+        self.assertEqual(simplified, [
+            start, bridge_start, bridge_end, target,
+        ])
+
+    def test_transition_loop_cleanup_cannot_cut_across_bridge_points(self):
+        """局部回环命中起点附近时，也不能把已经经过的桥点整段截掉。"""
+        from modeling_task_generator import _simplify_transition_path_points
+
+        start = (0.0, 0.0)
+        bridge_start = (0.0, 50.0)
+        bridge_end = (0.0, 80.0)
+        near_start_again = (2.0, 1.0)
+        target = (100.0, 100.0)
+        simplified = _simplify_transition_path_points(
+            [start, bridge_start, bridge_end, near_start_again, target],
+            protected_points=[bridge_start, bridge_end],
+        )
+
+        self.assertIn(bridge_start, simplified)
+        self.assertIn(bridge_end, simplified)
+        self.assertEqual(simplified[0], start)
+        self.assertEqual(simplified[-1], target)
+
+    def test_compaction_removes_short_clean_transfer_reverse_pair(self):
+        from modeling_task_generator import _compact_executable_tasks
+
+        def task(task_id, mode, start, end):
+            return {
+                "id": task_id,
+                "mode": mode,
+                "startX": start[0],
+                "startY": start[1],
+                "endX": end[0],
+                "endY": end[1],
+                "startLat": 32.0,
+                "startLon": 118.0,
+                "endLat": 32.0,
+                "endLon": 118.0,
+                "source": "modeling_clean" if mode == 1 else "modeling_transfer",
+            }
+
+        first = task(1, 1, (-100.0, 0.0), (0.0, 0.0))
+        spur = task(2, 1, (0.0, 0.0), (6.0, 11.0))
+        spur["continuousPathId"] = "boundary-lane"
+        compacted = _compact_executable_tasks([
+            first,
+            spur,
+            task(3, 2, (6.0, 11.0), (0.0, 0.0)),
+            task(4, 2, (0.0, 0.0), (0.0, 100.0)),
+        ])
+
+        self.assertEqual(len(compacted), 2)
+        self.assertEqual((compacted[0]["endX"], compacted[0]["endY"]), (0.0, 0.0))
+        self.assertEqual((compacted[1]["startX"], compacted[1]["startY"]), (0.0, 0.0))
+        self.assertEqual((compacted[1]["endX"], compacted[1]["endY"]), (0.0, 100.0))
+
     def test_route_cost_key_ignores_interpreter_level_float_noise(self):
         from modeling_task_generator import _stable_cost_key
 
@@ -209,6 +344,57 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(path[3], bridge)
         self.assertEqual(len(path), 4)
         self.assertNotIn(mapper.point_to_xy(anchors[2]), path)
+
+    def test_same_edge_lane_change_does_not_overshoot_nearby_corner_and_reverse(self):
+        """边界点测试1右侧换行应直达第二条线，不能越过17cm后掉头。"""
+        from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        # 边界点测试1区域2的真实记录坐标。第一条清扫线右端位于p6，
+        # 第二条线右端(1194.8,265.0)位于p6--p7同一条边上，距p7约17cm。
+        points = [
+            point("p1", 836.869, 199.895),
+            point("p2", 842.779, 278.232),
+            point("p3", 847.106, 336.876),
+            point("p4", 970.192, 324.422),
+            point("p5", 1081.938, 315.983),
+            point("p6", 1198.011, 303.840),
+            point("p7", 1193.430, 247.987),
+            point("p8", 1186.823, 179.580),
+        ]
+        draft = {"groups": [{"id": "area-2", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+        current = (1198.0, 303.8)
+        next_lane_start = (1194.8, 265.0)
+
+        path = _group_anchor_transition_points(
+            draft,
+            "area-2",
+            current,
+            next_lane_start,
+            mapper,
+        )
+
+        self.assertEqual(path[0], current)
+        self.assertEqual(path[-1], next_lane_start)
+        self.assertNotIn((1193.430, 247.987), path)
+        # 沿同一边只允许单调接近目标，不能出现到p7后再反向17cm的回补段。
+        distances_to_target = [
+            ((item[0] - next_lane_start[0]) ** 2 + (item[1] - next_lane_start[1]) ** 2) ** 0.5
+            for item in path
+        ]
+        self.assertTrue(all(
+            following <= previous + 0.01
+            for previous, following in zip(distances_to_target, distances_to_target[1:])
+        ))
 
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks
@@ -987,6 +1173,89 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(
             [(point["x"], point["y"]) for point in frontend_path_points({"tasks": tasks})],
             [(0, 0), (100, 10), (200, 0), (200, 100)],
+        )
+
+    def test_clean_path_collapses_same_position_points_but_keeps_real_short_corner(self):
+        from modeling_task_generator import _simplify_clean_path_points
+
+        # 0.75cm的A1-9/A1-8是同一物理位置，必须合并；13cm的
+        # 90度短边是真实边界拐角，不能因为短就被抹掉。
+        a1_9 = (940.5, 45.79)
+        a1_8 = (940.2, 45.1)
+        a1_7 = (675.5, 75.0)
+        self.assertEqual(
+            _simplify_clean_path_points([a1_9, a1_8, a1_7]),
+            [a1_9, a1_7],
+        )
+
+        right_angle = [(0.0, 0.0), (0.0, 13.0), (100.0, 13.0)]
+        self.assertEqual(_simplify_clean_path_points(right_angle), right_angle)
+
+    def test_clean_path_removes_short_straight_tail_but_preserves_endpoint(self):
+        from modeling_task_generator import _simplify_clean_path_points
+
+        # 最后18cm与前一段只相5度，属于同一直行边的密集采样。
+        # 删除中间点时必须保留原清扫终点，供下一段转场使用。
+        start = (492.0, 88.0)
+        dense = (31.1, 121.2)
+        endpoint = (12.64, 123.938)
+        self.assertEqual(
+            _simplify_clean_path_points([start, dense, endpoint]),
+            [start, endpoint],
+        )
+
+    def test_append_clean_segments_does_not_create_test2_one_centimeter_lane(self):
+        from modeling_task_generator import _CoordinateMapper, _append_clean_segments
+
+        draft = {
+            "groups": [{
+                "id": "g1",
+                "points": [{
+                    "id": "origin", "x": 0, "y": 0,
+                    "lat": 32.0, "lon": 118.0,
+                }],
+            }],
+        }
+        mapper = _CoordinateMapper(draft)
+        tasks = []
+        current, next_task_id, clean_count = _append_clean_segments(
+            tasks,
+            [{
+                "groupId": "g1",
+                "areaNumber": 1,
+                "sourceId": "lane-1",
+                "laneType": "boundary",
+                "start": (940.5, 45.79),
+                "end": (675.475, 75.045),
+                "path": [
+                    (940.5, 45.79),
+                    (940.217, 45.112),
+                    (675.475, 75.045),
+                ],
+            }],
+            (935.579, -26.965),
+            mapper,
+            1,
+            draft,
+        )
+
+        clean_tasks = [task for task in tasks if task["mode"] == 1]
+        self.assertEqual(clean_count, 1)
+        self.assertEqual(next_task_id, 3)
+        self.assertEqual(current, (675.475, 75.045))
+        self.assertEqual(len(clean_tasks), 1)
+        self.assertEqual(
+            (
+                clean_tasks[0]["startX"], clean_tasks[0]["startY"],
+                clean_tasks[0]["endX"], clean_tasks[0]["endY"],
+            ),
+            (941, 46, 675, 75),
+        )
+        self.assertGreater(clean_tasks[0]["length"], 5)
+        # 转场终点必须与清理后的清扫起点完全一致。
+        self.assertEqual(
+            (tasks[0]["endX"], tasks[0]["endY"]),
+            (clean_tasks[0]["startX"], clean_tasks[0]["startY"]),
         )
 
     def test_lane_changes_preserve_every_recorded_short_side_point(self):

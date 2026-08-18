@@ -84,6 +84,32 @@ class RTKPathTrackingTest(unittest.TestCase):
         self.assertNotEqual(command.raw_lat, command.filtered_lat)
         self.assertEqual(command.source, "kalman_p_control")
 
+    def test_continuous_lookahead_can_override_short_range_heading_limit(self):
+        controller = StraightLinePController(
+            heading_gain=10.0,
+            cte_gain=0.0,
+            short_range_heading_limit_deg=5.0,
+        )
+        arguments = dict(
+            start_lat=32.0,
+            start_lon=118.0,
+            end_lat=32.000001,
+            end_lon=118.0,
+            current_lat=32.0,
+            current_lon=118.0,
+            vehicle_heading=0.0,
+            target_heading=30.0,
+        )
+
+        ordinary = controller.compute(**arguments)
+        continuous = controller.compute(
+            short_range_heading_limit_deg=20.0,
+            **arguments
+        )
+
+        self.assertAlmostEqual(ordinary.heading_error_deg, 5.0)
+        self.assertAlmostEqual(continuous.heading_error_deg, 20.0)
+
 
 if __name__ == "__main__":
     unittest.main()
