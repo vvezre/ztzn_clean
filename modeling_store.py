@@ -176,6 +176,24 @@ class ModelingStore(object):
                 numbers.append(index)
         return (max(numbers) if numbers else 0) + 1
 
+    def _normalize_group_link_point_roles(self, points, now):
+        """Renumber a connection polyline and mark its start, middle and end points."""
+        point_count = len(points or [])
+        normalized_points = []
+        for sequence, raw_point in enumerate(points or [], start=1):
+            point = dict(raw_point)
+            point["sequence"] = sequence
+            if sequence == 1:
+                point["role"] = "group_link_start"
+            elif sequence == point_count:
+                point["role"] = "group_link_end"
+            else:
+                point["role"] = "group_link_waypoint"
+            point["roles"] = ["group_connector"]
+            point["updatedAt"] = now
+            normalized_points.append(point)
+        return normalized_points
+
     def _normalize_group(self, payload, group_id=None, area_number=None, now=None):
         if not isinstance(payload, dict):
             raise InvalidModelPayloadError("group payload must be an object")
@@ -474,8 +492,8 @@ class ModelingStore(object):
 
         if link.get("endGroupId"):
             raise InvalidModelPayloadError("group link is already bound")
-        if len(link.get("points") or []) != 2:
-            raise InvalidModelPayloadError("record both connection points before creating the next area")
+        if len(link.get("points") or []) < 2:
+            raise InvalidModelPayloadError("record at least two connection points before creating the next area")
 
         groups = list(draft.get("groups") or [])
         end_group = self._normalize_group(
@@ -509,8 +527,6 @@ class ModelingStore(object):
         index = self._find_group_link_index(draft, link_id)
         link = dict(draft["groupLinks"][index])
         points = list(link.get("points") or [])
-        if len(points) >= 2:
-            raise InvalidModelPayloadError("group link already has start and end points")
 
         normalized = dict(point)
         normalized["id"] = self._validate_model_id(normalized.get("id") or self._new_point_id())
@@ -521,14 +537,13 @@ class ModelingStore(object):
         normalized["x"] = self._normalize_optional_float(normalized.get("x"))
         normalized["y"] = self._normalize_optional_float(normalized.get("y"))
         normalized["source"] = str(normalized.get("source") or "rtk_mean")
-        normalized["role"] = "group_link_start" if normalized["sequence"] == 1 else "group_link_end"
-        normalized["roles"] = ["group_connector"]
         normalized["createdAt"] = int(normalized.get("createdAt") or current_time)
         normalized["updatedAt"] = current_time
 
         points.append(normalized)
+        points = self._normalize_group_link_point_roles(points, current_time)
         link["points"] = points
-        link["status"] = "ready" if len(points) == 2 and link.get("endGroupId") else "draft"
+        link["status"] = "ready" if len(points) >= 2 and link.get("endGroupId") else "draft"
         link["updatedAt"] = current_time
         draft["groupLinks"][index] = link
         # Connection points use the same origin immediately, so querying the
@@ -556,14 +571,9 @@ class ModelingStore(object):
         if len(next_points) == len(points):
             raise ModelNotFoundError("point not found")
 
-        for sequence, point in enumerate(next_points, start=1):
-            point["sequence"] = sequence
-            point["role"] = "group_link_start" if sequence == 1 else "group_link_end"
-            point["roles"] = ["group_connector"]
-            point["updatedAt"] = current_time
-
+        next_points = self._normalize_group_link_point_roles(next_points, current_time)
         link["points"] = next_points
-        link["status"] = "ready" if len(next_points) == 2 and link.get("endGroupId") else "draft"
+        link["status"] = "ready" if len(next_points) >= 2 and link.get("endGroupId") else "draft"
         link["updatedAt"] = current_time
         draft["groupLinks"][index] = link
         draft = normalize_draft_coordinates(draft)

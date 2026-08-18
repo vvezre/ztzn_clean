@@ -3,6 +3,79 @@ import unittest
 
 
 class ModelingTaskGeneratorTest(unittest.TestCase):
+    def test_group_recorded_anchors_merge_near_last_point_into_first(self):
+        from modeling_task_generator import _CoordinateMapper, _group_recorded_xy
+
+        points = [
+            {"id": "p1", "x": 20.662, "y": 278.877, "lat": 32.0, "lon": 118.0},
+            {"id": "p2", "x": 24.301, "y": 340.201, "lat": 32.0, "lon": 118.0},
+            {"id": "p3", "x": 380.344, "y": 371.936, "lat": 32.0, "lon": 118.0},
+            {"id": "p4", "x": 369.240, "y": 247.031, "lat": 32.0, "lon": 118.0},
+            {"id": "p5", "x": 5.769, "y": 271.349, "lat": 32.0, "lon": 118.0},
+        ]
+        draft = {"groups": [{"id": "g1", "points": points}]}
+
+        anchors = _group_recorded_xy(draft, "g1", _CoordinateMapper(draft))
+
+        self.assertEqual(anchors, [
+            (20.662, 278.877),
+            (24.301, 340.201),
+            (380.344, 371.936),
+            (369.240, 247.031),
+        ])
+        # 规划只返回合并后的锚点，绝不能删除或改写原始记录。
+        self.assertEqual(len(draft["groups"][0]["points"]), 5)
+        self.assertEqual(draft["groups"][0]["points"][-1]["id"], "p5")
+
+    def test_l_shaped_group_link_keeps_all_points_and_stops_at_corner(self):
+        from modeling_task_generator import _CoordinateMapper, _append_transition_tasks
+
+        draft = {
+            "groups": [
+                {"id": "g1", "points": [{
+                    "id": "a1", "x": 0, "y": 0, "lat": 32.0, "lon": 118.0,
+                }]},
+                {"id": "g2", "points": [{
+                    "id": "b1", "x": 100, "y": 100, "lat": 32.000009, "lon": 118.0000106,
+                }]},
+            ],
+        }
+        preview = {
+            "groupLinks": [{
+                "id": "l1",
+                "startGroupId": "g1",
+                "endGroupId": "g2",
+                "points": [
+                    {"id": "l1-start", "x": 0, "y": 0},
+                    {"id": "l1-corner", "x": 100, "y": 0},
+                    {"id": "l1-end", "x": 100, "y": 100},
+                ],
+            }],
+        }
+        mapper = _CoordinateMapper(draft)
+        tasks = []
+
+        next_task_id = _append_transition_tasks(
+            tasks,
+            (0, 0),
+            (100, 100),
+            2,
+            mapper,
+            1,
+            preview,
+            draft,
+            "g1",
+            "g2",
+        )
+
+        self.assertEqual(next_task_id, 3)
+        self.assertEqual(
+            [(task["startX"], task["startY"], task["endX"], task["endY"]) for task in tasks],
+            [(0, 0, 100, 0), (100, 0, 100, 100)],
+        )
+        self.assertEqual([task["turnAtStart"] for task in tasks], [True, True])
+        self.assertEqual([task["stopAtEnd"] for task in tasks], [True, True])
+
     def test_transition_path_removes_local_out_and_back_loop(self):
         from modeling_task_generator import _simplify_transition_path_points
 
@@ -178,12 +251,13 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
 
         self.assertEqual(path, [(0.0, 0.0), (340.0, -20.0), (340.0, 90.0)])
 
-    def test_connection_points_enter_boundary_through_the_nearest_recorded_anchors(self):
-        """连接点不得为缩短距离而斜穿到同一条边的远端角点。"""
+    def test_connection_points_enter_boundary_through_nearest_projection(self):
+        """连接点必须先投影到边界，不得斜穿到同一条边的远端角点。"""
         from modeling_task_generator import (
             _CoordinateMapper,
             _compact_executable_tasks,
             _group_anchor_transition_points,
+            _nearest_boundary_projection,
         )
 
         points = [
@@ -194,6 +268,10 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         ]
         draft = {"groups": [{"id": "area-1", "points": points}]}
         mapper = _CoordinateMapper(draft)
+        anchors = [mapper.point_to_xy(point) for point in points]
+        l1_projection = _nearest_boundary_projection(
+            (31.474, 177.712), anchors
+        )["point"]
 
         outbound = _group_anchor_transition_points(
             draft,
@@ -212,13 +290,13 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
 
         self.assertEqual(outbound, [
             (31.474, 177.712),
-            (10.708, 127.296),
+            l1_projection,
             (954.092, 52.061),
             (957.0, 105.0),
         ])
         self.assertEqual(inbound, list(reversed(outbound)))
 
-        # 后续普通移动点简化也必须保留 A2、A3 这两个明显转向点。
+        # 后续普通移动点简化也必须保留投影点和A3明显转向点。
         raw_tasks = []
         for index in range(len(outbound) - 1):
             start = outbound[index]
@@ -242,7 +320,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             for task in compacted
             for prefix in ("start", "end")
         }
-        self.assertIn((10.708, 127.296), executable_points)
+        self.assertIn(l1_projection, executable_points)
         self.assertIn((954.092, 52.061), executable_points)
 
     def test_connection_bridge_at_edge_middle_uses_boundary_projection_before_corner(self):
@@ -385,6 +463,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
 
         self.assertEqual(path[0], current)
         self.assertEqual(path[-1], next_lane_start)
+        self.assertEqual(path, [current, next_lane_start])
         self.assertNotIn((1193.430, 247.987), path)
         # 沿同一边只允许单调接近目标，不能出现到p7后再反向17cm的回补段。
         distances_to_target = [
@@ -395,6 +474,106 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             following <= previous + 0.01
             for previous, following in zip(distances_to_target, distances_to_target[1:])
         ))
+
+    def test_adjacent_edge_lane_change_does_not_snap_back_to_nearby_corner(self):
+        """8.17真实坐标：相邻边换行必须经过共享点，不能先退回19cm外的原点。"""
+        from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        # 区域1原点短边的真实记录点。current 位于 A1--A1-02，target
+        # 位于 A1-02--A1-03；A1-02 才是两条相邻边的共享换行点。
+        points = [
+            point("A1", 0.000, 0.000),
+            point("A1-02", 4.581, 52.373),
+            point("A1-03", 7.183, 116.121),
+            point("A1-04", 232.844, 96.895),
+            point("A1-05", 580.215, 68.885),
+            point("A1-06", 934.486, 46.524),
+            point("A1-07", 933.845, 40.508),
+            point("A1-08", 926.879, -26.153),
+            point("A1-09", 922.477, -87.066),
+            point("A1-10", 790.804, -74.267),
+            point("A1-11", 458.580, -50.060),
+            point("A1-12", 106.817, -18.703),
+            point("A1-13", -7.993, -11.075),
+        ]
+        draft = {"groups": [{"id": "area-1", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+        current = (2.0, 19.0)
+        next_lane_start = (5.0, 67.0)
+
+        path = _group_anchor_transition_points(
+            draft,
+            "area-1",
+            current,
+            next_lane_start,
+            mapper,
+        )
+
+        self.assertEqual(path[0], current)
+        self.assertEqual(path[-1], next_lane_start)
+        self.assertNotIn((0.0, 0.0), path)
+        self.assertIn((4.581, 52.373), path)
+        # 路径沿短边单调向上，任何一步都不能重新远离目标。
+        distances_to_target = [
+            ((item[0] - next_lane_start[0]) ** 2 + (item[1] - next_lane_start[1]) ** 2) ** 0.5
+            for item in path
+        ]
+        self.assertTrue(all(
+            following <= previous + 0.01
+            for previous, following in zip(distances_to_target, distances_to_target[1:])
+        ))
+
+    def test_external_connector_takes_direct_route_only_when_it_stays_outside_area(self):
+        """边界角点可直达区域外连接点，但禁止直线穿过清扫区域。"""
+        from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        draft = {"groups": [{
+            "id": "area-1",
+            "points": [
+                point("p1", 0, 0),
+                point("p2", 0, 100),
+                point("p3", 100, 100),
+                point("p4", 100, 0),
+            ],
+        }]}
+        mapper = _CoordinateMapper(draft)
+
+        outside_path = _group_anchor_transition_points(
+            draft,
+            "area-1",
+            (0.0, 100.0),
+            (20.0, 150.0),
+            mapper,
+        )
+        self.assertEqual(outside_path, [(0.0, 100.0), (20.0, 150.0)])
+
+        crossing_path = _group_anchor_transition_points(
+            draft,
+            "area-1",
+            (0.0, 50.0),
+            (120.0, 50.0),
+            mapper,
+        )
+        self.assertNotEqual(crossing_path, [(0.0, 50.0), (120.0, 50.0)])
+        self.assertTrue(any(point in crossing_path for point in ((0, 0), (0, 100))))
 
     def test_collinear_same_mode_segments_are_compacted_without_crossing_turns_or_mode_changes(self):
         from modeling_task_generator import _compact_executable_tasks

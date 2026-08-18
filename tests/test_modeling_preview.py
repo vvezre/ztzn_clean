@@ -292,6 +292,45 @@ class ModelingPreviewTest(unittest.TestCase):
             for lane in lanes[1:-1]
         ))
 
+    def test_near_last_recorded_point_merges_into_first_only_for_planning(self):
+        from modeling_preview import build_model_preview
+
+        # p6是绕区域一圈后回到p1附近的闭合重复点，二者相距约16.6cm。
+        # 规划多边形应使用p1闭合，不能再生成p6->p1短边；原始数据必须保持不变。
+        points = [
+            _point("p1", 20.662, 278.877),
+            _point("p2", 24.301, 397.400),
+            _point("p3", 188.843, 387.125),
+            _point("p4", 380.344, 371.936),
+            _point("p5", 369.240, 247.031),
+            _point("p6", 5.769, 271.349),
+        ]
+        draft = {
+            "id": "near-boundary-closure",
+            "recognition": {"confirmed": True},
+            "groups": [{
+                "id": "g1",
+                "areaNumber": 1,
+                "sweepDirection": "auto",
+                "points": points,
+                "subAreas": [{"id": "sa1", "pointIds": [point["id"] for point in points]}],
+            }],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+        sub_area = preview["groups"][0]["subAreas"][0]
+
+        self.assertEqual(sub_area["pointIds"], ["p1", "p2", "p3", "p4", "p5"])
+        self.assertEqual([point["id"] for point in draft["groups"][0]["points"]], [
+            "p1", "p2", "p3", "p4", "p5", "p6",
+        ])
+        self.assertFalse(any(
+            [(point["x"], point["y"]) for point in lane.get("pathPoints") or []][-2:]
+            == [(5.8, 271.3), (20.7, 278.9)]
+            for lane in sub_area["lanes"]
+        ))
+
     def test_side_fluctuation_uses_the_whole_first_side_for_sweep_direction(self):
         from modeling_preview import build_model_preview
 
@@ -371,7 +410,8 @@ class ModelingPreviewTest(unittest.TestCase):
                 "endGroupId": "g2",
                 "points": [
                     {"id": "lp1", "sequence": 1, "x": 10, "y": 10, "lat": 32.0, "lon": 118.0},
-                    {"id": "lp2", "sequence": 2, "x": 200, "y": 10, "lat": 32.0, "lon": 118.0},
+                    {"id": "lp2", "sequence": 2, "x": 100, "y": 10, "lat": 32.0, "lon": 118.0},
+                    {"id": "lp3", "sequence": 3, "x": 100, "y": 100, "lat": 32.0, "lon": 118.0},
                 ],
                 "status": "ready",
             }],
@@ -381,11 +421,12 @@ class ModelingPreviewTest(unittest.TestCase):
 
         self.assertEqual(len(preview["groupLinks"]), 1)
         self.assertEqual(preview["groupLinks"][0]["startPoint"]["id"], "lp1")
-        self.assertEqual(preview["groupLinks"][0]["endPoint"]["id"], "lp2")
+        self.assertEqual(preview["groupLinks"][0]["endPoint"]["id"], "lp3")
         self.assertEqual(
             [point["id"] for point in preview["groupLinks"][0]["points"]],
-            ["lp1", "lp2"],
+            ["lp1", "lp2", "lp3"],
         )
+        self.assertEqual(preview["groupLinks"][0]["lengthCm"], 180.0)
 
 
 if __name__ == "__main__":

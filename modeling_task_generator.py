@@ -25,9 +25,10 @@ EPSILON_CM = 1e-6
 # 区域边界和连接桥由人工遥控打点，RTK 抖动会让本来接近直线的点左右偏几厘米。
 # 只有普通移动 mode=2 使用这条20厘米走廊；清扫线 mode=1 不使用容差合并。
 TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
-# 边界投影点距离记录角点不超过20cm时直接吸附到角点，避免让小车为RTK抖动
-# 产生的很短边界段额外停车；超过该距离时必须保留投影点，禁止斜切到角点。
-BOUNDARY_CORNER_SNAP_CM = 20.0
+# 只有边界投影点距离记录角点不超过5cm时，才将它们视为同一物理位置。
+# 5cm以内可能来自RTK抖动、浮点求交和整数厘米取整；超过5cm的边界段必须保留，
+# 不再把16～20cm的真实路线当成误差吸回角点，避免“先退回角点、再掉头返回”。
+BOUNDARY_CORNER_SNAP_CM = 5.0
 # 只有当前点和目标点本身都贴在边界上，才允许使用“同边直达”。连接桥可能
 # 位于区域外侧，即使两个最近投影碰巧落在同一边，也仍须经过人工边界锚点。
 SAME_EDGE_DIRECT_MAX_OFFSET_CM = 2.0
@@ -59,6 +60,9 @@ CLEAN_PATH_HARD_TURN_DEG = 30.0
 CLEAN_DUPLICATE_POINT_CM = 5.0
 CLEAN_NEAR_POINT_CM = 30.0
 CLEAN_BACKTRACK_DEG = 150.0
+# 与预览几何保持一致：同一区域最后记录点回到第一记录点30cm以内时，
+# 规划阶段将末点并入首点。原始建模数据不删除，只有执行转场使用合并后的锚点。
+BOUNDARY_CLOSURE_MERGE_CM = 30.0
 
 # 小于3厘米的普通转场低于当前RTK点到点导航的有效执行尺度，不应单独形成
 # “移动几乎看不见、但停车并重新下发下一任务”的伪任务。这里只处理mode=2
@@ -1154,14 +1158,22 @@ def _pin_path_endpoints(path, current, target):
 
 
 def _group_recorded_xy(draft, group_id, mapper):
-    """Return the area's recorded route anchors in the same order as manual capture."""
+    """返回人工记录顺序的区域锚点，并合并30cm内的首尾闭合重复点。"""
     for group in draft.get("groups") or []:
         if group.get("id") != group_id:
             continue
-        return _dedupe_xy_path([
+        anchors = _dedupe_xy_path([
             mapper.point_to_xy(point)
             for point in (group.get("points") or [])
         ])
+        # 保留至少三个顶点，只把最后记录点并入第一记录点。这样转场、边界投影
+        # 和清扫预览使用同一份闭合边界，不会在清扫线删掉末点后又绕回该点。
+        if (
+                len(anchors) > 3
+                and _length_cm(anchors[0], anchors[-1])
+                <= BOUNDARY_CLOSURE_MERGE_CM):
+            anchors.pop()
+        return anchors
     return []
 
 
@@ -1214,6 +1226,85 @@ def _nearest_boundary_projection(point, anchors):
     }
 
 
+def _cross_2d(left, right):
+    """返回二维向量叉积，用于线段相交和点在多边形内的判定。"""
+    return left[0] * right[1] - left[1] * right[0]
+
+
+def _point_strictly_inside_polygon(point, polygon):
+    """判断点是否严格位于记录区域内部；落在边界上返回False。"""
+    if len(polygon) < 3:
+        return False
+    for index, start in enumerate(polygon):
+        end = polygon[(index + 1) % len(polygon)]
+        if _point_to_segment_distance(point, start, end) <= EPSILON_CM:
+            return False
+
+    inside = False
+    x, y = point
+    for index, start in enumerate(polygon):
+        end = polygon[(index + 1) % len(polygon)]
+        if (start[1] > y) == (end[1] > y):
+            continue
+        crossing_x = start[0] + (
+            (y - start[1]) * (end[0] - start[0]) / float(end[1] - start[1])
+        )
+        if x < crossing_x:
+            inside = not inside
+    return inside
+
+
+def _segment_polygon_crossing_parameters(start, end, polygon):
+    """返回线段start--end与多边形边界相交时的比例 t∈[0,1]。"""
+    direction = (end[0] - start[0], end[1] - start[1])
+    parameters = [0.0, 1.0]
+    for index, edge_start in enumerate(polygon):
+        edge_end = polygon[(index + 1) % len(polygon)]
+        edge_direction = (
+            edge_end[0] - edge_start[0],
+            edge_end[1] - edge_start[1],
+        )
+        denominator = _cross_2d(direction, edge_direction)
+        offset = (edge_start[0] - start[0], edge_start[1] - start[1])
+        if abs(denominator) <= EPSILON_CM:
+            # 共线时把边的两个端点也加入分段位置；后续中点
+            # 检查会区分“沿边行走”和“穿过区域内部”。
+            if abs(_cross_2d(offset, direction)) <= EPSILON_CM:
+                length_squared = direction[0] ** 2 + direction[1] ** 2
+                if length_squared > EPSILON_CM:
+                    for edge_point in (edge_start, edge_end):
+                        ratio = (
+                            (edge_point[0] - start[0]) * direction[0]
+                            + (edge_point[1] - start[1]) * direction[1]
+                        ) / float(length_squared)
+                        if -EPSILON_CM <= ratio <= 1.0 + EPSILON_CM:
+                            parameters.append(max(0.0, min(1.0, ratio)))
+            continue
+        line_ratio = _cross_2d(offset, edge_direction) / float(denominator)
+        edge_ratio = _cross_2d(offset, direction) / float(denominator)
+        if (
+                -EPSILON_CM <= line_ratio <= 1.0 + EPSILON_CM
+                and -EPSILON_CM <= edge_ratio <= 1.0 + EPSILON_CM):
+            parameters.append(max(0.0, min(1.0, line_ratio)))
+    return sorted(set(round(value, 12) for value in parameters))
+
+
+def _straight_segment_avoids_polygon_interior(start, end, polygon):
+    """线段可沿边或在区域外行走，但不得斜穿清扫区域内部。"""
+    parameters = _segment_polygon_crossing_parameters(start, end, polygon)
+    for left, right in zip(parameters, parameters[1:]):
+        if right - left <= EPSILON_CM:
+            continue
+        ratio = (left + right) / 2.0
+        midpoint = (
+            start[0] + (end[0] - start[0]) * ratio,
+            start[1] + (end[1] - start[1]) * ratio,
+        )
+        if _point_strictly_inside_polygon(midpoint, polygon):
+            return False
+    return True
+
+
 def _boundary_anchor_candidates(projection, anchors):
     """
     返回投影所在边的两个端点，并把较近端点放在前面。
@@ -1244,9 +1335,11 @@ def _boundary_anchor_candidates(projection, anchors):
     return [next_index, edge_index]
 
 
-def _boundary_projection_waypoint(projection, anchor):
-    """投影离角点较远时返回投影点，靠近角点时允许直接吸附。"""
+def _boundary_projection_waypoint(projection, anchor, endpoint=None):
+    """返回必须经过的投影点；5cm内的同位点不再拆成独立任务。"""
     point = projection["point"]
+    if endpoint is not None and _length_cm(point, endpoint) <= BOUNDARY_CORNER_SNAP_CM:
+        return None
     if _length_cm(point, anchor) > BOUNDARY_CORNER_SNAP_CM:
         return point
     return None
@@ -1288,6 +1381,41 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
     target_boundary_offset = _length_cm(target, target_projection["point"])
     current_edge_index = current_projection["edgeIndex"]
     target_edge_index = target_projection["edgeIndex"]
+
+    # 连接点通常由人工记录在区域外侧。若一端已在边界上、另一端
+    # 明确位于边界外，且两点直线完全不穿过区域内部，则直接连接。
+    # 这不依赖“20cm吸附”，也不会为了先到投影点而产生十几厘米
+    # 的反向短段；直线会穿过区域时仍必须沿人工记录边界绕行。
+    boundary_endpoint = None
+    outside_projection = None
+    if (
+            current_boundary_offset <= SAME_EDGE_DIRECT_MAX_OFFSET_CM
+            and target_boundary_offset > SAME_EDGE_DIRECT_MAX_OFFSET_CM):
+        boundary_endpoint = current
+        outside_projection = target_projection["point"]
+    elif (
+            target_boundary_offset <= SAME_EDGE_DIRECT_MAX_OFFSET_CM
+            and current_boundary_offset > SAME_EDGE_DIRECT_MAX_OFFSET_CM):
+        boundary_endpoint = target
+        outside_projection = current_projection["point"]
+
+    # 只在边界端点本身就是人工角点，且外部连接点的投影仍落在该角点
+    # 30cm局部范围内时才启用直达。连接点靠近边的中部时，仍依次经过
+    # 投影点和记录边界，不会跳过A5、A6这类真实边界段。
+    local_corner_shortcut = False
+    if boundary_endpoint is not None:
+        nearest_anchor = min(
+            anchors,
+            key=lambda anchor: _length_cm(boundary_endpoint, anchor),
+        )
+        local_corner_shortcut = (
+            _length_cm(boundary_endpoint, nearest_anchor) <= BOUNDARY_CORNER_SNAP_CM
+            and _length_cm(outside_projection, nearest_anchor) <= TRANSITION_NEAR_POINT_CM
+        )
+    if (
+            local_corner_shortcut
+            and _straight_segment_avoids_polygon_interior(current, target, anchors)):
+        return _pin_path_endpoints([current, target], current, target)
     # 角点同时属于前后两条相邻边。最近投影为保证稳定会选择编号较小的边，
     # 例如右上角可能归到“上边”，而紧接着的换行目标归到“右边”。只比较边号
     # 会误判成不同边并绕到右下角；若一个投影点正好是另一条边的端点，也应
@@ -1315,13 +1443,11 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
             same_or_shared_edge
             and current_boundary_offset <= SAME_EDGE_DIRECT_MAX_OFFSET_CM
             and target_boundary_offset <= SAME_EDGE_DIRECT_MAX_OFFSET_CM):
-        direct_path = _dedupe_xy_path([
-            current,
-            current_projection["point"],
-            target_projection["point"],
-            target,
-        ])
-        return _pin_path_endpoints(direct_path, current, target)
+        # 两端都已在同一条（或共享角点的相邻）记录边界2cm范围内，投影点只是
+        # 浮点计算辅助点，不是人工记录点。若把它们落成任务，独立取整可能生成
+        # “沿边50cm -> 横移1cm -> 清扫”的伪停车段。直接使用真实起终点既仍沿
+        # 记录边界行驶，也不会改变目标点和下一条清扫线方向。
+        return _dedupe_xy_path([current, target])
     for start_priority, start_index in enumerate(start_indexes):
         for end_priority, end_index in enumerate(end_indexes):
             # 沿记录点正序(+1)和逆序(-1)各生成一条闭环边界候选，避免固定绕行方向。
@@ -1329,10 +1455,10 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
             reverse_indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), -1)
             for direction_priority, indexes in enumerate((forward_indexes, reverse_indexes)):
                 start_projection_point = _boundary_projection_waypoint(
-                    current_projection, anchors[start_index]
+                    current_projection, anchors[start_index], endpoint=current
                 )
                 end_projection_point = _boundary_projection_waypoint(
-                    target_projection, anchors[end_index]
+                    target_projection, anchors[end_index], endpoint=target
                 )
                 # 路线必须从真实current开始，随后经过投影点、人工锚点，最终到真实target。
                 path = [current]

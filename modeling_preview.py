@@ -25,6 +25,10 @@ DEFAULT_OVERLAP_CM = 53.0
 MIN_OVERLAP_CM = 30.0
 # 浮点几何判断误差，避免把几乎相等的坐标误判成不同点。
 EPSILON = 1e-6
+# 人工沿区域边界记录一圈后，最后一点经常会落在第一个点附近。二者距离
+# 不超过30cm时，规划几何把最后一点并入第一个点，避免闭合边界生成一条
+# 无意义的十几厘米清扫短线。这里只整理规划副本，不修改原始记录点数据。
+BOUNDARY_CLOSURE_MERGE_CM = 30.0
 
 
 class ModelingPreviewError(Exception):
@@ -199,8 +203,9 @@ def _clean_polygon_points(points):
     """
     整理多边形点序列。
 
-    删除无效坐标、相邻重复点，并去掉“末点等于首点”的重复闭合点。
-    几何求交时会自动连接最后一点和第一点，因此无需在数组中重复保存首点。
+    删除无效坐标；当末点回到首点30cm范围内时，把末点并入首点。
+    几何求交会自动连接最后一个有效点和第一点，因此无需保留这段很短的
+    人工闭合尾巴。传入的原始点列表不会被修改，前端点位查询仍返回全部记录点。
     """
     cleaned = []
     for point in points:
@@ -208,6 +213,14 @@ def _clean_polygon_points(points):
         if xy is None:
             continue
         cleaned.append(point)
+
+    # 至少保留三个多边形顶点。只处理“记录序列的末点回到首点附近”这一种
+    # 明确的闭合重复，不改变区域中间点的近点、拐点和波动边界处理规则。
+    if len(cleaned) > 3:
+        first_xy = _point_xy(cleaned[0])
+        last_xy = _point_xy(cleaned[-1])
+        if _distance(first_xy, last_xy) <= BOUNDARY_CLOSURE_MERGE_CM:
+            cleaned.pop()
     return cleaned
 
 

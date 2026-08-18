@@ -341,10 +341,10 @@ class ModelingSession(object):
                 )
             if current_link.get("endGroupId"):
                 raise ModelingSessionError("MODELING_LINK_ALREADY_BOUND", "connection already has a destination area")
-            if len(current_link.get("points") or []) != 2:
+            if len(current_link.get("points") or []) < 2:
                 raise ModelingSessionError(
                     "MODELING_LINK_INCOMPLETE",
-                    "record both connection points before creating the next area",
+                    "record at least two connection points before creating the next area",
                 )
             source_group = self._find_group(draft, current_link.get("startGroupId"))
             if source_group is None:
@@ -720,18 +720,19 @@ class ModelingSession(object):
                 raise ModelingSessionError(error.code, error.message)
             draft = self.store.save_draft(model_id, draft)
 
-        # 每条连接桥必须保留两个桥头，并且明确连接哪两个区域。
+        # 每条连接桥至少保留起点和终点，也可以包含任意多个桥内途经点，
+        # 并且必须明确连接哪两个区域。
         links = list(draft.get("groupLinks") or [])
         incomplete_links = [
             link for link in links
-            if len(link.get("points") or []) != 2
+            if len(link.get("points") or []) < 2
             or not link.get("startGroupId")
             or not link.get("endGroupId")
         ]
         if incomplete_links:
             raise ModelingSessionError(
                 "MODELING_LINK_INCOMPLETE",
-                "each connection must contain its original start and end points",
+                "each connection must contain at least its original start and end points",
             )
 
         # 每个区域至少四个记录点，才能形成可识别的闭合清扫区域。

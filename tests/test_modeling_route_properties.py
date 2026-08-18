@@ -226,6 +226,111 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             for index in range(1, len(tasks)):
                 self.assertFalse(_same_direction_collinear(tasks[index - 1], tasks[index]), case_index)
 
+    def test_random_multi_point_bridges_preserve_every_segment_in_both_directions(self):
+        """多点连接桥无论正向或反向通过，都必须保留全部折点和真实转角。"""
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import _round_int, generate_task_plan
+
+        randomizer = random.Random(20260818)
+        for case_index in range(60):
+            home_width = randomizer.uniform(400.0, 1600.0)
+            home_height = randomizer.uniform(180.0, 700.0)
+            remote_width = randomizer.uniform(300.0, 1200.0)
+            remote_height = randomizer.uniform(180.0, 650.0)
+            remote_x = randomizer.uniform(-180.0, 180.0)
+            remote_bottom = home_height + randomizer.uniform(100.0, 350.0)
+            home_points = [
+                _point("h1", 0, 0),
+                _point("h2", 0, home_height),
+                _point("h3", home_width, home_height),
+                _point("h4", home_width, 0),
+            ]
+            remote_points = [
+                _point("r1", remote_x, remote_bottom),
+                _point("r2", remote_x, remote_bottom + remote_height),
+                _point("r3", remote_x + remote_width, remote_bottom + remote_height),
+                _point("r4", remote_x + remote_width, remote_bottom),
+            ]
+            start = (0.0, home_height)
+            end = (remote_x, remote_bottom)
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = math.hypot(dx, dy)
+            perpendicular = (-dy / length, dx / length)
+            middle_count = randomizer.randint(1, 4)
+            bridge_xy = [start]
+            for middle_index in range(1, middle_count + 1):
+                ratio = float(middle_index) / float(middle_count + 1)
+                offset = randomizer.uniform(-100.0, 100.0)
+                bridge_xy.append((
+                    start[0] + dx * ratio + perpendicular[0] * offset,
+                    start[1] + dy * ratio + perpendicular[1] * offset,
+                ))
+            bridge_xy.append(end)
+            link_points = [
+                _point("l{}".format(index + 1), x, y)
+                for index, (x, y) in enumerate(bridge_xy)
+            ]
+            for sequence, point in enumerate(link_points, start=1):
+                point["sequence"] = sequence
+                point["role"] = (
+                    "group_link_start" if sequence == 1
+                    else "group_link_end" if sequence == len(link_points)
+                    else "group_link_waypoint"
+                )
+
+            for area_order in ([1, 2], [2, 1]):
+                draft = {
+                    "id": "random-polyline-{}-{}".format(case_index, area_order[0]),
+                    "recognition": {"confirmed": True},
+                    "groups": [
+                        {
+                            "id": "home",
+                            "areaNumber": 1,
+                            "points": home_points,
+                            "subAreas": [{"id": "home-area", "pointIds": [p["id"] for p in home_points]}],
+                        },
+                        {
+                            "id": "remote",
+                            "areaNumber": 2,
+                            "points": remote_points,
+                            "subAreas": [{"id": "remote-area", "pointIds": [p["id"] for p in remote_points]}],
+                        },
+                    ],
+                    "groupLinks": [{
+                        "id": "bridge",
+                        "startGroupId": "home",
+                        "endGroupId": "remote",
+                        "status": "ready",
+                        "points": link_points,
+                    }],
+                    "routePolicy": {"type": "area_order", "areaOrder": list(area_order)},
+                }
+                draft["taskPreview"] = build_model_preview(draft, now=1000)
+                plan = generate_task_plan(draft, now=2000)
+                tasks = plan["tasks"]
+                task_pairs = [
+                    (
+                        (task["startX"], task["startY"]),
+                        (task["endX"], task["endY"]),
+                    )
+                    for task in tasks
+                ]
+                rounded_bridge = [
+                    (_round_int(point["x"]), _round_int(point["y"]))
+                    for point in draft["taskPreview"]["groupLinks"][0]["points"]
+                ]
+
+                self.assertEqual(plan["areaOrder"], list(area_order), case_index)
+                _assert_continuous_round_trip(self, tasks)
+                for start_xy, end_xy in zip(rounded_bridge, rounded_bridge[1:]):
+                    self.assertTrue(
+                        (start_xy, end_xy) in task_pairs or (end_xy, start_xy) in task_pairs,
+                        "case {} order {} lost bridge segment {} -> {}".format(
+                            case_index, area_order, start_xy, end_xy
+                        ),
+                    )
+
     def test_real_tilted_two_area_route_keeps_boundary_lanes_and_default_area_order(self):
         from modeling_preview import build_model_preview
         from modeling_task_generator import _same_direction_collinear, generate_task_plan

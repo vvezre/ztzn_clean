@@ -232,7 +232,7 @@ class ModelingStoreTest(unittest.TestCase):
         self.assertEqual(deleted["groupLinkId"], link["id"])
         self.assertEqual(deleted["draft"]["groupLinks"], [])
 
-    def test_group_link_rejects_same_group_or_more_than_two_points(self):
+    def test_group_link_rejects_same_group_and_accepts_polyline_points(self):
         from modeling_store import ModelingStore, InvalidModelPayloadError
 
         store = ModelingStore(self.tmpdir, now=lambda: 1000)
@@ -250,11 +250,34 @@ class ModelingStoreTest(unittest.TestCase):
             "startGroupId": start_group["id"],
             "endGroupId": end_group["id"],
         }, now=1004)["groupLink"]
-        store.append_group_link_point(model["id"], link["id"], {"lat": 32.0, "lon": 118.0}, now=1005)
-        store.append_group_link_point(model["id"], link["id"], {"lat": 32.1, "lon": 118.1}, now=1006)
+        store.append_group_link_point(
+            model["id"], link["id"], {"id": "l1", "lat": 32.0, "lon": 118.0}, now=1005
+        )
+        store.append_group_link_point(
+            model["id"], link["id"], {"id": "l2", "lat": 32.1, "lon": 118.1}, now=1006
+        )
+        third = store.append_group_link_point(
+            model["id"], link["id"], {"id": "l3", "lat": 32.2, "lon": 118.2}, now=1007
+        )
 
-        with self.assertRaises(InvalidModelPayloadError):
-            store.append_group_link_point(model["id"], link["id"], {"lat": 32.2, "lon": 118.2}, now=1007)
+        self.assertEqual(
+            [point["role"] for point in third["groupLink"]["points"]],
+            ["group_link_start", "group_link_waypoint", "group_link_end"],
+        )
+        self.assertEqual(third["groupLink"]["status"], "ready")
+
+        deleted = store.delete_group_link_point(
+            model["id"], link["id"], "l2", now=1008
+        )
+        self.assertEqual(
+            [point["id"] for point in deleted["groupLink"]["points"]],
+            ["l1", "l3"],
+        )
+        self.assertEqual(
+            [point["role"] for point in deleted["groupLink"]["points"]],
+            ["group_link_start", "group_link_end"],
+        )
+        self.assertEqual(deleted["groupLink"]["status"], "ready")
 
     def test_build_task_preview_requires_confirmed_recognition_and_saves_preview(self):
         from modeling_store import ModelingStore

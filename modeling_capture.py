@@ -99,10 +99,10 @@ def resolve_mixed_capture(draft):
         )
     link = dict(links[0])
     link_points = list(link.get("points") or [])
-    if len(link_points) != 2 or len(link_event_ids) != 2:
+    if len(link_points) < 2 or len(link_event_ids) != len(link_points):
         raise MixedCaptureError(
             "MODELING_LINK_INCOMPLETE",
-            "the connection requires its original start and end points",
+            "the connection requires at least its original start and end points",
         )
     if len(area_ids) < 8:
         raise MixedCaptureError(
@@ -125,7 +125,7 @@ def resolve_mixed_capture(draft):
         points[point_id]["y"] = round(y, 3)
 
     link_start = points[link_event_ids[0]]
-    link_end = points[link_event_ids[1]]
+    link_end = points[link_event_ids[-1]]
     dx = link_end["x"] - link_start["x"]
     dy = link_end["y"] - link_start["y"]
     length = math.hypot(dx, dy)
@@ -177,10 +177,16 @@ def resolve_mixed_capture(draft):
     remote_group = _set_group_points(group_by_id[end_group_id], remote_ids, points)
 
     link["points"] = [dict(points[point_id]) for point_id in link_event_ids]
-    link["points"][0]["sequence"] = 1
-    link["points"][0]["role"] = "group_link_start"
-    link["points"][1]["sequence"] = 2
-    link["points"][1]["role"] = "group_link_end"
+    point_count = len(link["points"])
+    for sequence, point in enumerate(link["points"], start=1):
+        point["sequence"] = sequence
+        if sequence == 1:
+            point["role"] = "group_link_start"
+        elif sequence == point_count:
+            point["role"] = "group_link_end"
+        else:
+            point["role"] = "group_link_waypoint"
+        point["roles"] = ["group_connector"]
     link["status"] = "ready"
 
     first_link_index = next(

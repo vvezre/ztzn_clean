@@ -86,7 +86,7 @@ class ModelingSessionTest(unittest.TestCase):
             _point("a4", 0, 200),
             _point("l1", 400, 100),
             _point("l2", 600, 100),
-            _point("unused", 700, 100),
+            _point("l3", 700, 200),
             _point("b1", 600, 0),
             _point("b2", 1000, 0),
             _point("b3", 1000, 200),
@@ -103,14 +103,18 @@ class ModelingSessionTest(unittest.TestCase):
 
         first_link = session.record_link_point()
         second_link = session.record_link_point()
+        third_link = session.record_link_point()
 
         self.assertEqual(first_link["point"]["role"], "group_link_start")
         self.assertEqual(second_link["point"]["role"], "group_link_end")
-        self.assertEqual(second_link["session"]["linkPointCount"], 2)
-        self.assertEqual(second_link["session"]["groupCount"], 1)
-
-        with self.assertRaises(InvalidModelPayloadError):
-            session.record_link_point()
+        self.assertEqual(third_link["point"]["role"], "group_link_end")
+        self.assertEqual(third_link["session"]["linkPointCount"], 3)
+        self.assertEqual(third_link["session"]["groupCount"], 1)
+        draft = session.store.get_draft(session.current()["modelId"])
+        self.assertEqual(
+            [point["role"] for point in draft["groupLinks"][0]["points"]],
+            ["group_link_start", "group_link_waypoint", "group_link_end"],
+        )
 
         created_area = session.new_area()
         self.assertEqual(created_area, {
