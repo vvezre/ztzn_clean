@@ -108,6 +108,15 @@ class ModelingSessionTest(unittest.TestCase):
         self.assertEqual(first_link["point"]["role"], "group_link_start")
         self.assertEqual(second_link["point"]["role"], "group_link_end")
         self.assertEqual(third_link["point"]["role"], "group_link_end")
+        # 一座桥允许记录三个或更多点；这些点必须返回同一个桥编号。
+        self.assertEqual(
+            [
+                first_link["point"]["linkNumber"],
+                second_link["point"]["linkNumber"],
+                third_link["point"]["linkNumber"],
+            ],
+            [1, 1, 1],
+        )
         self.assertEqual(third_link["session"]["linkPointCount"], 3)
         self.assertEqual(third_link["session"]["groupCount"], 1)
         draft = session.store.get_draft(session.current()["modelId"])
@@ -179,7 +188,9 @@ class ModelingSessionTest(unittest.TestCase):
         second = session.record_link_point()
         self.assertEqual(first["point"]["id"], "l1")
         self.assertEqual(first["linkNumber"], 1)
+        self.assertEqual(first["point"]["linkNumber"], 1)
         self.assertEqual(second["linkNumber"], 1)
+        self.assertEqual(second["point"]["linkNumber"], 1)
 
         session.new_area()
         for _ in range(4):

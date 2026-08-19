@@ -328,7 +328,14 @@ class ModelingStoreTest(unittest.TestCase):
         first = saved["taskPlan"]["tasks"][0]
         self.assertEqual(first["mode"], 2)
         self.assertEqual((first["startX"], first["startY"]), (0, 0))
-        self.assertEqual((first["endX"], first["endY"]), (1000, 0))
+        # 1000x600区域按完整形状选择1000cm长轴。第一段可能是从原点前往
+        # 首条清扫线的转场，因此直接检查第一条mode=1清扫任务是否横向贯穿区域。
+        first_clean = next(
+            task for task in saved["taskPlan"]["tasks"]
+            if task["mode"] == 1
+        )
+        self.assertEqual(first_clean["startY"], first_clean["endY"])
+        self.assertEqual(abs(first_clean["endX"] - first_clean["startX"]), 1000)
         self.assertIn("startLat", first)
         self.assertIn("endLon", first)
 

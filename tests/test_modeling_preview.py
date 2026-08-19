@@ -51,7 +51,8 @@ class ModelingPreviewTest(unittest.TestCase):
         self.assertEqual(preview["config"]["overlapCm"], 53.0)
         self.assertEqual(preview["config"]["laneSpacingCm"], 63.0)
         lanes = preview["groups"][0]["subAreas"][0]["lanes"]
-        self.assertEqual(lanes[0]["heading"], 180.0)
+        # 1000x600区域应沿1000cm长轴清扫，不能因为先记录了下方长边就竖着扫。
+        self.assertEqual(lanes[0]["heading"], 90.0)
         self.assertGreater(lanes[0]["lengthCm"], 0)
 
     def test_standard_panel_length_offers_four_and_five_lane_candidates(self):
@@ -331,11 +332,11 @@ class ModelingPreviewTest(unittest.TestCase):
             for lane in sub_area["lanes"]
         ))
 
-    def test_side_fluctuation_uses_the_whole_first_side_for_sweep_direction(self):
+    def test_side_fluctuation_uses_the_whole_shape_for_sweep_direction(self):
         from modeling_preview import build_model_preview
 
-        # A1->A2整条侧边总体竖直，但第一小段明显向右偏。旧逻辑只看p1->p2，
-        # 会把全部清扫线带歪；新逻辑应识别p1..p4为完整第一侧边并得到90度清扫方向。
+        # 四边都存在真实波动。自动方向应由完整区域的长轴决定，不能被p1->p2
+        # 这一小段带歪；整体仍应保持接近横向清扫。
         points = [
             _point("p1", 0, 0),
             _point("p2", 25, 30),
@@ -367,7 +368,7 @@ class ModelingPreviewTest(unittest.TestCase):
         sub_area = preview["groups"][0]["subAreas"][0]
         lanes = sub_area["lanes"]
 
-        self.assertEqual(sub_area["sweepAngle"], 90.0)
+        self.assertLess(abs(sub_area["sweepAngle"] - 90.0), 5.0)
         self.assertGreaterEqual(len(lanes), 2)
         self.assertEqual(lanes[0]["laneType"], "boundary")
         self.assertEqual(lanes[-1]["laneType"], "boundary")
@@ -375,6 +376,98 @@ class ModelingPreviewTest(unittest.TestCase):
             lane["laneType"] == "interior" and len(lane["pathPoints"]) == 2
             for lane in lanes[1:-1]
         ))
+
+    def test_auto_sweep_is_invariant_to_start_point_and_recording_direction(self):
+        from modeling_preview import build_model_preview
+
+        base = [
+            _point("p1", 0, 0),
+            _point("p2", 0, 120),
+            _point("p3", 400, 120),
+            _point("p4", 400, 0),
+        ]
+
+        def preview_for(points):
+            draft = {
+                "id": "order-invariant",
+                "recognition": {"confirmed": True},
+                "groups": [{
+                    "id": "g1",
+                    "areaNumber": 1,
+                    "sweepDirection": "auto",
+                    "points": points,
+                    "subAreas": [{
+                        "id": "sa1",
+                        "pointIds": [point["id"] for point in points],
+                    }],
+                }],
+                "groupLinks": [],
+            }
+            return build_model_preview(draft, now=1000)["groups"][0]["subAreas"][0]
+
+        variants = []
+        for offset in range(len(base)):
+            variants.append(base[offset:] + base[:offset])
+        reversed_base = list(reversed(base))
+        for offset in range(len(reversed_base)):
+            variants.append(reversed_base[offset:] + reversed_base[:offset])
+
+        results = [preview_for(points) for points in variants]
+        self.assertEqual({result["sweepAngle"] for result in results}, {90.0})
+
+        def lane_signature(result):
+            return [
+                (
+                    tuple((point["x"], point["y"]) for point in lane.get("pathPoints") or []),
+                    lane.get("laneType"),
+                )
+                for lane in result["lanes"]
+            ]
+
+        expected = lane_signature(results[0])
+        self.assertTrue(all(lane_signature(result) == expected for result in results[1:]))
+
+    def test_111_like_regions_both_choose_horizontal_long_axis(self):
+        from modeling_preview import build_model_preview
+
+        area_one = [
+            _point("p1", 0.0, 0.0),
+            _point("p2", 7.334, 123.771),
+            _point("p3", 12.480, 123.482),
+            _point("p4", 365.686, 106.002),
+            _point("p5", 931.441, 51.061),
+            _point("p6", 921.280, -73.578),
+            _point("p7", 594.147, -47.213),
+        ]
+        # 区域二先记录了横向长边；旧算法会因此生成竖向短清扫线。
+        area_two = [
+            _point("q1", 824.398, 192.145),
+            _point("q2", 1189.528, 172.986),
+            _point("q3", 1195.900, 294.633),
+            _point("q4", 868.060, 340.668),
+        ]
+        draft = {
+            "id": "111-shape-directions",
+            "recognition": {"confirmed": True},
+            "groups": [
+                {
+                    "id": "g1", "areaNumber": 1, "points": area_one,
+                    "subAreas": [{"id": "sa1", "pointIds": [p["id"] for p in area_one]}],
+                },
+                {
+                    "id": "g2", "areaNumber": 2, "points": area_two,
+                    "subAreas": [{"id": "sa2", "pointIds": [p["id"] for p in area_two]}],
+                },
+            ],
+            "groupLinks": [],
+        }
+
+        preview = build_model_preview(draft, now=1000)
+        angles = [group["subAreas"][0]["sweepAngle"] for group in preview["groups"]]
+        self.assertTrue(all(abs(angle - 90.0) < 15.0 for angle in angles))
+        for group in preview["groups"]:
+            lanes = group["subAreas"][0]["lanes"]
+            self.assertTrue(all(abs(lane["endX"] - lane["startX"]) > abs(lane["endY"] - lane["startY"]) for lane in lanes))
 
     def test_build_preview_requires_confirmed_recognition(self):
         from modeling_preview import ModelingPreviewError, build_model_preview

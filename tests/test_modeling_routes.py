@@ -319,9 +319,9 @@ class ModelingRoutesTest(unittest.TestCase):
             "areaNumber": 1,
             "points": [
                 {"id": "p1", "sequence": 1, "lat": 32.0, "lon": 118.0, "x": 0, "y": 0},
-                {"id": "p2", "sequence": 2, "lat": 32.0, "lon": 118.0, "x": 1000, "y": 0},
-                {"id": "p3", "sequence": 3, "lat": 32.0, "lon": 118.0, "x": 1000, "y": 600},
-                {"id": "p4", "sequence": 4, "lat": 32.0, "lon": 118.0, "x": 0, "y": 600},
+                {"id": "p2", "sequence": 2, "lat": 32.0, "lon": 118.000106, "x": 1000, "y": 0},
+                {"id": "p3", "sequence": 3, "lat": 32.000054, "lon": 118.000106, "x": 1000, "y": 600},
+                {"id": "p4", "sequence": 4, "lat": 32.000054, "lon": 118.0, "x": 0, "y": 600},
             ],
         }]
         self.client.post("/modeling/draft", json={"modelId": model["id"], "draft": draft})
@@ -394,6 +394,16 @@ class ModelingRoutesTest(unittest.TestCase):
             "groupId": "g1",
             "status": "recognized",
             "summary": {"pointCount": 4, "subAreaCount": 1, "connectorCount": 0, "assistPointCount": 0},
+        }
+        # 该测试直接构造的x/y已经处于统一模型坐标系，明确写出坐标系元数据，
+        # 避免预览接口把近似经纬度再次迁移并引入与路线算法无关的测试误差。
+        draft["coordinateFrame"] = {
+            "type": "model_origin",
+            "unit": "cm",
+            "originPointId": "p1",
+            "originGroupId": "g1",
+            "originLat": 32.0,
+            "originLon": 118.0,
         }
         self.client.post("/modeling/draft", json={"modelId": model["id"], "draft": draft})
 

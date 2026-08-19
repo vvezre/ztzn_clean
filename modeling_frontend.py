@@ -24,8 +24,9 @@ def frontend_area_points(draft):
     1. 先从所有区域组收集点对象，并用 id 去重；
     2. 再按 captureSequence 还原全局记录顺序；旧草稿若没有完整顺序，则把遗漏点补到末尾。
 
-    返回的每个元素固定包含 id、name、sequence、x、y、lat、lon，前端可直接列表展示、
-    标号或连线。id 是删除点位时使用的唯一标识，sequence 只是当前列表展示顺序。
+    返回的每个元素固定包含 id、name、sequence、areaNumber、x、y、lat、lon，前端可
+    直接列表展示、分区或连线。id 是删除点位时使用的唯一标识，sequence 只是当前列表
+    展示顺序，areaNumber 表示该点属于第几个清扫区域。
     """
     # points_by_id 保存唯一点对象；fallback_point_ids 保存草稿中的自然遍历顺序，
     # 用于兼容早期没有 captureSequence 字段的建模数据。
@@ -90,7 +91,8 @@ def frontend_link_points(draft):
     也符合前端“查询全部连接点、按 id 删除”的使用方式。
 
     排序和兼容策略与 :func:`frontend_area_points` 一致：优先使用 captureSequence，
-    没有顺序记录的历史点追加到末尾。
+    没有顺序记录的历史点追加到末尾。每个返回点还包含 linkNumber，表示该点属于第
+    几座连接桥；同一座桥记录两个、三个或更多点时，它们的 linkNumber 始终相同。
     """
     # 先建立 id -> 点对象索引，保证列表里的 id 唯一。
     points_by_id = {}

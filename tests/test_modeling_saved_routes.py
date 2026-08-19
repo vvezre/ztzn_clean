@@ -46,6 +46,7 @@ class ModelingSavedRoutesTest(unittest.TestCase):
                     }],
                 }],
                 "groupLinks": [{
+                    "linkNumber": 3,
                     "points": [{
                         "id": "l1",
                         "x": 0,
@@ -82,6 +83,7 @@ class ModelingSavedRoutesTest(unittest.TestCase):
         self.assertEqual(result["routes"][1]["areaOrder"], [1, 2])
         self.assertEqual(result["routes"][0]["areaPoints"][0]["id"], "a1")
         self.assertEqual(result["routes"][0]["linkPoints"][0]["id"], "l1")
+        self.assertEqual(result["routes"][0]["linkPoints"][0]["linkNumber"], 3)
         self.assertEqual(
             [point["id"] for point in result["routes"][0]["pathPoints"]],
             ["p1", "p2"],

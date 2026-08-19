@@ -516,16 +516,22 @@ class ModelingSession(object):
                 "link",
                 result["point"],
             )
+            # 与区域点在point中直接返回areaNumber保持一致：连接点也把所属桥编号
+            # 放进公开point对象。前端收到单次记录结果后可以直接把point插入
+            # linkPoints列表，不必再从外层字段补写，也不会把sequence误当成桥编号。
+            link_number = (result.get("groupLink") or {}).get("linkNumber")
+            public_point = dict(result["point"])
+            public_point["linkNumber"] = link_number
             state["currentPointType"] = "link"
             state["captureMode"] = "link"
             state = self._write_state(state)
             return {
                 "modelId": model_id,
                 "linkId": link_id,
-                "linkNumber": (result.get("groupLink") or {}).get("linkNumber"),
+                "linkNumber": link_number,
                 "pointType": "link",
                 "pointNo": result["point"].get("sequence"),
-                "point": result["point"],
+                "point": public_point,
                 "sourceAreaNumber": source_group.get("areaNumber"),
                 "session": self._summary(state, saved),
             }

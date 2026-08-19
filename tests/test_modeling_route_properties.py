@@ -137,14 +137,31 @@ class ModelingRoutePropertyTest(unittest.TestCase):
             lanes = preview["groups"][0]["subAreas"][0]["lanes"]
 
             self.assertGreaterEqual(len(lanes), 2, case_index)
-            self.assertAlmostEqual(lanes[0]["startX"], points[1]["x"], places=1)
-            self.assertAlmostEqual(lanes[0]["startY"], points[1]["y"], places=1)
-            self.assertAlmostEqual(lanes[0]["endX"], points[2]["x"], places=1)
-            self.assertAlmostEqual(lanes[0]["endY"], points[2]["y"], places=1)
-            self.assertAlmostEqual(lanes[-1]["startX"], points[0]["x"], places=1)
-            self.assertAlmostEqual(lanes[-1]["startY"], points[0]["y"], places=1)
-            self.assertAlmostEqual(lanes[-1]["endX"], points[3]["x"], places=1)
-            self.assertAlmostEqual(lanes[-1]["endY"], points[3]["y"], places=1)
+            # 清扫方向现在由整个四边形长轴决定，因此宽度大于高度时保留上下
+            # 外边界，高度大于宽度时保留左右外边界；不能再固定假设p1->p2是短边。
+            def matching_edge_index(lane):
+                lane_start = (lane["startX"], lane["startY"])
+                lane_end = (lane["endX"], lane["endY"])
+
+                def close(left, right):
+                    return abs(left[0] - right[0]) < 0.11 and abs(left[1] - right[1]) < 0.11
+
+                for edge_index, edge_start in enumerate(points):
+                    edge_end = points[(edge_index + 1) % len(points)]
+                    start_xy = (edge_start["x"], edge_start["y"])
+                    end_xy = (edge_end["x"], edge_end["y"])
+                    if (
+                            (close(lane_start, start_xy) and close(lane_end, end_xy))
+                            or (close(lane_start, end_xy) and close(lane_end, start_xy))):
+                        return edge_index
+                return None
+
+            first_edge = matching_edge_index(lanes[0])
+            last_edge = matching_edge_index(lanes[-1])
+            self.assertIsNotNone(first_edge, case_index)
+            self.assertIsNotNone(last_edge, case_index)
+            self.assertEqual((first_edge - last_edge) % 2, 0, case_index)
+            self.assertNotEqual(first_edge, last_edge, case_index)
             selected_count = plan["routeSelections"][0]["laneCount"]
             self.assertEqual(plan["summary"]["cleanTaskCount"], selected_count, case_index)
             self.assertIn(

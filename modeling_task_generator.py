@@ -29,6 +29,11 @@ TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
 # 5cm以内可能来自RTK抖动、浮点求交和整数厘米取整；超过5cm的边界段必须保留，
 # 不再把16～20cm的真实路线当成误差吸回角点，避免“先退回角点、再掉头返回”。
 BOUNDARY_CORNER_SNAP_CM = 5.0
+# 连接桥首尾点由人工遥控记录，和区域边界可能存在数厘米RTK偏差。桥头距离
+# 最近边界不超过10cm，且从相邻边界锚点直连桥头不会穿过区域内部时，把桥头
+# 直接作为区域与连接桥的接入点，不再保留“边界投影Q -> 桥头L1”的几厘米短任务。
+# 这条阈值只用于桥头接边，不扩大普通点、真实短边和桥内中间点的5cm去重范围。
+BRIDGE_BOUNDARY_JOIN_CM = 10.0
 # 只有当前点和目标点本身都贴在边界上，才允许使用“同边直达”。连接桥可能
 # 位于区域外侧，即使两个最近投影碰巧落在同一边，也仍须经过人工边界锚点。
 SAME_EDGE_DIRECT_MAX_OFFSET_CM = 2.0
@@ -46,12 +51,12 @@ TRANSITION_DUPLICATE_POINT_CM = 5.0
 TRANSITION_NEAR_POINT_CM = 30.0
 TRANSITION_BACKTRACK_DEG = 150.0
 
-# 局部方向变化达到30度就认为是真实转弯，必须保留为任务端点，让小车停车重新转向。
-# test12 中16～18度的采样摆动可以连续直行，而实际90度连接桥转角一定会被保留。
-TRANSFER_HARD_TURN_DEG = 30.0
-# 同一条边界清扫折线也使用30度作为“必须停车重新转向”的阈值。小于该角度时，
+# 局部方向变化达到55度才认为是真实硬转弯，必须保留为任务端点，让小车停车重新转向。
+# 记录边界上的小幅摆动和中等方向修正会连续通过，实际接近90度的拐角仍会停车转向。
+TRANSFER_HARD_TURN_DEG = 55.0
+# 同一条边界清扫折线也使用55度作为“必须停车重新转向”的阈值。小于该角度时，
 # 相邻点仍作为真实路径点保留，但执行器连续驶过，不关闭滚刷、不执行原地转向。
-CLEAN_PATH_HARD_TURN_DEG = 30.0
+CLEAN_PATH_HARD_TURN_DEG = 55.0
 
 # 人工记录的边界清扫折线中，两点不超过5cm时视为同一物理位置，
 # 禁止拆成“停车转向 -> 行走1cm -> 再停车”的独立清扫任务。5～30cm
@@ -600,7 +605,7 @@ def _simplify_transfer_run(tasks):
             return list(tasks)
         points.append(endpoint)
 
-    # 首点和尾点永远保留，中间先检查是否存在30度以上的真实转角。
+    # 首点和尾点永远保留，中间先检查是否存在55度以上的真实转角。
     hard_indexes = [0]
     for index in range(1, len(points) - 1):
         if _turn_angle_degrees(points[index - 1], points[index], points[index + 1]) >= TRANSFER_HARD_TURN_DEG:
@@ -792,6 +797,68 @@ def _link_xy_points(link, mapper):
     return points
 
 
+def _group_boundary_distance(preview, group_id, point, mapper):
+    """计算一个桥端点到指定区域真实记录边界的最短距离。"""
+    group = next(
+        (item for item in (preview.get("groups") or []) if item.get("groupId") == group_id),
+        None,
+    )
+    if group is None:
+        return None
+
+    best = None
+    for sub_area in group.get("subAreas") or []:
+        polygon = []
+        for raw_point in sub_area.get("polygon") or []:
+            xy = mapper.point_to_xy(raw_point)
+            if xy is not None and (not polygon or not _is_same_point(polygon[-1], xy)):
+                polygon.append(xy)
+        if len(polygon) == 1:
+            distance = _length_cm(point, polygon[0])
+            best = distance if best is None else min(best, distance)
+            continue
+        for index, start in enumerate(polygon):
+            end = polygon[(index + 1) % len(polygon)]
+            distance = _point_to_segment_distance(point, start, end)
+            best = distance if best is None else min(best, distance)
+    return best
+
+
+def _orient_link_points_for_groups(preview, start_group_id, end_group_id, points, mapper):
+    """让桥点自动从start区域指向end区域，不依赖人工记录方向。"""
+    original = list(points or [])
+    if len(original) < 2:
+        return original
+
+    first, last = original[0], original[-1]
+    forward_distances = (
+        _group_boundary_distance(preview, start_group_id, first, mapper),
+        _group_boundary_distance(preview, end_group_id, last, mapper),
+    )
+    reverse_distances = (
+        _group_boundary_distance(preview, start_group_id, last, mapper),
+        _group_boundary_distance(preview, end_group_id, first, mapper),
+    )
+    # 手工构造的历史预览可能没有polygon；此时继续沿用原有元数据方向，避免
+    # 改变不含区域形状信息的旧任务。真实新建模型始终包含完整polygon。
+    if None in forward_distances or None in reverse_distances:
+        return original
+
+    forward_cost = sum(forward_distances)
+    reverse_cost = sum(reverse_distances)
+    if reverse_cost + EPSILON_CM < forward_cost:
+        return list(reversed(original))
+    if forward_cost + EPSILON_CM < reverse_cost:
+        return original
+
+    # 对称场景中两种代价完全相等，用坐标序列作稳定决胜，保证把同一座桥整体
+    # 反向记录后仍得到同一条有向折线，而不是受输入数组顺序影响。
+    reversed_points = list(reversed(original))
+    original_signature = tuple((round(point[0], 8), round(point[1], 8)) for point in original)
+    reversed_signature = tuple((round(point[0], 8), round(point[1], 8)) for point in reversed_points)
+    return original if original_signature <= reversed_signature else reversed_points
+
+
 def _link_route_between(preview, from_group_id, to_group_id, mapper):
     """返回区域图中的连接桥边序列，每条边保留方向化后的全部桥点。"""
     # 同一区域不需要经过连接桥；缺少任一groupId也无法构图。
@@ -806,11 +873,19 @@ def _link_route_between(preview, from_group_id, to_group_id, mapper):
         # start/endGroupId定义桥连接的两个区域，不表示只能单向行驶。
         start_group_id = link.get("startGroupId")
         end_group_id = link.get("endGroupId")
-        # link_points严格保持人工记录顺序，可包含两个以上的桥内中间点。
+        # 连接桥可包含两个以上的桥内中间点；记录顺序只描述折线形状，不再决定
+        # startGroup到endGroup的通行方向。程序用桥两端到两个区域边界的距离自动定向。
         link_points = _link_xy_points(link, mapper)
         if not start_group_id or not end_group_id or len(link_points) < 2:
             # 不完整连接不参与路径搜索，避免生成到一半中断的跨区路线。
             continue
+        link_points = _orient_link_points_for_groups(
+            preview,
+            start_group_id,
+            end_group_id,
+            link_points,
+            mapper,
+        )
         # 正向：startGroup -> endGroup，连接点使用原顺序。
         graph.setdefault(start_group_id, []).append({
             "fromGroupId": start_group_id,
@@ -905,7 +980,12 @@ def _append_transition_tasks(
     elif route_edges:
         first_points = route_edges[0].get("points") or []
         path_points = _group_anchor_transition_points(
-            draft, from_group_id, current, first_points[0], mapper
+            draft,
+            from_group_id,
+            current,
+            first_points[0],
+            mapper,
+            target_is_bridge_endpoint=True,
         )
         for edge_index, edge in enumerate(route_edges):
             edge_points = edge.get("points") or []
@@ -919,10 +999,17 @@ def _append_transition_tasks(
                     edge_points[-1],
                     next_points[0],
                     mapper,
+                    current_is_bridge_endpoint=True,
+                    target_is_bridge_endpoint=True,
                 )
                 path_points = _dedupe_xy_path(path_points + boundary[1:])
         arrival = _group_anchor_transition_points(
-            draft, to_group_id, path_points[-1], target, mapper
+            draft,
+            to_group_id,
+            path_points[-1],
+            target,
+            mapper,
+            current_is_bridge_endpoint=True,
         )
         path_points = _dedupe_xy_path(path_points + arrival[1:])
     else:
@@ -1059,7 +1146,7 @@ def _simplify_transition_path_points(points, protected_points=None):
     1. 精确重复点先由 ``_dedupe_xy_path`` 删除；
     2. 新点回到最近几个历史点 5cm 内时，删除中间局部环路，例如 A->B->A；
     3. 30cm内、连续出现的普通中间点按局部路线总代价选择一个代表点；
-    4. 其余孤立短段只在小于30度的近似直行或大于150度的明显折返时合并；
+    4. 其余孤立短段只在小于55度的连续转向或大于150度的明显折返时合并；
     5. 始终把首尾重新固定为原始 current/target，保证任务接口坐标不漂移。
     """
     normalized = _dedupe_xy_path(points)
@@ -1335,17 +1422,42 @@ def _boundary_anchor_candidates(projection, anchors):
     return [next_index, edge_index]
 
 
-def _boundary_projection_waypoint(projection, anchor, endpoint=None):
-    """返回必须经过的投影点；5cm内的同位点不再拆成独立任务。"""
+def _boundary_projection_waypoint(
+        projection,
+        anchor,
+        endpoint=None,
+        bridge_endpoint=False,
+        polygon=None):
+    """返回必须经过的投影点；安全贴边的桥头直接替代投影点。
+
+    普通区域端点继续使用原有5cm吸附规则。只有调用方明确说明endpoint是
+    连接桥首尾点时，才允许使用10cm桥头接边容差；并且还要验证从相邻边界
+    锚点直达桥头不会穿过区域内部。这样只删除程序生成的Q点，不删除人工L点。
+    """
     point = projection["point"]
-    if endpoint is not None and _length_cm(point, endpoint) <= BOUNDARY_CORNER_SNAP_CM:
-        return None
+    if endpoint is not None:
+        endpoint_distance = _length_cm(point, endpoint)
+        if not bridge_endpoint and endpoint_distance <= BOUNDARY_CORNER_SNAP_CM:
+            return None
+        if (
+                bridge_endpoint
+                and endpoint_distance <= BRIDGE_BOUNDARY_JOIN_CM
+                and polygon
+                and _straight_segment_avoids_polygon_interior(anchor, endpoint, polygon)):
+            return None
     if _length_cm(point, anchor) > BOUNDARY_CORNER_SNAP_CM:
         return point
     return None
 
 
-def _group_anchor_transition_points(draft, group_id, current, target, mapper):
+def _group_anchor_transition_points(
+        draft,
+        group_id,
+        current,
+        target,
+        mapper,
+        current_is_bridge_endpoint=False,
+        target_is_bridge_endpoint=False):
     """
     Connect two positions through the area's manually recorded anchors.
 
@@ -1455,10 +1567,18 @@ def _group_anchor_transition_points(draft, group_id, current, target, mapper):
             reverse_indexes = _cyclic_anchor_indexes(start_index, end_index, len(anchors), -1)
             for direction_priority, indexes in enumerate((forward_indexes, reverse_indexes)):
                 start_projection_point = _boundary_projection_waypoint(
-                    current_projection, anchors[start_index], endpoint=current
+                    current_projection,
+                    anchors[start_index],
+                    endpoint=current,
+                    bridge_endpoint=current_is_bridge_endpoint,
+                    polygon=anchors,
                 )
                 end_projection_point = _boundary_projection_waypoint(
-                    target_projection, anchors[end_index], endpoint=target
+                    target_projection,
+                    anchors[end_index],
+                    endpoint=target,
+                    bridge_endpoint=target_is_bridge_endpoint,
+                    polygon=anchors,
                 )
                 # 路线必须从真实current开始，随后经过投影点、人工锚点，最终到真实target。
                 path = [current]
@@ -1659,9 +1779,9 @@ def _group_lane_segments(preview, group_id, entry, exit_point):
 def _clean_turn_can_remove_point(previous_point, current_point, next_point):
     """判断一个5～30cm近点能否在不破坏真实边界的前提下删除。
 
-    ``previous -> current -> next`` 的方向变化小于30度，说明current
+    ``previous -> current -> next`` 的方向变化小于55度，说明current
     只是近似直线上的密集采样点；方向变化大于等于150度，说明它
-    形成了很短的原路折返。两种情况都可以删除。30～150度之间视为
+    形成了很短的原路折返。两种情况都可以删除。55～150度之间视为
     真实边界拐点，即使相邻段很短也不能抹掉。
     """
     turn_angle = _turn_angle_degrees(previous_point, current_point, next_point)
@@ -1808,7 +1928,7 @@ def _simplify_clean_segments(segments):
 
 
 def _mark_continuous_path_tasks(path_tasks, continuous_path_id):
-    """保留一条人工折线的全部点，仅在30度以上硬拐点停车重新转向。"""
+    """保留一条人工折线的全部点，仅在55度以上硬拐点停车重新转向。"""
     if not path_tasks:
         return
     for task in path_tasks:
@@ -1966,7 +2086,7 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
                     segment.get("sourceId") or "lane",
                     task_id,
                 )
-                # hard_turns[i]描述第i段终点处是否达到30°停车转向阈值。
+                # hard_turns[i]描述第i段终点处是否达到55°停车转向阈值。
                 hard_turns = []
                 for index in range(len(lane_tasks) - 1):
                     start = (
@@ -1983,7 +2103,7 @@ def _append_clean_segments(tasks, segments, current, mapper, task_id, draft):
                     )
                     # θ_turn=min(|θ_in-θ_out|,360-|θ_in-θ_out|)，范围0..180°。
                     turn_angle = _turn_angle_degrees(start, middle, end)
-                    # 达到30°是真实硬拐点；小于30°仍保留目标点，但连续通过。
+                    # 达到55°是真实硬拐点；小于55°仍保留目标点，但连续通过。
                     hard_turns.append(turn_angle >= CLEAN_PATH_HARD_TURN_DEG)
 
                 for index, task in enumerate(lane_tasks):
@@ -2460,7 +2580,7 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
             source="modeling_return_origin",
         )
 
-    # 删除小于3cm伪转场、合并普通近似直行转场，同时保留30°以上真实拐点。
+    # 删除小于3cm伪转场、合并普通连续转向转场，同时保留55°以上真实拐点。
     tasks = _compact_executable_tasks(tasks)
     # 边界折线的多个mode=1子段属于同一条清扫线，不能改变cleanTaskCount的历史含义。
     clean_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)

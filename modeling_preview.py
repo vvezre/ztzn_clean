@@ -3,10 +3,10 @@
 
 本文件只负责几何规划，不直接驱动小车。评审时可以按下面四步阅读：
 
-1. 用区域前两个记录点确定一条边的方向，再旋转90度得到清扫主方向。
+1. 用完整区域的凸包和最小外接矩形确定长轴方向，不依赖前两个点或记录方向。
 2. 用“滚刷宽度 - 重叠宽度”得到目标线间距，并生成满足最低重叠的奇偶候选。
-3. 按记录顺序把区域边界分为两条侧边和两条边界清扫线；边界清扫线保留全部记录点。
-4. 两条边界线之间生成平行直线，并输出给任务生成器排成 S 形。
+3. 在闭合边界的所有循环起点和正反方向中识别两条外边界，保留真实边界折线。
+4. 两条边界折线之间生成沿区域长轴的平行直线，并输出给任务生成器排成 S 形。
 
 坐标约定：x 向东为正，y 向北为正，单位厘米；航向0度沿+y，90度沿+x。
 """
@@ -114,61 +114,102 @@ def _heading_from_points(start, end):
     return _normalize_heading(math.degrees(math.atan2(dx, dy)))
 
 
+def _convex_hull(points):
+    """返回与记录起点、记录方向和重复采样数量无关的二维凸包。"""
+    unique = sorted(set(
+        (float(point[0]), float(point[1]))
+        for point in points
+        if point is not None
+    ))
+    if len(unique) <= 1:
+        return unique
+
+    def cross(origin, left, right):
+        return (
+            (left[0] - origin[0]) * (right[1] - origin[1])
+            - (left[1] - origin[1]) * (right[0] - origin[0])
+        )
+
+    lower = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= EPSILON:
+            lower.pop()
+        lower.append(point)
+    upper = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= EPSILON:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _canonical_axis_heading(direction):
+    """把一条无向轴统一表示成[0,180)航向，消除正反记录造成的180度差。"""
+    heading = math.degrees(math.atan2(direction[0], direction[1])) % 180.0
+    if abs(heading - 180.0) <= 1e-9:
+        return 0.0
+    return heading
+
+
 def _default_sweep_angle(points):
     """
-    自动确定清扫主方向。
+    根据完整区域形状自动确定清扫主方向。
 
-    用户从第一条侧边的起点开始，沿侧边连续记录到第一个角点。侧边中间允许
-    存在任意数量的真实浮动点，因此不能再用“第一个点 -> 第二个点”这一小段
-    代表整条侧边。这里先用第一小段取得初始方向，再识别完整的第一侧边，最终
-    使用“侧边首点 -> 侧边末点”的总体方向生成与它垂直的清扫线方向。
+    区域点只描述闭合边界，不再用第一个点、第二个点或第一条记录边决定清扫
+    方向。程序先计算所有边界点的凸包，再枚举凸包边对应的外接矩形，选择面积
+    最小且跨行宽度最小的稳定方向，最后沿外接矩形长轴生成清扫线。这样同一
+    区域无论从哪个角开始、顺时针还是逆时针记录，都会得到同一组平行清扫线。
     """
-    # 没有两个点就无法得到边界方向。
-    if len(points) < 2:
-        return None
-    # 第一小段只用于给四段边界识别提供初始方向，不能直接作为最终清扫方向。
-    start_xy = _point_xy(points[0])
-    end_xy = _point_xy(points[1])
-    if start_xy is None or end_xy is None:
-        return None
-    # 边界方向向量 v=(dx,dy)。
-    dx = end_xy[0] - start_xy[0]
-    dy = end_xy[1] - start_xy[1]
-    if abs(dx) < EPSILON and abs(dy) < EPSILON:
-        return None
-    # 几何求交必须保留完整精度；提前四舍五入到0.1°会让旋转矩形的最外侧扫描线
-    # 与边界产生轻微夹角，最终漏掉首尾两条清扫线。展示时再统一保留0.1°。
-    # 本项目0度沿+y，所以航向角使用 atan2(dx,dy)。
-    first_edge = math.degrees(math.atan2(dx, dy)) % 360.0
-    # 清扫线与侧边垂直，因此初始值沿顺时针方向旋转90度。
-    sweep_angle = (first_edge + 90.0) % 360.0
-
-    # 浮动点可能让第一小段偏斜几十度。使用当前方向识别四段边界后，再用完整
-    # 第一侧边的首尾弦方向修正；重复两次可让分段和最终方向稳定一致。
     polygon_xy = [_point_xy(point) for point in points]
     polygon_xy = [point for point in polygon_xy if point is not None]
-    for _ in range(2):
-        radians = math.radians(sweep_angle)
-        direction = (math.sin(radians), math.cos(radians))
-        normal = (math.cos(radians), -math.sin(radians))
-        sections = _recorded_boundary_sections(polygon_xy, direction, normal)
-        if sections is None:
-            break
-        first_side = sections.get("firstSide") or []
-        if len(first_side) < 2:
-            break
-        side_dx = first_side[-1][0] - first_side[0][0]
-        side_dy = first_side[-1][1] - first_side[0][1]
-        if abs(side_dx) < EPSILON and abs(side_dy) < EPSILON:
-            break
-        side_heading = math.degrees(math.atan2(side_dx, side_dy)) % 360.0
-        refined = (side_heading + 90.0) % 360.0
-        if _angle_difference(refined, sweep_angle) <= 1e-7:
-            sweep_angle = refined
-            break
-        sweep_angle = refined
-    # 旋转后的反方向仍属于同一组平行线；从哪一端出发由S形候选阶段决定。
-    return sweep_angle
+    hull = _convex_hull(polygon_xy)
+    if len(hull) < 2:
+        return None
+
+    candidates = []
+    for index, start in enumerate(hull):
+        end = hull[(index + 1) % len(hull)]
+        edge = (end[0] - start[0], end[1] - start[1])
+        edge_length = math.hypot(edge[0], edge[1])
+        if edge_length <= EPSILON:
+            continue
+        edge_axis = (edge[0] / edge_length, edge[1] / edge_length)
+        perpendicular_axis = (edge_axis[1], -edge_axis[0])
+        edge_offsets = [
+            edge_axis[0] * point[0] + edge_axis[1] * point[1]
+            for point in hull
+        ]
+        perpendicular_offsets = [
+            perpendicular_axis[0] * point[0] + perpendicular_axis[1] * point[1]
+            for point in hull
+        ]
+        edge_span = max(edge_offsets) - min(edge_offsets)
+        perpendicular_span = max(perpendicular_offsets) - min(perpendicular_offsets)
+        if edge_span <= EPSILON and perpendicular_span <= EPSILON:
+            continue
+
+        # 清扫线沿外接矩形长轴；较短轴是需要布置多条清扫线的跨行宽度。
+        if edge_span >= perpendicular_span:
+            sweep_axis = edge_axis
+            sweep_span = edge_span
+            cross_span = perpendicular_span
+        else:
+            sweep_axis = perpendicular_axis
+            sweep_span = perpendicular_span
+            cross_span = edge_span
+        heading = _canonical_axis_heading(sweep_axis)
+        # 主排序使用最小外接面积；面积相同时优先跨行宽度更小、清扫线更长的方向。
+        # 最后用规范化航向消除正方形等对称区域的方向歧义，保证结果可复现。
+        candidates.append((
+            edge_span * perpendicular_span,
+            cross_span,
+            -sweep_span,
+            heading,
+        ))
+
+    if not candidates:
+        return None
+    return min(candidates)[3]
 
 
 def _group_sweep_angle(group, polygon):
@@ -176,7 +217,7 @@ def _group_sweep_angle(group, polygon):
     获取一个区域的清扫方向。
 
     sweepDirection=manual 时使用人工指定的 sweepAngle；
-    其他情况根据该区域前两个有效点自动计算。
+    其他情况根据完整区域形状自动计算，与记录起点和记录方向无关。
     """
     direction = str(group.get("sweepDirection") or "auto")
     manual_angle = _normalize_heading(group.get("sweepAngle"))
@@ -395,7 +436,7 @@ def _is_convex_quadrilateral(points):
     return all(sign == signs[0] for sign in signs[1:])
 
 
-def _recorded_boundary_sections(polygon_xy, direction, normal):
+def _recorded_boundary_sections_from_start(polygon_xy, direction, normal):
     """
     按人工记录顺序识别“侧边、外边界、侧边、外边界”四段折线。
 
@@ -591,7 +632,45 @@ def _recorded_boundary_sections(polygon_xy, direction, normal):
         "secondBoundary": second_boundary,
         "boundaryPaths": paths,
         "splits": (first_split, second_split, third_split),
+        "_quality": best[:5],
     }
+
+
+def _recorded_boundary_sections(polygon_xy, direction, normal):
+    """识别两条真实外边界，结果不依赖从哪个点开始或按哪个方向记录。"""
+    points = list(polygon_xy or [])
+    if len(points) < 4:
+        return None
+
+    best_result = None
+    best_quality = None
+    best_signature = None
+    # 同时枚举原方向和反方向；每个方向再枚举所有循环起点。记录点只描述
+    # 边界形状，因此同一闭环的循环移位和整体反转必须得到相同的外边界。
+    for oriented in (points, list(reversed(points))):
+        for start_index in range(len(oriented)):
+            rotated = oriented[start_index:] + oriented[:start_index]
+            result = _recorded_boundary_sections_from_start(rotated, direction, normal)
+            if result is None:
+                continue
+            # 循环移位后，同一几何切分会因浮点加法顺序产生约1e-15的差异。
+            # 先统一到稳定精度，避免这类无意义差异压过后续的方向匹配分数。
+            quality = tuple(round(value, 9) for value in (result.get("_quality") or ()))
+            signature = tuple(
+                tuple((round(point[0], 8), round(point[1], 8)) for point in path)
+                for path in (result.get("boundaryPaths") or [])
+            )
+            if (
+                    best_result is None
+                    or quality > best_quality
+                    or (quality == best_quality and signature < best_signature)):
+                best_result = result
+                best_quality = quality
+                best_signature = signature
+
+    if best_result is not None:
+        best_result.pop("_quality", None)
+    return best_result
 
 
 def _recorded_boundary_paths(polygon_xy, direction, normal):
@@ -608,13 +687,12 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     """
     为按顺序记录的区域生成“外边界折线 + 内部直线”清扫线。
 
-    建模约定前两个点给出一条侧边方向，清扫线与它垂直。程序按记录顺序识别
-    两条侧边和两条外边界：第一条、最后一条清扫线完整经过对应外边界的全部
-    记录点，中间清扫线保持直线。
+    程序根据完整区域形状得到长轴清扫方向，再从闭合记录边界中识别两条外边界：
+    第一条、最后一条清扫线完整经过对应外边界的全部记录点，中间清扫线保持直线。
 
     这样既兼容原有四点梯形，也支持一条边上记录多个点、边界上下波动的区域。
 
-    只有 sweep_angle 与“前两个点自动确定的方向”一致时才启用该方法；手工指定
+    只有 sweep_angle 与“完整区域形状自动确定的方向”一致时才启用该方法；手工指定
     其他清扫方向时仍走原有通用扫描线算法。
     """
     polygon_xy = [_point_xy(point) for point in polygon]
@@ -643,23 +721,10 @@ def _generate_boundary_interpolated_quadrilateral_lanes(
     # q_min/q_max给出区域在跨行轴上的两侧边界。
     min_offset = min(offsets)
     max_offset = max(offsets)
-    # 四点区域继续使用左右侧边投影均值，保持已验证路线与Python 2/3结果不变；
-    # 多点不规则区域使用完整投影跨度，保证最外侧波动也处于滚刷覆盖范围内。
-    if len(polygon_xy) == 4 and _is_convex_quadrilateral(polygon_xy):
-        first, second, third, fourth = polygon_xy
-        left_span = abs(
-            normal[0] * (first[0] - second[0])
-            + normal[1] * (first[1] - second[1])
-        )
-        right_span = abs(
-            normal[0] * (fourth[0] - third[0])
-            + normal[1] * (fourth[1] - third[1])
-        )
-        # D=(D_left+D_right)/2：四点梯形用左右侧边扫宽平均值抑制轻微RTK误差。
-        span = (left_span + right_span) / 2.0
-    else:
-        # 多点不规则区域必须覆盖最外侧记录点，所以D=q_max-q_min。
-        span = max_offset - min_offset
+    # D=q_max-q_min。不能再假定第一个点和第二个点位于某条短边，否则同一四边形
+    # 仅改变记录起点就会算出0宽度。使用完整投影跨度既与记录顺序无关，也能保证
+    # 多点不规则区域最外侧的真实记录位置仍处于滚刷覆盖范围内。
+    span = max_offset - min_offset
     if span <= EPSILON:
         return None
 
@@ -863,14 +928,9 @@ def _generate_lane_candidates(
     # 与实际生成清扫线使用相同的跨行法向量，确保候选条数计算的D与几何结果一致。
     radians = math.radians(sweep_angle)
     normal = (math.cos(radians), -math.sin(radians))
-    if len(polygon_xy) == 4 and _is_convex_quadrilateral(polygon_xy):
-        first, second, third, fourth = polygon_xy
-        left_span = abs(normal[0] * (first[0] - second[0]) + normal[1] * (first[1] - second[1]))
-        right_span = abs(normal[0] * (fourth[0] - third[0]) + normal[1] * (fourth[1] - third[1]))
-        span = (left_span + right_span) / 2.0
-    else:
-        offsets = [normal[0] * x + normal[1] * y for x, y in polygon_xy]
-        span = max(offsets) - min(offsets)
+    # 使用所有顶点在跨行轴上的完整跨度，禁止依赖“前两点恰好属于短边”的旧约定。
+    offsets = [normal[0] * x + normal[1] * y for x, y in polygon_xy]
+    span = max(offsets) - min(offsets)
 
     # 对每个满足最低重叠的整数N都真正生成一次几何线路；几何生成不足N条时丢弃候选。
     result = []

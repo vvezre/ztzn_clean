@@ -323,6 +323,74 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertIn(l1_projection, executable_points)
         self.assertIn((954.092, 52.061), executable_points)
 
+    def test_bridge_endpoint_within_ten_cm_replaces_boundary_projection(self):
+        """桥头贴边且不穿区时，用人工桥头替代Q点，正反方向都不能生成短任务。"""
+        from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
+
+        points = [
+            {"id": "a1", "x": 0.0, "y": 0.0, "lat": 32.0, "lon": 118.0},
+            {"id": "a2", "x": 0.0, "y": 100.0, "lat": 32.0, "lon": 118.0},
+            {"id": "a3", "x": 200.0, "y": 100.0, "lat": 32.0, "lon": 118.0},
+            {"id": "a4", "x": 200.0, "y": 0.0, "lat": 32.0, "lon": 118.0},
+        ]
+        draft = {"groups": [{"id": "g1", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+        bridge = (100.0, -5.5)
+
+        outbound = _group_anchor_transition_points(
+            draft,
+            "g1",
+            (0.0, 0.0),
+            bridge,
+            mapper,
+            target_is_bridge_endpoint=True,
+        )
+        inbound = _group_anchor_transition_points(
+            draft,
+            "g1",
+            bridge,
+            (0.0, 0.0),
+            mapper,
+            current_is_bridge_endpoint=True,
+        )
+
+        self.assertEqual(outbound, [(0.0, 0.0), bridge])
+        self.assertEqual(inbound, list(reversed(outbound)))
+        self.assertNotIn((100.0, 0.0), outbound)
+
+    def test_bridge_endpoint_outside_tolerance_or_crossing_area_keeps_projection(self):
+        """超过10cm或直连会穿过区域时，仍保留Q点，禁止为了合并而斜穿。"""
+        from modeling_task_generator import _CoordinateMapper, _group_anchor_transition_points
+
+        points = [
+            {"id": "a1", "x": 0.0, "y": 0.0, "lat": 32.0, "lon": 118.0},
+            {"id": "a2", "x": 0.0, "y": 100.0, "lat": 32.0, "lon": 118.0},
+            {"id": "a3", "x": 200.0, "y": 100.0, "lat": 32.0, "lon": 118.0},
+            {"id": "a4", "x": 200.0, "y": 0.0, "lat": 32.0, "lon": 118.0},
+        ]
+        draft = {"groups": [{"id": "g1", "points": points}]}
+        mapper = _CoordinateMapper(draft)
+
+        too_far = _group_anchor_transition_points(
+            draft,
+            "g1",
+            (0.0, 0.0),
+            (100.0, -10.1),
+            mapper,
+            target_is_bridge_endpoint=True,
+        )
+        crosses_area = _group_anchor_transition_points(
+            draft,
+            "g1",
+            (0.0, 0.0),
+            (100.0, 5.0),
+            mapper,
+            target_is_bridge_endpoint=True,
+        )
+
+        self.assertIn((100.0, 0.0), too_far)
+        self.assertIn((100.0, 0.0), crosses_area)
+
     def test_connection_bridge_at_edge_middle_uses_boundary_projection_before_corner(self):
         """桥头位于边中部时，必须先接上边界，再沿边界前往清扫入口。"""
         from modeling_task_generator import (
@@ -1088,7 +1156,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                 (tasks[index]["startX"], tasks[index]["startY"]),
             )
 
-    def test_first_lane_is_oriented_from_the_second_recorded_boundary_point(self):
+    def test_long_axis_wins_even_when_first_recorded_edge_is_shorter_axis(self):
         from modeling_preview import build_model_preview
         from modeling_task_generator import generate_task_plan
 
@@ -1114,13 +1182,15 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
 
         tasks = generate_task_plan(draft, now=2000)["tasks"]
 
+        # 区域纵向339cm、横向226cm，因此应沿纵向长轴清扫；第一条记录边
+        # p1->p2是横向边，但不能再支配清扫方向。
         self.assertEqual(
             (tasks[0]["startX"], tasks[0]["startY"], tasks[0]["endX"], tasks[0]["endY"]),
-            (0, 0, 226, 0),
+            (0, 0, 0, 339),
         )
         self.assertEqual(
             (tasks[1]["startX"], tasks[1]["startY"]),
-            (226, 0),
+            (0, 339),
         )
         self.assertEqual(
             (tasks[-1]["endX"], tasks[-1]["endY"]),
@@ -1354,6 +1424,36 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             [(0, 0), (100, 10), (200, 0), (200, 100)],
         )
 
+    def test_turn_stop_thresholds_are_fifty_five_degrees(self):
+        """清扫折线和跨区转场必须统一使用55度停车转向阈值。"""
+        from modeling_task_generator import (
+            CLEAN_PATH_HARD_TURN_DEG,
+            TRANSFER_HARD_TURN_DEG,
+        )
+
+        self.assertEqual(TRANSFER_HARD_TURN_DEG, 55.0)
+        self.assertEqual(CLEAN_PATH_HARD_TURN_DEG, 55.0)
+
+    def test_continuous_path_passes_45_degree_turn_but_stops_for_60_degrees(self):
+        """55度以下连续经过，55度以上仍停车并重新转向。"""
+        from modeling_task_generator import _mark_continuous_path_tasks
+
+        def tasks_for(end):
+            return [
+                {"startX": 0, "startY": 0, "endX": 100, "endY": 0},
+                {"startX": 100, "startY": 0, "endX": end[0], "endY": end[1]},
+            ]
+
+        forty_five = tasks_for((200, 100))
+        sixty = tasks_for((150, 86.6025403784))
+        _mark_continuous_path_tasks(forty_five, "path-45")
+        _mark_continuous_path_tasks(sixty, "path-60")
+
+        self.assertFalse(forty_five[0]["stopAtEnd"])
+        self.assertFalse(forty_five[1]["turnAtStart"])
+        self.assertTrue(sixty[0]["stopAtEnd"])
+        self.assertTrue(sixty[1]["turnAtStart"])
+
     def test_clean_path_collapses_same_position_points_but_keeps_real_short_corner(self):
         from modeling_task_generator import _simplify_clean_path_points
 
@@ -1517,8 +1617,8 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                 "lon": 118.0,
             }
 
-        # 四条边都包含人工记录的波动点：左右短边负责换行，上下长边本身就是
-        # 两条边界清扫线。完整规划必须经过所有记录点，并且内部线仍是一段直线。
+        # 四条边都包含人工记录的波动点：区域点定义真实形状，但不再要求每个
+        # 记录点都成为机器人任务端点。两条外边界保留折线，内部线仍保持直线。
         points = [
             point("p1", 0, 0),
             point("p2", 25, 30),
@@ -1552,15 +1652,11 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
 
         plan = generate_task_plan(draft, now=2000)
         tasks = plan["tasks"]
-        visited = {
-            (task[prefix + "X"], task[prefix + "Y"])
-            for task in tasks
-            for prefix in ("start", "end")
-        }
-        expected = {(int(item["x"]), int(item["y"])) for item in points}
-
         self.assertEqual(plan["status"], "ready")
-        self.assertTrue(expected.issubset(visited))
+        self.assertEqual(
+            [point["id"] for point in draft["taskPreview"]["groups"][0]["subAreas"][0]["polygon"]],
+            [point["id"] for point in points],
+        )
         self.assertTrue(all(
             (left["endX"], left["endY"]) == (right["startX"], right["startY"])
             for left, right in zip(tasks, tasks[1:])
@@ -1576,6 +1672,163 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         ]
         # 每条内部线只生成一个首尾任务段，说明它没有继承边界波动而变成折线。
         self.assertEqual(len(interior_lane_ids), len(set(interior_lane_ids)))
+
+    def test_multi_point_bridge_recording_direction_does_not_change_route(self):
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0 + y / 11111100.0,
+                "lon": 118.0 + x / 9420000.0,
+            }
+
+        group_one = [
+            point("a1", 0, 0), point("a2", 0, 120),
+            point("a3", 300, 120), point("a4", 300, 0),
+        ]
+        group_two = [
+            point("b1", 420, 220), point("b2", 420, 340),
+            point("b3", 720, 340), point("b4", 720, 220),
+        ]
+        forward_bridge = [
+            point("l1", 300, 100),
+            point("l2", 360, 100),
+            point("l3", 360, 240),
+            point("l4", 420, 240),
+        ]
+
+        def plan_for(bridge_points):
+            draft = {
+                "id": "bridge-direction-invariant",
+                "recognition": {"confirmed": True},
+                "groups": [
+                    {
+                        "id": "g1", "areaNumber": 1, "points": group_one,
+                        "subAreas": [{"id": "sa1", "pointIds": [p["id"] for p in group_one]}],
+                    },
+                    {
+                        "id": "g2", "areaNumber": 2, "points": group_two,
+                        "subAreas": [{"id": "sa2", "pointIds": [p["id"] for p in group_two]}],
+                    },
+                ],
+                "groupLinks": [{
+                    "id": "link-1",
+                    "startGroupId": "g1",
+                    "endGroupId": "g2",
+                    "points": bridge_points,
+                }],
+                "routePolicy": {"areaOrder": [1, 2]},
+            }
+            draft["taskPreview"] = build_model_preview(draft, now=1000)
+            return generate_task_plan(draft, now=2000)
+
+        forward = plan_for(forward_bridge)
+        backward = plan_for(list(reversed(forward_bridge)))
+
+        def signature(plan):
+            return [
+                (
+                    task["mode"],
+                    task["startX"], task["startY"],
+                    task["endX"], task["endY"],
+                    task.get("source"),
+                )
+                for task in plan["tasks"]
+            ]
+
+        self.assertEqual(signature(forward), signature(backward))
+        # L形桥的四个点必须按自动确定的区域1->区域2方向依次出现在跨区路线中。
+        visited_segments = [
+            ((task["startX"], task["startY"]), (task["endX"], task["endY"]))
+            for task in forward["tasks"]
+            if task.get("source") == "modeling_transfer"
+        ]
+        self.assertIn(((300, 100), (360, 100)), visited_segments)
+        self.assertIn(((360, 100), (360, 240)), visited_segments)
+        self.assertIn(((360, 240), (420, 240)), visited_segments)
+
+    def test_real_111_bridge_join_has_no_five_cm_projection_tasks(self):
+        """真实111模型的Q<->L1短任务必须消失，同时保留四个桥点和完整往返。"""
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id,
+                "x": x,
+                "y": y,
+                "lat": 32.0,
+                "lon": 118.0,
+            }
+
+        area_one = [
+            point("a1", 0.0, 0.0),
+            point("a2", 7.334, 123.771),
+            point("a3", 12.480, 123.482),
+            point("a4", 365.686, 106.002),
+            point("a5", 931.441, 51.061),
+            point("a6", 921.280, -73.578),
+            point("a7", 594.147, -47.213),
+        ]
+        area_two = [
+            point("b1", 824.398, 192.145),
+            point("b2", 1189.528, 172.986),
+            point("b3", 1195.900, 294.633),
+            point("b4", 868.060, 340.668),
+        ]
+        bridge = [
+            point("l1", 808.930, -69.986),
+            point("l2", 812.135, 29.834),
+            point("l3", 816.292, 106.703),
+            point("l4", 823.833, 192.045),
+        ]
+        draft = {
+            "id": "real-111-bridge-join",
+            "recognition": {"confirmed": True},
+            "groups": [
+                {
+                    "id": "g1", "areaNumber": 1, "points": area_one,
+                    "subAreas": [{"id": "sa1", "pointIds": [p["id"] for p in area_one]}],
+                },
+                {
+                    "id": "g2", "areaNumber": 2, "points": area_two,
+                    "subAreas": [{"id": "sa2", "pointIds": [p["id"] for p in area_two]}],
+                },
+            ],
+            "groupLinks": [{
+                "id": "link-1",
+                "startGroupId": "g1",
+                "endGroupId": "g2",
+                "points": bridge,
+            }],
+            "routePolicy": {"areaOrder": [2, 1]},
+        }
+        draft["taskPreview"] = build_model_preview(draft, now=1000)
+
+        plan = generate_task_plan(draft, now=2000)
+        tasks = plan["tasks"]
+        endpoints = {
+            (task[prefix + "X"], task[prefix + "Y"])
+            for task in tasks
+            for prefix in ("start", "end")
+        }
+
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["summary"]["taskCount"], 25)
+        self.assertNotIn((809, -65), endpoints)
+        self.assertIn((809, -70), endpoints)
+        self.assertIn((812, 30), endpoints)
+        self.assertIn(
+            (809, -70, 812, 30),
+            {
+                (task["startX"], task["startY"], task["endX"], task["endY"])
+                for task in tasks
+            },
+        )
 
     def test_generate_task_plan_requires_ready_preview(self):
         from modeling_task_generator import ModelingTaskGenerationError, generate_task_plan
