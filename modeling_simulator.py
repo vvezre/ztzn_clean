@@ -19,6 +19,7 @@ import threading
 import time
 
 from AppLogger import logger
+from manual_steering import ManualSteeringController, ManualSteeringError
 from modeling_session import ModelingSession, ModelingSessionError
 from modeling_store import ModelingStore
 from modeling_task_persistence import normalize_task_name
@@ -325,6 +326,17 @@ class ModelingSimulatorController(object):
             step_cm=playback_step_cm,
             interval=playback_interval,
         )
+        self._sim_motion_state = "stopped"
+        self._manual_events = []
+        self.manual_steering_controller = ManualSteeringController(
+            motion_provider=self._manual_motion_state,
+            apply_trim=self._simulate_trim,
+            start_rotation=self._simulate_rotation_start,
+            stop_rotation=self._simulate_rotation_stop,
+            step=50,
+            max_value=500,
+            keepalive_timeout=1.5,
+        )
 
     def set_position_callback(self, callback):
         self.position_callback = callback
@@ -349,6 +361,26 @@ class ModelingSimulatorController(object):
             return self._success(message, callback())
         except Exception as error:
             logger.warning("Simulator command failed: {}".format(str(error)))
+            return self._failure(error)
+
+    def _manual_motion_state(self):
+        if self.player.snapshot().get("state") in ("running", "paused"):
+            return "auto"
+        return self._sim_motion_state
+
+    def _simulate_trim(self, value, motion_state):
+        self._manual_events.append({"event": "trim", "value": int(value), "motionState": motion_state})
+
+    def _simulate_rotation_start(self, direction):
+        self._manual_events.append({"event": "rotation_start", "direction": direction})
+
+    def _simulate_rotation_stop(self):
+        self._manual_events.append({"event": "rotation_stop"})
+
+    def manual_steering(self, params):
+        try:
+            return self.manual_steering_controller.handle(params or {})
+        except ManualSteeringError as error:
             return self._failure(error)
 
     def _capture_events(self):
@@ -671,9 +703,23 @@ class ModelingSimulatorController(object):
         return self._call("simulation task selected", action)
 
     def auto_drive(self):
+        self.manual_steering_controller.reset(send_hardware=False)
+        self._sim_motion_state = "stopped"
         return self._call("simulation path playback started", self.player.start)
 
+    def drive(self, distance=0, speed=None):
+        self.manual_steering_controller.reset(send_hardware=False)
+        self._sim_motion_state = "forward"
+        return self._success("simulation forward motion started")
+
+    def back(self, distance=0, speed=None):
+        self.manual_steering_controller.reset(send_hardware=False)
+        self._sim_motion_state = "reverse"
+        return self._success("simulation reverse motion started")
+
     def stop(self):
+        self.manual_steering_controller.reset(send_hardware=False)
+        self._sim_motion_state = "stopped"
         return self._call("simulation path playback paused", self.player.pause)
 
     def go_on(self):
@@ -681,6 +727,8 @@ class ModelingSimulatorController(object):
 
     def parking(self):
         def action():
+            self.manual_steering_controller.reset(send_hardware=False)
+            self._sim_motion_state = "stopped"
             self.player.cancel()
             return self.player.snapshot()
         return self._call("simulation path playback stopped", action)
@@ -701,10 +749,14 @@ class ModelingSimulatorController(object):
         running = playback["state"] == "running"
         paused = playback["state"] == "paused"
         complete = playback["state"] == "complete"
-        return {
+        manual_status = self.manual_steering_controller.snapshot()
+        motion_state = manual_status.get("motionState")
+        speed = 100 if running else (-100 if motion_state == "reverse" else (100 if motion_state == "forward" else 0))
+        status = {
             "status": "working" if running or paused else "active",
             "online_state": "ONLINE",
-            "speed": 100 if running else 0,
+            "speed": speed,
+            "xSpeed": speed,
             "brush_speed": 100 if running and int(position.get("mode") or 2) == 1 else 0,
             "battery_percent": 88,
             "lat": position.get("lat"),
@@ -717,7 +769,19 @@ class ModelingSimulatorController(object):
             "simulation": True,
             "simulation_device_id": SIMULATOR_DEVICE_ID,
             "simulation_playback": playback,
+            "simulation_manual_events": list(self._manual_events[-20:]),
+            "supported_actions": [
+                "drive", "back", "stop", "parking", "manual_steering",
+                "auto_drive", "go_on", "get_status",
+            ],
+            "supported_status_fields": [
+                "xSpeed", "motionState", "manualSteeringAllowed",
+                "manualSteeringMode", "manualSteeringDirection",
+                "manualCorrectionValue", "manualCorrectionLevel",
+            ],
         }
+        status.update(manual_status)
+        return status
 
 
 class ModelingSimulatorMQTTService(object):
@@ -812,6 +876,7 @@ class ModelingSimulatorMQTTService(object):
 
     def stop(self):
         self.running = False
+        self.controller.manual_steering_controller.close()
         self.controller.player.cancel()
         if self.status_thread and self.status_thread.is_alive():
             self.status_thread.join(timeout=2.0)

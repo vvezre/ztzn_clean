@@ -84,6 +84,8 @@ from RTKDataManager import RTKDataManager
 
 from mqtt_integration import MQTTIntegration
 from mqtt_vehicle_adapter import VehicleControllerAdapter
+from manual_steering import ManualSteeringController, ManualSteeringError
+from motion_state import derive_motion_state
 from vision_line_detection import GuidanceBandTracker, find_vertical_bright_band, resolve_guidance_command
 from go_to_point import build_go_to_point_plan
 from turn_heading_control import (
@@ -251,6 +253,9 @@ LOWER_MACHINE_FRAME_START = 0x7b
 LOWER_MACHINE_FRAME_END = 0x7d
 LOWER_MACHINE_SHORT_STATUS_LEN = 14
 LOWER_MACHINE_RX_BUFFER_LIMIT = 512
+MANUAL_STEERING_COMMAND_LOCK = threading.RLock()
+manual_steering_controller = None
+MANUAL_STEERING_CONTROLLER_LOCK = threading.RLock()
 
 # 状态，0刹车，1速度模式，2距离速度模式，3旋转模式
 global_get_status = 0
@@ -1458,6 +1463,14 @@ def _frame_u16_to_int(data, index):
     return (high << 8) + low
 
 
+def _frame_i16_to_int(data, index):
+    """Decode the signed speed fields returned by the lower machine."""
+    value = _frame_u16_to_int(data, index)
+    if value is None:
+        return None
+    return value - 0x10000 if value >= 0x8000 else value
+
+
 def _frame_hex(data):
     if data is None:
         return ''
@@ -1671,6 +1684,7 @@ def _apply_lower_machine_status_frame(data, source):
     status = byte_at(1)
     if status is not None:
         global_get_status = status
+        redis_cli.set("lowerMachineStatus", status)
         
         current_g_state = get_garage_state()
         # 1. 硬件强装充电
@@ -1706,13 +1720,13 @@ def _apply_lower_machine_status_frame(data, source):
         redis_cli.set("hardwareState", global_get_HWstatus)
 
     if frame_len > 5:
-        x_speed = _frame_u16_to_int(data, 4)
+        x_speed = _frame_i16_to_int(data, 4)
         if x_speed is not None:
             global_get_XSpeed = x_speed
             redis_cli.set("xSpeed", x_speed)
 
     if frame_len > 7:
-        z_speed = _frame_u16_to_int(data, 6)
+        z_speed = _frame_i16_to_int(data, 6)
         if z_speed is not None:
             global_get_ZSpeed = z_speed
 
@@ -2022,6 +2036,7 @@ def _build_vehicle_status_payload():
     command_brush_speed = _coerce_int(redis_cli.get('brushSpeed'), None)
     live_speed = live_value_from_report(_coerce_int(global_get_XSpeed, None), hardware_report_at)
     live_brush_speed = live_value_from_report(_coerce_int(global_get_brushSpeed, None), hardware_report_at)
+    manual_status = _manual_steering_status_snapshot(live_speed, control_state, fault_state)
 
     detail = _build_runtime_detail({
         'lastCommandMessage': _decode_redis_value(redis_cli.get('lastCommandMessage')) or '',
@@ -2056,6 +2071,7 @@ def _build_vehicle_status_payload():
         'health_state': _derive_health_state(),
         'fault_state': fault_state,
         'speed': live_speed,
+        'xSpeed': live_speed,
         'brush_speed': live_brush_speed,
         'command_speed': command_speed,
         'command_brush_speed': command_brush_speed,
@@ -2083,13 +2099,20 @@ def _build_vehicle_status_payload():
             "currentLoop": _coerce_int(redis_cli.get('waypointLoopCurrent'), 0),
             "targetLoop": _coerce_int(redis_cli.get('waypointLoopTarget'), 0),
         },
-        'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path'],
+        'supported_actions': ['auto_drive', 'go_on', 'stop', 'parking', 'manual_steering', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path'],
         'supported_params': ['taskName', 'speed', 'tracking', 'path'],
-        'supported_status_fields': ['control_state', 'health_state', 'fault_state', 'detail', 'mission_state', 'garage_state', 'loop_auto_clean', 'taskOrigin'],
+        'supported_status_fields': [
+            'control_state', 'health_state', 'fault_state', 'detail',
+            'mission_state', 'garage_state', 'loop_auto_clean', 'taskOrigin',
+            'xSpeed', 'motionState', 'manualSteeringAllowed',
+            'manualSteeringMode', 'manualSteeringDirection',
+            'manualCorrectionValue', 'manualCorrectionLevel',
+        ],
         'detail': detail,
         'timestamp': int(time.time()),
     }
     payload.update(task_origin_status)
+    payload.update(manual_status)
     return payload
 
 
@@ -4634,6 +4657,7 @@ def setStatus_api():
 # 自动清扫
 @app.route("/vehicle/autoDrive", methods=['GET'])
 def auto_driving():
+    _reset_manual_steering(send_hardware=False)
     redis_cli.set("reverse", "false")
     global global_doCleanThreadStop
     if not _can_start_runtime_task():
@@ -5035,6 +5059,7 @@ def correctByRTK():
 # 急停
 @app.route("/vehicle/parking", methods=['GET'])
 def parking():
+    _reset_manual_steering(send_hardware=False)
     _request_runtime_stop('manual_parking', clear_auto_task=True, update_runtime=True,
                           message='已执行停车指令')
     response = make_response("1")
@@ -6870,6 +6895,7 @@ def turnCheckPoint(originHeading):
 # 前进
 @app.route("/vehicle/drive", methods=['GET'])
 def driving():
+    _reset_manual_steering(send_hardware=False)
     redis_cli.set("correct", "false")
     redis_cli.set("reverse", "false")
     forward_speed = int(redis_cli.get("forwardSpeed"))
@@ -6913,6 +6939,7 @@ def drive():
 # 后退
 @app.route("/vehicle/back", methods=['GET'])
 def reverse():
+    _reset_manual_steering(send_hardware=False)
     redis_cli.set("correct", "false")
     redis_cli.set('reverse', 'true')
     redis_cli.set('action', 'true')
@@ -7442,6 +7469,7 @@ def setZSpeed(status):
 
         command[7] = int(hex_2, 16)
 
+
     elif int(status) <= 255:
 
         hex_string = hex(int(status))[2:]
@@ -7477,6 +7505,107 @@ def setZSpeed(status):
         hex_2 = hex_string[2] + hex_string[3]
 
         command[7] = int(hex_2, 16)
+
+
+def _manual_steering_base_motion():
+    """Derive motion from live lower-machine data, never from frontend input."""
+    hardware_report_at = _get_hardware_report_at()
+    live_speed = live_value_from_report(_coerce_int(global_get_XSpeed, None), hardware_report_at)
+    return derive_motion_state(
+        live_speed,
+        lower_status=global_get_status,
+        control_state=_derive_control_state(),
+        fault_state=_derive_fault_state(),
+    )
+
+
+def _persist_manual_steering_state(snapshot):
+    """Expose the manual-button state to MQTT/WebSocket through Redis."""
+    values = {
+        'manualSteeringMode': snapshot.get('manualSteeringMode') or 'none',
+        'manualSteeringDirection': snapshot.get('manualSteeringDirection') or '',
+        'manualCorrectionValue': int(snapshot.get('manualCorrectionValue') or 0),
+        'manualCorrectionLevel': int(snapshot.get('manualCorrectionLevel') or 0),
+        'manualSteeringControlId': snapshot.get('manualSteeringControlId') or '',
+    }
+    for key, value in values.items():
+        redis_cli.set(key, value)
+
+
+def _send_manual_trim(correction_value, motion_state):
+    """Send a fixed differential-wheel correction while preserving movement."""
+    current_speed = _coerce_int(global_get_XSpeed, 0)
+    if motion_state == 'forward' and current_speed <= 0:
+        raise RuntimeError('lower machine is not reporting forward speed')
+    if motion_state == 'reverse' and current_speed >= 0:
+        raise RuntimeError('lower machine is not reporting reverse speed')
+    with MANUAL_STEERING_COMMAND_LOCK:
+        preBuildCommand()
+        command[1] = 0x01
+        command[2] = 0x01
+        setXSpeed(current_speed)
+        setZSpeed(int(correction_value))
+        command[8] = 0x00
+        command[9] = 0x00
+        command[10] = 0x00
+        setHWstatus(0, 0, 0, 0, 0)
+        command[17] = tem_listener(command, 17)
+        duplicateWriteCmd(ser, command)
+
+
+def _start_manual_rotation(direction):
+    """Reuse the exact pure-left/pure-right joystick protocol (mode 4)."""
+    with MANUAL_STEERING_COMMAND_LOCK:
+        if direction == 'left':
+            sendDrivingWest(0, 1000)
+        else:
+            sendDrivingEast(0, -1000)
+
+
+def _stop_manual_rotation():
+    with MANUAL_STEERING_COMMAND_LOCK:
+        sendBraking()
+
+
+def _get_manual_steering_controller():
+    global manual_steering_controller
+    with MANUAL_STEERING_CONTROLLER_LOCK:
+        if manual_steering_controller is None:
+            manual_steering_controller = ManualSteeringController(
+                motion_provider=_manual_steering_base_motion,
+                apply_trim=_send_manual_trim,
+                start_rotation=_start_manual_rotation,
+                stop_rotation=_stop_manual_rotation,
+                state_callback=_persist_manual_steering_state,
+                step=50,
+                max_value=500,
+                keepalive_timeout=1.5,
+            )
+        return manual_steering_controller
+
+
+def _reset_manual_steering(send_hardware=False):
+    controller = manual_steering_controller
+    if controller is not None:
+        controller.reset(send_hardware=send_hardware)
+
+
+def _manual_steering_status_snapshot(live_speed=None, control_state=None, fault_state=None):
+    return _get_manual_steering_controller().snapshot()
+
+
+@app.route('/vehicle/manualSteering', methods=['POST'])
+def manual_steering_api():
+    """Local business endpoint used by MQTT for tap/hold left-right buttons."""
+    params = request.get_json(silent=True) or {}
+    try:
+        return jsonify(_get_manual_steering_controller().handle(params))
+    except ManualSteeringError as error:
+        return jsonify({
+            'success': False,
+            'message': error.message,
+            'data': {'code': error.code},
+        })
 
 
 def setDistance(status):

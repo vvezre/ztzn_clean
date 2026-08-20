@@ -13,6 +13,7 @@ import util
 from AppLogger import logger
 from mqtt_client import MQTTClient, get_mqtt_client
 from mqtt_handler import MQTTCommandHandler
+from motion_state import derive_motion_state, manual_steering_allowed
 from status_values import (
     live_heading_from_location,
     live_value_from_report,
@@ -172,8 +173,22 @@ class MQTTIntegration:
                 current_action,
                 control_state,
             )
+            live_speed = live_value_from_report(
+                self._get_redis_value('xSpeed', int, None),
+                hardware_report_at,
+            )
+            manual_mode = self._get_redis_value('manualSteeringMode', str, 'none') or 'none'
+            fault_state = self._build_fault_state(runtime_state)
+            motion_state = derive_motion_state(
+                live_speed,
+                lower_status=self._get_redis_value('lowerMachineStatus', int, None),
+                control_state=control_state,
+                fault_state=fault_state,
+                manual_mode=manual_mode,
+            )
             status = {
-                'speed': live_value_from_report(self._get_redis_value('xSpeed', int, None), hardware_report_at),
+                'speed': live_speed,
+                'xSpeed': live_speed,
                 'brush_speed': live_value_from_report(self._get_redis_value('brushSpeedActual', int, None), hardware_report_at),
                 'command_speed': self._get_redis_value('forwardSpeed', int, None),
                 'command_brush_speed': self._get_redis_value('brushSpeed', int, None),
@@ -206,18 +221,28 @@ class MQTTIntegration:
                 'mission_state': self._build_mission_state(runtime_state),
                 'control_state': control_state,
                 'health_state': self._build_health_state(runtime_state),
-                'fault_state': self._build_fault_state(runtime_state),
+                'fault_state': fault_state,
+                'motionState': motion_state,
+                'manualSteeringAllowed': manual_steering_allowed(motion_state),
+                'manualSteeringMode': manual_mode,
+                'manualSteeringDirection': self._get_redis_value('manualSteeringDirection', str, '') or None,
+                'manualCorrectionValue': self._get_redis_value('manualCorrectionValue', int, 0),
+                'manualCorrectionLevel': self._get_redis_value('manualCorrectionLevel', int, 0),
                 'tracking': self._get_redis_value('correct', self._bool_value, False),
                 'path_planning': self._get_redis_value('pathPlanning', str, ''),
                 'move_judge': self._get_redis_value('moveJudge', self._bool_value, False),
                 'detect_qrcode': self._get_redis_value('detectQrcode', self._bool_value, False),
                 'enter_garage': self._get_redis_value('enterGarage', self._bool_value, False),
                 'supported_actions': [
-                    'auto_drive', 'go_on', 'stop', 'parking', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path', 'get_modeling_points', 'new_modeling_link', 'new_modeling_area', 'replan_modeling_route'
+                    'auto_drive', 'go_on', 'stop', 'parking', 'manual_steering', 'return_to_point', 'go_to_point', 'multi_go_to_point', 'get_status', 'get_task_path', 'get_modeling_path', 'get_modeling_points', 'new_modeling_link', 'new_modeling_area', 'replan_modeling_route'
                 ],
                 'supported_params': ['taskName', 'modelId', 'speed', 'tracking', 'path'],
                 'supported_status_fields': [
-                    'control_state', 'health_state', 'fault_state', 'mission_state', 'local_x', 'local_y', 'detail', 'rtk'
+                    'control_state', 'health_state', 'fault_state', 'mission_state',
+                    'local_x', 'local_y', 'detail', 'rtk', 'xSpeed', 'motionState',
+                    'manualSteeringAllowed', 'manualSteeringMode',
+                    'manualSteeringDirection', 'manualCorrectionValue',
+                    'manualCorrectionLevel'
                 ],
                 'detail': self._build_detail(
                     task_params=task_params,

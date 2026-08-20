@@ -4,7 +4,13 @@ import unittest
 
 
 RUNTIME_ROOT = os.path.dirname(os.path.dirname(__file__))
-FILES_TO_CHECK = ("GPSuse.py", "Ntrip2Uart3.py", "vision_line_detection.py")
+FILES_TO_CHECK = (
+    "GPSuse.py",
+    "Ntrip2Uart3.py",
+    "vision_line_detection.py",
+    "manual_steering.py",
+    "motion_state.py",
+)
 ANNOTATION_RE = re.compile(r"^\s*def\s+\w+\s*\([^)]*:\s*[^)]*\)", re.MULTILINE)
 FSTRING_RE = re.compile(r"(^|[^A-Za-z0-9_])([fF][rRbBuU]{0,2}|[rRbBuU]{0,2}[fF])(['\"])", re.MULTILINE)
 

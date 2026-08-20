@@ -122,6 +122,8 @@ class MQTTCommandHandler(object):
             'clear_modeling_area_points': self._handle_clear_modeling_area_points,
             'clearModelingLinkPoints': self._handle_clear_modeling_link_points,
             'clear_modeling_link_points': self._handle_clear_modeling_link_points,
+            'manualSteering': self._handle_manual_steering,
+            'manual_steering': self._handle_manual_steering,
         })
         logger.info("MQTT command handler initialized")
 
@@ -174,6 +176,7 @@ class MQTTCommandHandler(object):
             'clear_modeling_points': self._handle_clear_modeling_points,
             'clear_modeling_area_points': self._handle_clear_modeling_area_points,
             'clear_modeling_link_points': self._handle_clear_modeling_link_points,
+            'manual_steering': self._handle_manual_steering,
         }
 
     def handle(self, message_data):
@@ -292,6 +295,16 @@ class MQTTCommandHandler(object):
             params.get('distance', 50),
             params.get('dirX', 0),
             params.get('dirY', 0)
+        )
+
+    def _handle_manual_steering(self, params):
+        """Forward one complete left/right button event to the vehicle FSM."""
+        if not isinstance(params, dict):
+            return {'success': False, 'message': 'manual_steering params must be an object'}
+        return self._call_controller(
+            'manual_steering',
+            'manual steering command executed',
+            params,
         )
 
     def _handle_auto_drive(self, params):

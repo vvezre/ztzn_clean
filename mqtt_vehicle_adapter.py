@@ -154,6 +154,10 @@ class VehicleControllerAdapter(object):
     def joystick_move(self, distance, dir_x, dir_y):
         return self._call('/vehicle/joystickMove/{}/{}/{}'.format(distance, dir_x, dir_y))
 
+    def manual_steering(self, params):
+        """Send a tap/hold event to the local FSM; the FSM decides motion mode."""
+        return self._call('/vehicle/manualSteering', json_data=params or {})
+
     def auto_drive(self):
         return self._call('/vehicle/autoDrive')
 
