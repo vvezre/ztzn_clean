@@ -8,7 +8,7 @@ from motion_state import derive_motion_state
 
 
 class ManualSteeringControllerTest(unittest.TestCase):
-    def _controller(self, motion="forward", timeout=1.5):
+    def _controller(self, motion="forward", timeout=1.5, tap_duration=0.05):
         state = {"motion": motion, "now": 10.0}
         events = []
         controller = ManualSteeringController(
@@ -17,28 +17,32 @@ class ManualSteeringControllerTest(unittest.TestCase):
             start_rotation=lambda direction: events.append(("rotate", direction)),
             stop_rotation=lambda: events.append(("stop_rotate",)),
             now=lambda: state["now"],
+            moving_value=700,
+            tap_duration=tap_duration,
             keepalive_timeout=timeout,
         )
         return controller, state, events
 
-    def test_forward_tap_and_hold_increase_by_fixed_steps(self):
+    def test_forward_tap_uses_fixed_left_diagonal_then_restores_straight(self):
         controller, state, events = self._controller("forward")
         try:
             first = controller.handle({"action": "tap", "direction": "left", "controlId": "tap-1", "sequence": 1})
-            self.assertEqual(-50, first["data"]["manualCorrectionValue"])
-            controller.handle({"action": "hold_start", "direction": "left", "controlId": "hold-1", "sequence": 1})
-            result = controller.handle({"action": "keepalive", "direction": "left", "controlId": "hold-1", "sequence": 2})
-            self.assertEqual(-150, result["data"]["manualCorrectionValue"])
-            self.assertEqual(("trim", -150, "forward"), events[-1])
+            self.assertEqual(-700, first["data"]["manualCorrectionValue"])
+            self.assertEqual("forward_tap", first["data"]["manualSteeringMode"])
+            self.assertEqual(("trim", -700, "forward"), events[-1])
+
+            time.sleep(0.08)
+            self.assertEqual(("trim", 0, "forward"), events[-1])
+            self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
         finally:
             controller.close()
 
-    def test_reverse_reverses_raw_correction_sign(self):
+    def test_reverse_tap_uses_fixed_left_rear_diagonal(self):
         controller, state, events = self._controller("reverse")
         try:
             result = controller.handle({"action": "tap", "direction": "left", "controlId": "tap-r", "sequence": 1})
-            self.assertEqual(50, result["data"]["manualCorrectionValue"])
-            self.assertEqual(("trim", 50, "reverse"), events[-1])
+            self.assertEqual(-700, result["data"]["manualCorrectionValue"])
+            self.assertEqual(("trim", -700, "reverse"), events[-1])
         finally:
             controller.close()
 
@@ -63,6 +67,144 @@ class ManualSteeringControllerTest(unittest.TestCase):
             time.sleep(0.25)
             self.assertIn(("stop_rotate",), events)
             self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_rotation_keepalive_accepts_real_lower_machine_motion_report(self):
+        controller, state, events = self._controller("stopped")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "rotate", "sequence": 1})
+
+            # The joystick-style rotation command can make real hardware
+            # report a signed longitudinal speed even though the active manual
+            # session is still an in-place rotation.
+            state["motion"] = "forward"
+            kept = controller.handle({"action": "keepalive", "direction": "right", "controlId": "rotate", "sequence": 2})
+
+            self.assertTrue(kept["success"])
+            self.assertEqual("in_place_rotate", kept["data"]["manualSteeringMode"])
+            self.assertEqual("turning", kept["data"]["motionState"])
+            self.assertNotIn(("stop_rotate",), events)
+        finally:
+            controller.close()
+
+    def test_repeated_fixed_sequence_keeps_rotation_alive(self):
+        controller, state, events = self._controller("stopped", timeout=0.2)
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "fixed-sequence", "sequence": 1})
+            state["motion"] = "forward"
+
+            for _ in range(3):
+                state["now"] += 0.15
+                kept = controller.handle({"action": "keepalive", "direction": "right", "controlId": "fixed-sequence", "sequence": 2})
+                self.assertTrue(kept["success"])
+
+            time.sleep(0.25)
+            self.assertEqual("in_place_rotate", controller.snapshot()["manualSteeringMode"])
+            self.assertNotIn(("stop_rotate",), events)
+        finally:
+            controller.close()
+
+    def test_repeated_fixed_sequence_keeps_one_fixed_moving_direction(self):
+        controller, state, events = self._controller("forward")
+        try:
+            started = controller.handle({"action": "hold_start", "direction": "right", "controlId": "fixed-trim", "sequence": 1})
+            self.assertEqual(700, started["data"]["manualCorrectionValue"])
+
+            state["now"] += 0.5
+            first = controller.handle({"action": "keepalive", "direction": "right", "controlId": "fixed-trim", "sequence": 2})
+            self.assertEqual(700, first["data"]["manualCorrectionValue"])
+
+            state["now"] += 0.05
+            duplicate = controller.handle({"action": "keepalive", "direction": "right", "controlId": "fixed-trim", "sequence": 2})
+            self.assertEqual(700, duplicate["data"]["manualCorrectionValue"])
+
+            state["now"] += 0.5
+            kept = controller.handle({"action": "keepalive", "direction": "right", "controlId": "fixed-trim", "sequence": 2})
+            self.assertEqual(700, kept["data"]["manualCorrectionValue"])
+            self.assertEqual([("trim", 700, "forward")], events)
+        finally:
+            controller.close()
+
+    def test_moving_hold_release_sends_one_zero_and_clears_correction(self):
+        controller, state, events = self._controller("forward")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "release", "sequence": 1})
+            state["now"] += 0.5
+            controller.handle({"action": "keepalive", "direction": "right", "controlId": "release", "sequence": 2})
+
+            released = controller.handle({"action": "hold_stop", "direction": "right", "controlId": "release", "sequence": 3})
+
+            self.assertEqual(("trim", 0, "forward"), events[-1])
+            self.assertEqual(1, events.count(("trim", 0, "forward")))
+            self.assertEqual(0, released["data"]["manualCorrectionValue"])
+            self.assertEqual(0, released["data"]["manualCorrectionLevel"])
+            self.assertEqual("none", released["data"]["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_moving_hold_watchdog_restores_straight(self):
+        controller, state, events = self._controller("forward", timeout=0.2)
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "timeout-moving", "sequence": 1})
+            state["now"] += 1.0
+            time.sleep(0.25)
+
+            self.assertEqual(("trim", 0, "forward"), events[-1])
+            self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_reset_invalidates_delayed_tap_restore(self):
+        controller, state, events = self._controller("forward", tap_duration=0.1)
+        try:
+            controller.handle({"action": "tap", "direction": "right", "controlId": "tap-reset", "sequence": 1})
+            controller.reset(send_hardware=False)
+            time.sleep(0.15)
+
+            self.assertEqual([("trim", 700, "forward")], events)
+            self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_hold_stop_during_tap_restores_straight_once(self):
+        controller, state, events = self._controller("forward", tap_duration=0.1)
+        try:
+            controller.handle({"action": "tap", "direction": "left", "controlId": "tap-stop", "sequence": 1})
+            stopped = controller.handle({"action": "hold_stop", "direction": "left", "controlId": "tap-stop", "sequence": 2})
+            time.sleep(0.15)
+
+            self.assertEqual([("trim", -700, "forward"), ("trim", 0, "forward")], events)
+            self.assertEqual("none", stopped["data"]["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_rotation_duplicate_start_is_idempotent_after_motion_report_changes(self):
+        controller, state, events = self._controller("stopped")
+        try:
+            controller.handle({"action": "hold_start", "direction": "left", "controlId": "duplicate", "sequence": 1})
+            state["motion"] = "turning"
+
+            duplicate = controller.handle({"action": "hold_start", "direction": "left", "controlId": "duplicate", "sequence": 1})
+
+            self.assertTrue(duplicate["success"])
+            self.assertEqual("duplicate hold_start ignored", duplicate["message"])
+            self.assertEqual([("rotate", "left")], events)
+        finally:
+            controller.close()
+
+    def test_rotation_keepalive_still_stops_when_auto_control_takes_over(self):
+        controller, state, events = self._controller("stopped")
+        try:
+            controller.handle({"action": "hold_start", "direction": "left", "controlId": "auto-takeover", "sequence": 1})
+            state["motion"] = "auto"
+
+            with self.assertRaises(ManualSteeringError) as changed:
+                controller.handle({"action": "keepalive", "direction": "left", "controlId": "auto-takeover", "sequence": 2})
+
+            self.assertEqual("MOTION_STATE_CHANGED", changed.exception.code)
+            self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
+            self.assertIn(("stop_rotate",), events)
         finally:
             controller.close()
 
@@ -108,23 +250,24 @@ class ManualSteeringSimulatorTest(unittest.TestCase):
                 })
                 self.assertTrue(response["success"])
                 self.assertEqual("forward_trim", response["data"]["manualSteeringMode"])
-                self.assertEqual(50, response["data"]["manualCorrectionValue"])
+                self.assertEqual(700, response["data"]["manualCorrectionValue"])
                 status = controller.status_snapshot()
                 self.assertEqual("forward", status["motionState"])
-                self.assertEqual(50, status["manualCorrectionValue"])
+                self.assertEqual(700, status["manualCorrectionValue"])
 
                 kept = handler.handle({
                     "command": "manual_steering",
                     "params": {"action": "keepalive", "direction": "right", "controlId": "ui-1", "sequence": 2},
                 })
                 self.assertTrue(kept["success"])
-                self.assertEqual(100, kept["data"]["manualCorrectionValue"])
+                self.assertEqual(700, kept["data"]["manualCorrectionValue"])
                 released = handler.handle({
                     "command": "manual_steering",
                     "params": {"action": "hold_stop", "direction": "right", "controlId": "ui-1", "sequence": 3},
                 })
                 self.assertTrue(released["success"])
                 self.assertEqual("none", released["data"]["manualSteeringMode"])
+                self.assertEqual(0, released["data"]["manualCorrectionValue"])
 
                 controller.parking()
                 rotating = handler.handle({

@@ -718,6 +718,12 @@ def _start_runtime_thread(action, target, args=(), ready_message='正在创建�
         if not _can_start_runtime_task():
             return None, _runtime_not_startable_payload()
 
+        # 自动清扫、返航和点位导航等任务开始前，统一结束手动转向会话。
+        # 这里只清除控制器中的长按/点按状态并使延迟定时器失效，不向下位机
+        # 额外发送直行或停车命令；随后启动的运行任务会自行下发它需要的指令。
+        # 这样可以避免用户刚松开方向键时，旧的 300ms 点按恢复动作干扰新任务。
+        _reset_manual_steering(send_hardware=False)
+
         task_token = _begin_runtime_task(action)
         ready_detail = dict(detail or {})
         if action:
@@ -7533,24 +7539,48 @@ def _persist_manual_steering_state(snapshot):
 
 
 def _send_manual_trim(correction_value, motion_state):
-    """Send a fixed differential-wheel correction while preserving movement."""
+    """Reuse the local joystick's fixed 45-degree directions while moving.
+
+    ``correction_value`` is now a direction marker, not an accumulating RTK
+    correction: negative means the left joystick diagonal, positive means the
+    right diagonal, and zero restores straight travel.  The signed live speed
+    reported by the lower machine is preserved throughout the gesture.
+    """
     current_speed = _coerce_int(global_get_XSpeed, 0)
-    if motion_state == 'forward' and current_speed <= 0:
+    value = int(correction_value)
+    if value != 0 and motion_state == 'forward' and current_speed <= 0:
         raise RuntimeError('lower machine is not reporting forward speed')
-    if motion_state == 'reverse' and current_speed >= 0:
+    if value != 0 and motion_state == 'reverse' and current_speed >= 0:
         raise RuntimeError('lower machine is not reporting reverse speed')
+
+    # If the vehicle was independently stopped or changed direction before a
+    # delayed tap restore/hold_stop arrived, do not restart it or reverse it
+    # merely to send a zero steering value.
+    if value == 0:
+        if motion_state == 'forward' and current_speed <= 0:
+            return
+        if motion_state == 'reverse' and current_speed >= 0:
+            return
+
+    travel_speed = abs(current_speed)
+    steering_value = abs(value)
     with MANUAL_STEERING_COMMAND_LOCK:
-        preBuildCommand()
-        command[1] = 0x01
-        command[2] = 0x01
-        setXSpeed(current_speed)
-        setZSpeed(int(correction_value))
-        command[8] = 0x00
-        command[9] = 0x00
-        command[10] = 0x00
-        setHWstatus(0, 0, 0, 0, 0)
-        command[17] = tem_listener(command, 17)
-        duplicateWriteCmd(ser, command)
+        if motion_state == 'forward':
+            if value < 0:
+                sendDrivingNorthWest(travel_speed, steering_value)
+            elif value > 0:
+                sendDrivingNorthEast(travel_speed, steering_value)
+            else:
+                sendDrivingNorth(travel_speed)
+        elif motion_state == 'reverse':
+            if value < 0:
+                sendDrivingSouthWest(travel_speed, steering_value)
+            elif value > 0:
+                sendDrivingSouthEast(travel_speed, steering_value)
+            else:
+                sendDrivingSouth(travel_speed)
+        else:
+            raise RuntimeError('unsupported moving state: {}'.format(motion_state))
 
 
 def _start_manual_rotation(direction):
@@ -7577,8 +7607,8 @@ def _get_manual_steering_controller():
                 start_rotation=_start_manual_rotation,
                 stop_rotation=_stop_manual_rotation,
                 state_callback=_persist_manual_steering_state,
-                step=50,
-                max_value=500,
+                moving_value=700,
+                tap_duration=0.3,
                 keepalive_timeout=1.5,
             )
         return manual_steering_controller

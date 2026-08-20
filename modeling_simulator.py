@@ -333,8 +333,8 @@ class ModelingSimulatorController(object):
             apply_trim=self._simulate_trim,
             start_rotation=self._simulate_rotation_start,
             stop_rotation=self._simulate_rotation_stop,
-            step=50,
-            max_value=500,
+            moving_value=700,
+            tap_duration=0.3,
             keepalive_timeout=1.5,
         )
 
