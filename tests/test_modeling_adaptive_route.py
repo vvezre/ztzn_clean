@@ -90,6 +90,41 @@ class ModelingAdaptiveRouteTest(unittest.TestCase):
         first_clean = next(task for task in plan["tasks"] if task["mode"] == 1)
         self.assertEqual(first_clean["areaNumber"], 2)
 
+    def test_no_return_variant_replans_last_area_and_ends_there(self):
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        draft = _two_area_draft()
+        draft["taskPreview"] = build_model_preview(draft, now=100)
+        return_plan = generate_task_plan(draft, now=200, return_to_origin=True)
+        no_return_plan = generate_task_plan(draft, now=200, return_to_origin=False)
+
+        self.assertTrue(return_plan["returnToOrigin"])
+        self.assertFalse(no_return_plan["returnToOrigin"])
+        self.assertEqual(
+            (return_plan["tasks"][-1]["endX"], return_plan["tasks"][-1]["endY"]),
+            (0, 0),
+        )
+        self.assertNotEqual(
+            (no_return_plan["tasks"][-1]["endX"], no_return_plan["tasks"][-1]["endY"]),
+            (0, 0),
+        )
+        self.assertFalse(any(
+            task.get("source") == "modeling_return_origin"
+            for task in no_return_plan["tasks"]
+        ))
+        self.assertEqual(return_plan["routeSelections"][-1]["laneCount"], 4)
+        self.assertEqual(no_return_plan["routeSelections"][-1]["laneCount"], 3)
+        self.assertFalse(no_return_plan["routeSelections"][-1]["hasExitReference"])
+
+        for index in range(1, len(no_return_plan["tasks"])):
+            self.assertEqual(
+                (no_return_plan["tasks"][index - 1]["endX"],
+                 no_return_plan["tasks"][index - 1]["endY"]),
+                (no_return_plan["tasks"][index]["startX"],
+                 no_return_plan["tasks"][index]["startY"]),
+            )
+
     def test_area_order_must_be_complete_and_unique(self):
         from modeling_preview import build_model_preview
         from modeling_task_generator import ModelingTaskGenerationError, generate_task_plan

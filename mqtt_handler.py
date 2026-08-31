@@ -385,7 +385,23 @@ class MQTTCommandHandler(object):
         task_name = self._extract_task_name(params)
         if not task_name:
             return {'success': False, 'message': 'taskName不能为空'}
-        return self._call_controller('set_current_task', '任务已设置为当前任务', task_name)
+        raw_return = params.get('returnToOrigin') if isinstance(params, dict) else None
+        if raw_return is None:
+            return_to_origin = True
+        elif isinstance(raw_return, bool):
+            return_to_origin = raw_return
+        elif _as_text(raw_return).lower() in ('true', '1'):
+            return_to_origin = True
+        elif _as_text(raw_return).lower() in ('false', '0'):
+            return_to_origin = False
+        else:
+            return {'success': False, 'message': 'returnToOrigin必须是true或false'}
+        return self._call_controller(
+            'set_current_task',
+            '任务已设置为当前任务',
+            task_name,
+            return_to_origin,
+        )
 
     def _handle_save_modeling_task(self, params):
         # 仅在 finish_modeling 已生成可执行路径后，才能用 taskName 将其保存。

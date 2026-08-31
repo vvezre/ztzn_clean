@@ -121,8 +121,10 @@ from modeling_task_persistence import (
     build_named_task,
     is_same_named_task,
     normalize_task_name,
+    select_named_task_variant,
 )
 from modeling_saved_routes import build_saved_routes, discover_saved_task_names
+from modeling_task_generator import generate_task_plan as generate_modeling_task_plan
 from modeling_execution import (
     ModelingExecutionError,
     build_execution_plan,
@@ -3239,10 +3241,17 @@ def _save_modeling_task(task_name, current_path):
                 "taskName already exists",
             )
 
+        model_id = current_path.get("modelId")
+        draft = modeling_store.get_draft(model_id)
+        no_return_task_plan = generate_modeling_task_plan(
+            draft,
+            return_to_origin=False,
+        )
         task_config = build_named_task(
             _load_json_config("config.json"),
             current_path,
             task_name,
+            no_return_task_plan=no_return_task_plan,
         )
         _write_json_config(file_name, task_config)
         try:
@@ -4887,7 +4896,7 @@ def setCharginPileInfo():
     return jsonify(result)
 
 
-def _set_current_task(task_name):
+def _set_current_task(task_name, return_to_origin=True):
     global taskList
     try:
         taskName = normalize_task_name(task_name)
@@ -4900,17 +4909,49 @@ def _set_current_task(task_name):
     if not os.path.exists(fileName):
         return {"success": False, "msg": u"文件不存在 {}".format(fileName)}
 
+    if _is_runtime_task_active():
+        return {
+            "success": False,
+            "msg": "自动任务运行中，不能切换路线",
+            "data": {
+                "code": "TASK_SWITCH_WHILE_RUNNING",
+                "action": _runtime_action(),
+            },
+        }
+
+    return_to_origin = bool(return_to_origin)
+    task_config = _load_json_config(fileName)
+    try:
+        selected_config = select_named_task_variant(
+            task_config,
+            return_to_origin=return_to_origin,
+        )
+    except ModelingTaskPersistenceError as error:
+        return {
+            "success": False,
+            "msg": "该路线没有所选的返回方式，请重新建模并保存",
+            "data": {"code": error.code},
+        }
+    selected_tasks = selected_config.get('taskList') or []
+
     with TASK_SWITCH_LOCK:
-        with open(fileName, 'r') as src, open('config.json', 'w') as dst:
-            for line in src:
-                dst.write(line)
+        _write_json_config('config.json', selected_config)
         redis_cli.set('currentTaskName', taskName)
+        redis_cli.set('currentTaskReturnToOrigin', 'true' if return_to_origin else 'false')
         redis_cli.set('curTaskIndex', 0)
         redis_cli.delete('taskList')
         syncCurTaskFileToRedis()
         taskList = []
 
-    return {"success": True, "msg": "保存数据成功", "data": {"taskName": taskName}}
+    return {
+        "success": True,
+        "msg": "路线选择成功",
+        "data": {
+            "taskName": taskName,
+            "returnToOrigin": return_to_origin,
+            "taskCount": len(selected_tasks),
+        },
+    }
 # 设置入舱点，入舱点是小车进入充电桩前的入口位置，不等同于充电桩位置
 @app.route("/vehicle/setGarageEntryInfo", methods=['GET'])
 def setGarageEntryInfo():
@@ -5251,6 +5292,10 @@ def selectTaskName():
 def selectSavedRoutes():
     task_names = _reconcile_saved_task_index()
     current_task_name = redis_cli.get('currentTaskName')
+    current_return_to_origin = _coerce_bool(
+        redis_cli.get('currentTaskReturnToOrigin'),
+        True,
+    )
 
     def load_task_config(task_name):
         return _load_json_config(task_name + '.json')
@@ -5263,6 +5308,7 @@ def selectSavedRoutes():
         current_task_name,
         load_task_config,
         load_model,
+        current_return_to_origin=current_return_to_origin,
     )
     return jsonify({
         "success": True,
@@ -5290,12 +5336,18 @@ def selectTaskByName():
 # 保存当前任务
 @app.route("/vehicle/saveCurrentTaskName", methods=['GET'])
 def saveCurrentTaskName():
-    return jsonify(_set_current_task(request.args.get('taskName')))
+    return jsonify(_set_current_task(
+        request.args.get('taskName'),
+        _coerce_bool(request.args.get('returnToOrigin'), True),
+    ))
 
 
 @app.route("/vehicle/setCurrentTask", methods=['GET'])
 def setCurrentTask():
-    return jsonify(_set_current_task(request.args.get('taskName')))
+    return jsonify(_set_current_task(
+        request.args.get('taskName'),
+        _coerce_bool(request.args.get('returnToOrigin'), True),
+    ))
 
 # 将当前任务中的参数信息同步到redis中
 def syncCurTaskFileToRedis():
@@ -7538,32 +7590,33 @@ def _persist_manual_steering_state(snapshot):
         redis_cli.set(key, value)
 
 
-def _send_manual_trim(correction_value, motion_state):
+def _manual_steering_target_speed(motion_state):
+    """Return the configured manual speed, not decelerated wheel feedback."""
+    if motion_state == 'forward':
+        return max(1, abs(_coerce_int(redis_cli.get('forwardSpeed'), high_speed)))
+    if motion_state == 'reverse':
+        # /vehicle/back uses a fixed -100 longitudinal command.
+        return 100
+    raise RuntimeError('unsupported moving state: {}'.format(motion_state))
+
+
+def _send_manual_trim(correction_value, motion_state, travel_speed):
     """Reuse the local joystick's fixed 45-degree directions while moving.
 
     ``correction_value`` is now a direction marker, not an accumulating RTK
     correction: negative means the left joystick diagonal, positive means the
-    right diagonal, and zero restores straight travel.  The signed live speed
-    reported by the lower machine is preserved throughout the gesture.
+    right diagonal, and zero restores straight travel.  ``travel_speed`` is
+    captured from the original manual command and remains unchanged throughout
+    the gesture; live wheel feedback is deliberately not reused as a command.
     """
-    current_speed = _coerce_int(global_get_XSpeed, 0)
     value = int(correction_value)
-    if value != 0 and motion_state == 'forward' and current_speed <= 0:
-        raise RuntimeError('lower machine is not reporting forward speed')
-    if value != 0 and motion_state == 'reverse' and current_speed >= 0:
-        raise RuntimeError('lower machine is not reporting reverse speed')
-
-    # If the vehicle was independently stopped or changed direction before a
-    # delayed tap restore/hold_stop arrived, do not restart it or reverse it
-    # merely to send a zero steering value.
-    if value == 0:
-        if motion_state == 'forward' and current_speed <= 0:
-            return
-        if motion_state == 'reverse' and current_speed >= 0:
-            return
-
-    travel_speed = abs(current_speed)
+    travel_speed = max(1, abs(int(travel_speed)))
     steering_value = abs(value)
+    logger.info(
+        'manual joystick frame: motion={}, travelSpeed={}, steering={}'.format(
+            motion_state, travel_speed, value,
+        )
+    )
     with MANUAL_STEERING_COMMAND_LOCK:
         if motion_state == 'forward':
             if value < 0:
@@ -7606,6 +7659,7 @@ def _get_manual_steering_controller():
                 apply_trim=_send_manual_trim,
                 start_rotation=_start_manual_rotation,
                 stop_rotation=_stop_manual_rotation,
+                travel_speed_provider=_manual_steering_target_speed,
                 state_callback=_persist_manual_steering_state,
                 moving_value=700,
                 tap_duration=0.3,

@@ -1,4 +1,6 @@
 # coding=utf-8
+from contextlib import contextmanager
+import shutil
 import tempfile
 import time
 import unittest
@@ -7,15 +9,30 @@ from manual_steering import ManualSteeringController, ManualSteeringError
 from motion_state import derive_motion_state
 
 
+@contextmanager
+def temporary_directory():
+    """TemporaryDirectory equivalent that also runs on the robot's Python 2.7."""
+    directory = tempfile.mkdtemp()
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 class ManualSteeringControllerTest(unittest.TestCase):
     def _controller(self, motion="forward", timeout=1.5, tap_duration=0.05):
-        state = {"motion": motion, "now": 10.0}
+        state = {
+            "motion": motion,
+            "now": 10.0,
+            "speed": {"forward": 350, "reverse": 100},
+        }
         events = []
         controller = ManualSteeringController(
             motion_provider=lambda: state["motion"],
-            apply_trim=lambda value, mode: events.append(("trim", value, mode)),
+            apply_trim=lambda value, mode, speed: events.append(("trim", value, mode, speed)),
             start_rotation=lambda direction: events.append(("rotate", direction)),
             stop_rotation=lambda: events.append(("stop_rotate",)),
+            travel_speed_provider=lambda mode: state["speed"][mode],
             now=lambda: state["now"],
             moving_value=700,
             tap_duration=tap_duration,
@@ -29,10 +46,10 @@ class ManualSteeringControllerTest(unittest.TestCase):
             first = controller.handle({"action": "tap", "direction": "left", "controlId": "tap-1", "sequence": 1})
             self.assertEqual(-700, first["data"]["manualCorrectionValue"])
             self.assertEqual("forward_tap", first["data"]["manualSteeringMode"])
-            self.assertEqual(("trim", -700, "forward"), events[-1])
+            self.assertEqual(("trim", -700, "forward", 350), events[-1])
 
             time.sleep(0.08)
-            self.assertEqual(("trim", 0, "forward"), events[-1])
+            self.assertEqual(("trim", 0, "forward", 350), events[-1])
             self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
         finally:
             controller.close()
@@ -42,7 +59,7 @@ class ManualSteeringControllerTest(unittest.TestCase):
         try:
             result = controller.handle({"action": "tap", "direction": "left", "controlId": "tap-r", "sequence": 1})
             self.assertEqual(-700, result["data"]["manualCorrectionValue"])
-            self.assertEqual(("trim", -700, "reverse"), events[-1])
+            self.assertEqual(("trim", -700, "reverse", 100), events[-1])
         finally:
             controller.close()
 
@@ -122,7 +139,12 @@ class ManualSteeringControllerTest(unittest.TestCase):
             state["now"] += 0.5
             kept = controller.handle({"action": "keepalive", "direction": "right", "controlId": "fixed-trim", "sequence": 2})
             self.assertEqual(700, kept["data"]["manualCorrectionValue"])
-            self.assertEqual([("trim", 700, "forward")], events)
+            self.assertEqual([
+                ("trim", 700, "forward", 350),
+                ("trim", 700, "forward", 350),
+                ("trim", 700, "forward", 350),
+                ("trim", 700, "forward", 350),
+            ], events)
         finally:
             controller.close()
 
@@ -135,11 +157,95 @@ class ManualSteeringControllerTest(unittest.TestCase):
 
             released = controller.handle({"action": "hold_stop", "direction": "right", "controlId": "release", "sequence": 3})
 
-            self.assertEqual(("trim", 0, "forward"), events[-1])
-            self.assertEqual(1, events.count(("trim", 0, "forward")))
+            self.assertEqual(("trim", 0, "forward", 350), events[-1])
+            self.assertEqual(1, events.count(("trim", 0, "forward", 350)))
             self.assertEqual(0, released["data"]["manualCorrectionValue"])
             self.assertEqual(0, released["data"]["manualCorrectionLevel"])
             self.assertEqual("none", released["data"]["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_moving_hold_locks_commanded_speed_while_feedback_or_setting_changes(self):
+        controller, state, events = self._controller("forward")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "speed", "sequence": 1})
+            # Simulate a lower X-speed drop or a concurrent setting update.  A
+            # hold must keep using the 350 command captured at its start.
+            state["speed"]["forward"] = 120
+            state["now"] += 0.4
+            controller.handle({"action": "keepalive", "direction": "right", "controlId": "speed", "sequence": 2})
+            controller.handle({"action": "hold_stop", "direction": "right", "controlId": "speed", "sequence": 3})
+
+            self.assertEqual([
+                ("trim", 700, "forward", 350),
+                ("trim", 700, "forward", 350),
+                ("trim", 0, "forward", 350),
+            ], events)
+        finally:
+            controller.close()
+
+    def test_tap_then_different_control_keepalive_promotes_one_hold(self):
+        controller, state, events = self._controller("forward", tap_duration=0.2)
+        try:
+            controller.handle({"action": "tap", "direction": "left", "controlId": "tap-id", "sequence": 1})
+            promoted = controller.handle({"action": "keepalive", "direction": "left", "controlId": "hold-id", "sequence": 2})
+
+            self.assertEqual("forward_trim", promoted["data"]["manualSteeringMode"])
+            self.assertEqual("hold-id", promoted["data"]["manualSteeringControlId"])
+            stray_tap = controller.handle({"action": "tap", "direction": "left", "controlId": "tap-id", "sequence": 1})
+            self.assertEqual("tap ignored while hold is active", stray_tap["message"])
+            self.assertEqual("hold-id", stray_tap["data"]["manualSteeringControlId"])
+            controller.handle({"action": "keepalive", "direction": "left", "controlId": "hold-id", "sequence": 2})
+            time.sleep(0.25)
+            # The invalidated tap timer must not restore straight during hold.
+            self.assertEqual(("trim", -700, "forward", 350), events[-1])
+
+            controller.handle({"action": "hold_stop", "direction": "left", "controlId": "hold-id", "sequence": 6})
+            self.assertEqual(("trim", 0, "forward", 350), events[-1])
+        finally:
+            controller.close()
+
+    def test_hold_stop_tombstone_ignores_late_keepalive(self):
+        controller, state, events = self._controller("forward")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "late", "sequence": 1})
+            controller.handle({"action": "hold_stop", "direction": "right", "controlId": "late", "sequence": 6})
+            event_count = len(events)
+
+            stale = controller.handle({"action": "keepalive", "direction": "right", "controlId": "late", "sequence": 2})
+
+            self.assertEqual("stale keepalive ignored", stale["message"])
+            self.assertEqual(event_count, len(events))
+            self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
+        finally:
+            controller.close()
+
+    def test_duplicate_tap_does_not_restart_pulse(self):
+        controller, state, events = self._controller("forward", tap_duration=0.1)
+        try:
+            controller.handle({"action": "tap", "direction": "right", "controlId": "duplicate-tap", "sequence": 1})
+            duplicate = controller.handle({"action": "tap", "direction": "right", "controlId": "duplicate-tap", "sequence": 1})
+
+            self.assertEqual("duplicate tap ignored", duplicate["message"])
+            self.assertEqual(1, events.count(("trim", 700, "forward", 350)))
+            time.sleep(0.15)
+            self.assertEqual(1, events.count(("trim", 0, "forward", 350)))
+        finally:
+            controller.close()
+
+    def test_opposite_hold_switches_without_speed_step(self):
+        controller, state, events = self._controller("forward")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "right", "sequence": 1})
+            switched = controller.handle({"action": "hold_start", "direction": "left", "controlId": "left", "sequence": 1})
+            controller.handle({"action": "hold_stop", "direction": "left", "controlId": "left", "sequence": 6})
+
+            self.assertEqual("left", switched["data"]["manualSteeringDirection"])
+            self.assertEqual([
+                ("trim", 700, "forward", 350),
+                ("trim", -700, "forward", 350),
+                ("trim", 0, "forward", 350),
+            ], events)
         finally:
             controller.close()
 
@@ -150,7 +256,7 @@ class ManualSteeringControllerTest(unittest.TestCase):
             state["now"] += 1.0
             time.sleep(0.25)
 
-            self.assertEqual(("trim", 0, "forward"), events[-1])
+            self.assertEqual(("trim", 0, "forward", 350), events[-1])
             self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
         finally:
             controller.close()
@@ -162,7 +268,7 @@ class ManualSteeringControllerTest(unittest.TestCase):
             controller.reset(send_hardware=False)
             time.sleep(0.15)
 
-            self.assertEqual([("trim", 700, "forward")], events)
+            self.assertEqual([("trim", 700, "forward", 350)], events)
             self.assertEqual("none", controller.snapshot()["manualSteeringMode"])
         finally:
             controller.close()
@@ -174,7 +280,10 @@ class ManualSteeringControllerTest(unittest.TestCase):
             stopped = controller.handle({"action": "hold_stop", "direction": "left", "controlId": "tap-stop", "sequence": 2})
             time.sleep(0.15)
 
-            self.assertEqual([("trim", -700, "forward"), ("trim", 0, "forward")], events)
+            self.assertEqual([
+                ("trim", -700, "forward", 350),
+                ("trim", 0, "forward", 350),
+            ], events)
             self.assertEqual("none", stopped["data"]["manualSteeringMode"])
         finally:
             controller.close()
@@ -239,7 +348,7 @@ class ManualSteeringSimulatorTest(unittest.TestCase):
         from modeling_simulator import ModelingSimulatorController
         from mqtt_handler import MQTTCommandHandler
 
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             controller = ModelingSimulatorController(directory)
             handler = MQTTCommandHandler(controller)
             try:
@@ -308,7 +417,7 @@ class ManualSteeringSimulatorTest(unittest.TestCase):
                 self.position_messages.append(message)
                 return True
 
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             controller = ModelingSimulatorController(directory)
             mqtt = FakeMQTTClient()
             service = ModelingSimulatorMQTTService({}, controller, mqtt_client=mqtt)

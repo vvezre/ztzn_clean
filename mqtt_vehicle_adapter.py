@@ -204,9 +204,12 @@ class VehicleControllerAdapter(object):
     def save_task(self, task_name):
         return self.set_current_task(task_name)
 
-    def set_current_task(self, task_name):
+    def set_current_task(self, task_name, return_to_origin=True):
         """将一条已保存路线设为当前任务；只有完成此操作，auto_drive 才会执行该路线。"""
-        return self._call('/vehicle/setCurrentTask', params={'taskName': task_name})
+        return self._call('/vehicle/setCurrentTask', params={
+            'taskName': task_name,
+            'returnToOrigin': 'true' if return_to_origin else 'false',
+        })
 
     def save_modeling_task(self, task_name):
         """把当前已规划路径以 taskName 命名保存。"""

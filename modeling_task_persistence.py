@@ -71,7 +71,7 @@ def normalize_task_name(task_name):
     return value
 
 
-def build_named_task(base_config, current_path, task_name):
+def build_named_task(base_config, current_path, task_name, no_return_task_plan=None):
     """
     将 finish_modeling 生成的当前路径固化为一条可命名、可查询、可选择的任务。
 
@@ -84,7 +84,8 @@ def build_named_task(base_config, current_path, task_name):
     - 原有运行参数继续保留。
     - taskName 用于列表展示和选择。
     - modelId 关联到产生它的建模记录。
-    - taskList 是机器人真正执行的唯一有序路径段列表。
+    - taskList 保留默认“返回原点”版本，兼容现有执行链路。
+    - routeVariants 同时保存“返回原点”和“不返回原点”两套完整规划。
     - startLat/startLon 是路线起点。
     - originHeading/heading 为兼容旧任务文件继续保留；新版执行时会用实时位置重新算方向。
 
@@ -109,10 +110,27 @@ def build_named_task(base_config, current_path, task_name):
             "modeling path contains no executable tasks",
         )
 
+    if not isinstance(no_return_task_plan, dict) or no_return_task_plan.get("status") != "ready":
+        raise ModelingTaskPersistenceError(
+            "MODELING_NO_RETURN_PATH_NOT_READY",
+            "modeling no-return path is not ready",
+        )
+    no_return_tasks = no_return_task_plan.get("tasks")
+    if not isinstance(no_return_tasks, list) or not no_return_tasks:
+        raise ModelingTaskPersistenceError(
+            "MODELING_NO_RETURN_PATH_EMPTY",
+            "modeling no-return path contains no executable tasks",
+        )
+
     task_config = copy.deepcopy(base_config if isinstance(base_config, dict) else {})
     task_config["taskName"] = task_name
     task_config["modelId"] = current_path.get("modelId")
     task_config["taskList"] = copy.deepcopy(tasks)
+    task_config["returnToOrigin"] = True
+    task_config["routeVariants"] = {
+        "return": copy.deepcopy(task_plan),
+        "noReturn": copy.deepcopy(no_return_task_plan),
+    }
     # Keep the confirmed cleaning-area order with the named route.  A route
     # list can contain several plans built from the same model, so the model's
     # latest taskPlan alone is not a reliable source for each saved route.
@@ -153,6 +171,9 @@ def is_same_named_task(task_config, current_path, task_name):
     except ModelingTaskPersistenceError:
         return False
     task_list = task_config.get("taskList")
+    route_variants = task_config.get("routeVariants") or {}
+    return_variant = route_variants.get("return") or {}
+    no_return_variant = route_variants.get("noReturn") or {}
     current_task_plan = current_path.get("taskPlan")
     current_tasks = (
         current_task_plan.get("tasks")
@@ -166,4 +187,37 @@ def is_same_named_task(task_config, current_path, task_name):
         and bool(task_list)
         and isinstance(current_tasks, list)
         and task_list == current_tasks
+        and return_variant.get("tasks") == current_tasks
+        and isinstance(no_return_variant.get("tasks"), list)
+        and bool(no_return_variant.get("tasks"))
     )
+
+
+def select_named_task_variant(task_config, return_to_origin=True):
+    """从同一命名任务中取出指定返回方式，并生成可直接写入 config.json 的配置。"""
+    if not isinstance(task_config, dict):
+        raise ModelingTaskPersistenceError(
+            "TASK_CONFIG_INVALID",
+            "saved task config is invalid",
+        )
+
+    return_to_origin = bool(return_to_origin)
+    variants = task_config.get("routeVariants") or {}
+    variant_key = "return" if return_to_origin else "noReturn"
+    variant = variants.get(variant_key) or {}
+    tasks = variant.get("tasks")
+
+    # 老任务没有routeVariants时，仍允许按原先的返回原点taskList执行；
+    # 不返回版本不能猜测或截断旧路线，必须由新算法重新建模保存后才可选。
+    if return_to_origin and (not isinstance(tasks, list) or not tasks):
+        tasks = task_config.get("taskList")
+    if not isinstance(tasks, list) or not tasks:
+        raise ModelingTaskPersistenceError(
+            "ROUTE_VARIANT_NOT_AVAILABLE",
+            "selected route variant does not exist",
+        )
+
+    selected = copy.deepcopy(task_config)
+    selected["taskList"] = copy.deepcopy(tasks)
+    selected["returnToOrigin"] = return_to_origin
+    return selected

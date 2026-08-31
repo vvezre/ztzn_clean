@@ -174,7 +174,8 @@ def execute_modeling_plan(plan, run_segment, update_progress=None, should_stop=N
         update_progress(_progress_payload(plan, "running", completed, segment, "segment complete"))
         index += run_count
 
-    # 所有任务段均成功后才发布complete；因此complete同时表示已按闭环路线返回原点。
+    # 所有任务段均成功后才发布complete。是否回到原点由所选路线版本决定：
+    # returnToOrigin=true 的任务末段回原点，false 的任务在最后清扫区域结束。
     result = _progress_payload(plan, "complete", completed, None, "modeling task complete")
     result["code"] = "MODELING_TASK_COMPLETE"
     result["completedCount"] = completed

@@ -25,13 +25,15 @@ class ManualSteeringController(object):
     """Manage tap/hold steering without trusting frontend motion state."""
 
     def __init__(self, motion_provider, apply_trim, start_rotation,
-                 stop_rotation, state_callback=None, now=None,
+                 stop_rotation, travel_speed_provider=None,
+                 state_callback=None, now=None,
                  moving_value=700, tap_duration=0.3,
                  keepalive_timeout=1.5):
         self.motion_provider = motion_provider
         self.apply_trim = apply_trim
         self.start_rotation = start_rotation
         self.stop_rotation = stop_rotation
+        self.travel_speed_provider = travel_speed_provider
         self.state_callback = state_callback
         self.now = now or time.time
         # The moving left/right buttons reuse the existing joystick's fixed
@@ -48,6 +50,14 @@ class ManualSteeringController(object):
         self._control_id = None
         self._last_sequence = -1
         self._last_keepalive = 0.0
+        # Moving gestures must retain the original commanded travel speed.
+        # Reading live wheel feedback on every frame makes the speed ratchet
+        # down because a diagonal command naturally reports a lower X speed.
+        self._travel_speed = None
+        # A frontend/network retry may deliver keepalive after hold_stop.  Keep
+        # a small bounded tombstone set so such frames can never revive a
+        # released gesture.  A new explicit hold_start removes its tombstone.
+        self._closed_control_ids = []
         # Incrementing this invalidates a delayed tap restore.  A stale timer
         # can therefore never overwrite a later drive/stop/automatic command.
         self._session_generation = 0
@@ -124,13 +134,24 @@ class ManualSteeringController(object):
     def _moving_value(self, direction):
         return -self.moving_value if direction == 'left' else self.moving_value
 
-    def _apply_moving_direction_locked(self, direction, motion_state):
+    def _target_speed(self, motion_state):
+        if not callable(self.travel_speed_provider):
+            raise RuntimeError('manual steering travel speed provider is unavailable')
+        speed = abs(int(self.travel_speed_provider(motion_state)))
+        if speed <= 0:
+            raise RuntimeError('manual steering travel speed must be positive')
+        return speed
+
+    def _apply_moving_direction_locked(self, direction, motion_state, travel_speed=None):
         """Apply one fixed joystick direction while preserving travel speed."""
+        if travel_speed is None:
+            travel_speed = self._target_speed(motion_state)
         value = self._moving_value(direction)
-        self.apply_trim(value, motion_state)
+        self.apply_trim(value, motion_state, travel_speed)
         self._correction_level = -1 if direction == 'left' else 1
         self._correction_value = value
         self._correction_motion = motion_state
+        self._travel_speed = travel_speed
 
     def _clear_correction_locked(self):
         self._correction_level = 0
@@ -144,6 +165,28 @@ class ManualSteeringController(object):
         self._control_id = None
         self._last_sequence = -1
         self._last_keepalive = 0.0
+        self._travel_speed = None
+
+    def _remember_closed_control_locked(self, control_id):
+        if not control_id:
+            return
+        try:
+            self._closed_control_ids.remove(control_id)
+        except ValueError:
+            pass
+        self._closed_control_ids.append(control_id)
+        if len(self._closed_control_ids) > 32:
+            del self._closed_control_ids[:-32]
+
+    def _forget_closed_control_locked(self, control_id):
+        try:
+            self._closed_control_ids.remove(control_id)
+        except ValueError:
+            pass
+
+    def _restore_straight(self, motion_state, travel_speed):
+        if motion_state in ('forward', 'reverse') and travel_speed:
+            self.apply_trim(0, motion_state, travel_speed)
 
     def handle(self, params):
         params = params or {}
@@ -167,7 +210,7 @@ class ManualSteeringController(object):
         except Exception as error:
             raise ManualSteeringError('ACTUATOR_ERROR', 'manual steering actuator failed: {}'.format(error))
 
-    def _schedule_tap_restore(self, generation, motion_state):
+    def _schedule_tap_restore(self, generation, motion_state, travel_speed):
         def restore_after_delay():
             time.sleep(self.tap_duration)
             with self._lock:
@@ -177,7 +220,7 @@ class ManualSteeringController(object):
                 self._clear_session_locked()
                 self._clear_correction_locked()
             try:
-                self.apply_trim(0, motion_state)
+                self._restore_straight(motion_state, travel_speed)
             except Exception:
                 # A later stop/fault can make the lower machine unavailable.
                 # The session has already been invalidated, so never retry a
@@ -203,8 +246,18 @@ class ManualSteeringController(object):
             # session still owns the controls and cannot be interrupted by an
             # unrelated tap.
             if self._mode in ('forward_tap', 'reverse_tap'):
+                if (self._control_id == control_id and
+                        self._direction == direction and
+                        sequence == self._last_sequence):
+                    return self._response('duplicate tap ignored', motion)
                 self._clear_session_locked()
                 self._clear_correction_locked()
+            elif self._mode in ('forward_trim', 'reverse_trim'):
+                # Some frontend gesture implementations emit a tap event while
+                # the long-press session is already active.  The hold owns the
+                # controls; accepting the tap's different controlId would make
+                # the next valid keepalive look stale and break the session.
+                return self._response('tap ignored while hold is active', self._correction_motion)
             elif self._mode != 'none':
                 raise ManualSteeringError('CONTROL_SESSION_ACTIVE', 'another manual steering hold is active')
             self._apply_moving_direction_locked(direction, motion)
@@ -213,7 +266,8 @@ class ManualSteeringController(object):
             self._control_id = control_id
             self._last_sequence = sequence
             generation = self._session_generation
-        self._schedule_tap_restore(generation, motion)
+            travel_speed = self._travel_speed
+        self._schedule_tap_restore(generation, motion, travel_speed)
         self._notify_state()
         return self._response('{} joystick tap applied'.format(motion), motion)
 
@@ -225,14 +279,40 @@ class ManualSteeringController(object):
         # duplicate must therefore be treated as idempotent instead of being
         # rejected or reinterpreted as a new forward-trim gesture.
         with self._lock:
+            self._forget_closed_control_locked(control_id)
             if self._mode in ('forward_tap', 'reverse_tap'):
                 # A deliberate hold supersedes an unfinished tap without an
                 # intermediate straight frame that would cause a visible jerk.
                 self._clear_session_locked()
                 self._clear_correction_locked()
             if self._mode != 'none':
-                if self._control_id == control_id and sequence <= self._last_sequence:
+                if (self._control_id == control_id and
+                        self._direction == direction and
+                        sequence <= self._last_sequence):
+                    self._last_keepalive = self.now()
                     return self._response('duplicate hold_start ignored')
+                # A new left/right press supersedes the prior manual hold.  It
+                # keeps the same captured travel speed, so changing direction
+                # never introduces a stop frame or speed step.
+                if self._mode in ('forward_trim', 'reverse_trim'):
+                    motion = self._correction_motion
+                    travel_speed = self._travel_speed
+                    self._apply_moving_direction_locked(direction, motion, travel_speed)
+                    self._direction = direction
+                    self._control_id = control_id
+                    self._last_sequence = sequence
+                    self._last_keepalive = self.now()
+                    self._notify_state()
+                    return self._response('{} fixed joystick steering switched'.format(motion), motion)
+                if self._mode == 'in_place_rotate':
+                    self.stop_rotation()
+                    self.start_rotation(direction)
+                    self._direction = direction
+                    self._control_id = control_id
+                    self._last_sequence = sequence
+                    self._last_keepalive = self.now()
+                    self._notify_state()
+                    return self._response('in-place rotation direction switched')
                 raise ManualSteeringError('CONTROL_SESSION_ACTIVE', 'another manual steering hold is active')
 
             motion = self._motion()
@@ -258,7 +338,45 @@ class ManualSteeringController(object):
 
     def _keepalive(self, direction, control_id, sequence):
         with self._lock:
-            if self._mode == 'none' or self._control_id != control_id:
+            if self._mode == 'none':
+                if control_id in self._closed_control_ids:
+                    return self._response('stale keepalive ignored')
+                # Be tolerant of a lost/delayed hold_start: the first orphan
+                # keepalive can establish the hold, but never after a known
+                # hold_stop for the same controlId.
+                motion = self._motion()
+                if motion not in ('forward', 'reverse', 'stopped'):
+                    raise ManualSteeringError(
+                        'MANUAL_STEERING_BLOCKED',
+                        'manual steering is not allowed while {}'.format(motion),
+                    )
+                if motion == 'stopped':
+                    self.start_rotation(direction)
+                    self._mode = 'in_place_rotate'
+                else:
+                    self._apply_moving_direction_locked(direction, motion)
+                    self._mode = '{}_trim'.format(motion)
+                self._direction = direction
+                self._control_id = control_id
+                self._last_sequence = sequence
+                self._last_keepalive = self.now()
+                self._notify_state()
+                return self._response('orphan keepalive promoted to hold', motion)
+
+            if self._mode in ('forward_tap', 'reverse_tap'):
+                if direction != self._direction:
+                    raise ManualSteeringError('CONTROL_DIRECTION_MISMATCH', 'direction does not match the active tap')
+                motion = self._correction_motion
+                travel_speed = self._travel_speed
+                self._apply_moving_direction_locked(direction, motion, travel_speed)
+                self._mode = '{}_trim'.format(motion)
+                self._control_id = control_id
+                self._last_sequence = sequence
+                self._last_keepalive = self.now()
+                self._notify_state()
+                return self._response('tap promoted to active hold', motion)
+
+            if self._control_id != control_id:
                 raise ManualSteeringError('CONTROL_SESSION_NOT_FOUND', 'manual steering hold session was not found')
             if direction != self._direction:
                 raise ManualSteeringError('CONTROL_DIRECTION_MISMATCH', 'direction does not match the active hold')
@@ -286,9 +404,15 @@ class ManualSteeringController(object):
                 raise ManualSteeringError('MOTION_STATE_CHANGED', 'vehicle motion state changed during hold')
 
             current_time = self.now()
-            # The fixed 45-degree command is sent once by hold_start.  Repeated
-            # keepalive frames only prove that the button remains pressed; they
-            # never increase or resend the steering value.
+            # Re-send the exact same fixed 45-degree frame.  This mirrors the
+            # local joystick page, which streams its current direction while
+            # held.  The saved target speed and steering value never increase.
+            if self._mode in ('forward_trim', 'reverse_trim'):
+                self._apply_moving_direction_locked(
+                    self._direction,
+                    self._correction_motion,
+                    self._travel_speed,
+                )
             self._last_sequence = max(self._last_sequence, sequence)
             self._last_keepalive = current_time
         self._notify_state()
@@ -297,15 +421,19 @@ class ManualSteeringController(object):
     def _hold_stop(self, control_id):
         with self._lock:
             if self._mode == 'none':
+                self._remember_closed_control_locked(control_id)
                 return self._response('manual steering hold already stopped')
             if self._control_id != control_id:
-                raise ManualSteeringError('CONTROL_SESSION_NOT_FOUND', 'manual steering hold session was not found')
+                self._remember_closed_control_locked(control_id)
+                return self._response('stale hold stop ignored')
             rotate = self._mode == 'in_place_rotate'
             trim_motion = None
+            travel_speed = self._travel_speed
             if self._mode in ('forward_trim', 'forward_tap'):
                 trim_motion = 'forward'
             elif self._mode in ('reverse_trim', 'reverse_tap'):
                 trim_motion = 'reverse'
+            self._remember_closed_control_locked(control_id)
             self._clear_session_locked()
             if trim_motion is not None:
                 # A moving long-press is temporary steering assistance.  Do
@@ -318,7 +446,7 @@ class ManualSteeringController(object):
             # This is intentionally a single reset frame.  The lower-machine
             # command also contains the current longitudinal speed, so it must
             # not be transmitted continuously after the button is released.
-            self.apply_trim(0, trim_motion)
+            self._restore_straight(trim_motion, travel_speed)
         self._notify_state()
         return self._response('manual steering hold stopped')
 
@@ -326,6 +454,8 @@ class ManualSteeringController(object):
         with self._lock:
             rotate = self._mode == 'in_place_rotate'
             moving_motion = self._correction_motion
+            travel_speed = self._travel_speed
+            self._remember_closed_control_locked(self._control_id)
             had_moving_direction = self._correction_value != 0 and moving_motion in ('forward', 'reverse')
             self._clear_session_locked()
             self._clear_correction_locked()
@@ -333,7 +463,7 @@ class ManualSteeringController(object):
             if rotate:
                 self.stop_rotation()
             elif had_moving_direction:
-                self.apply_trim(0, moving_motion)
+                self._restore_straight(moving_motion, travel_speed)
         self._notify_state()
         return self._response(message)
 
@@ -343,12 +473,15 @@ class ManualSteeringController(object):
             timed_out = False
             rotate = False
             moving_motion = None
+            travel_speed = None
             with self._lock:
                 if self._mode in ('forward_trim', 'reverse_trim', 'in_place_rotate') and self._last_keepalive > 0:
                     timed_out = self.now() - self._last_keepalive > self.keepalive_timeout
                     if timed_out:
                         rotate = self._mode == 'in_place_rotate'
                         moving_motion = self._correction_motion
+                        travel_speed = self._travel_speed
+                        self._remember_closed_control_locked(self._control_id)
                         self._clear_session_locked()
                         self._clear_correction_locked()
             if timed_out:
@@ -362,7 +495,7 @@ class ManualSteeringController(object):
                         # A lost hold_stop must not leave the robot following a
                         # permanent diagonal command.  Resume its prior straight
                         # manual movement instead of braking it.
-                        self.apply_trim(0, moving_motion)
+                        self._restore_straight(moving_motion, travel_speed)
                     except Exception:
                         pass
                 self._notify_state()

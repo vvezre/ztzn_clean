@@ -5,6 +5,7 @@ from modeling_task_persistence import (
     build_named_task,
     is_same_named_task,
     normalize_task_name,
+    select_named_task_variant,
 )
 
 
@@ -34,13 +35,27 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
                 "tasks": [first_task],
             },
         }
+        no_return_plan = {
+            "status": "ready",
+            "returnToOrigin": False,
+            "areaOrder": [2, 1],
+            "tasks": [dict(first_task, id=2, endLon=118.1235)],
+        }
 
-        saved = build_named_task(base_config, current_path, u"厂区路线一")
+        saved = build_named_task(
+            base_config,
+            current_path,
+            u"厂区路线一",
+            no_return_task_plan=no_return_plan,
+        )
 
         self.assertEqual(saved["taskName"], u"厂区路线一")
         self.assertEqual(saved["modelId"], "model-1")
         self.assertEqual(saved["areaOrder"], [2, 1])
         self.assertEqual(saved["taskList"], [first_task])
+        self.assertTrue(saved["returnToOrigin"])
+        self.assertEqual(saved["routeVariants"]["return"], current_path["taskPlan"])
+        self.assertEqual(saved["routeVariants"]["noReturn"], no_return_plan)
         self.assertEqual(saved["startLat"], 32.0364)
         self.assertEqual(saved["startLon"], 118.1234)
         self.assertEqual(saved["originHeading"], 0)
@@ -66,6 +81,10 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
             "taskName": u"测试6",
             "modelId": "model-1",
             "taskList": [{"id": 1}],
+            "routeVariants": {
+                "return": {"tasks": [{"id": 1}]},
+                "noReturn": {"tasks": [{"id": 2}]},
+            },
         }
 
         self.assertTrue(is_same_named_task(task_config, current_path, u"测试6"))
@@ -80,6 +99,28 @@ class ModelingTaskPersistenceTest(unittest.TestCase):
             {"modelId": "model-1", "taskPlan": {"tasks": [{"id": 2}]}},
             u"测试6",
         ))
+
+    def test_selects_return_and_no_return_variants_without_changing_saved_task(self):
+        saved = {
+            "taskName": "route-a",
+            "taskList": [{"id": 1}],
+            "routeVariants": {
+                "return": {"tasks": [{"id": 1}]},
+                "noReturn": {"tasks": [{"id": 2}, {"id": 3}]},
+            },
+        }
+
+        return_config = select_named_task_variant(saved, True)
+        no_return_config = select_named_task_variant(saved, False)
+
+        self.assertEqual(return_config["taskList"], [{"id": 1}])
+        self.assertTrue(return_config["returnToOrigin"])
+        self.assertEqual(no_return_config["taskList"], [{"id": 2}, {"id": 3}])
+        self.assertFalse(no_return_config["returnToOrigin"])
+        self.assertEqual(saved["taskList"], [{"id": 1}])
+
+        with self.assertRaises(ModelingTaskPersistenceError):
+            select_named_task_variant({"taskList": [{"id": 1}]}, False)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,19 @@ class ModelingSavedRoutesTest(unittest.TestCase):
                     "endX": 200,
                     "endY": 100,
                 }],
+                "routeVariants": {
+                    "return": {"tasks": [{
+                        "startX": 200, "startY": 0,
+                        "endX": 200, "endY": 100,
+                    }]},
+                    "noReturn": {"tasks": [{
+                        "startX": 200, "startY": 0,
+                        "endX": 300, "endY": 0,
+                    }, {
+                        "startX": 300, "startY": 0,
+                        "endX": 400, "endY": 0,
+                    }]},
+                },
             },
         }
         models = {
@@ -68,6 +81,7 @@ class ModelingSavedRoutesTest(unittest.TestCase):
             "route-b",
             lambda task_name: task_configs[task_name],
             lambda model_id: models[model_id],
+            current_return_to_origin=False,
         )
 
         self.assertEqual(
@@ -75,10 +89,15 @@ class ModelingSavedRoutesTest(unittest.TestCase):
             ["route-a", "route-b"],
         )
         self.assertEqual(result["currentTaskName"], "route-b")
+        self.assertFalse(result["currentReturnToOrigin"])
         self.assertFalse(result["routes"][0]["current"])
         self.assertTrue(result["routes"][1]["current"])
+        self.assertTrue(result["routes"][0]["returnToOrigin"])
+        self.assertFalse(result["routes"][1]["returnToOrigin"])
         self.assertEqual(result["routes"][0]["modelId"], "model-a")
         self.assertEqual(result["routes"][0]["taskCount"], 1)
+        self.assertEqual(result["routes"][1]["taskCount"], 2)
+        self.assertEqual(len(result["routes"][1]["pathPoints"]), 3)
         self.assertEqual(result["routes"][0]["areaOrder"], [2, 1])
         self.assertEqual(result["routes"][1]["areaOrder"], [1, 2])
         self.assertEqual(result["routes"][0]["areaPoints"][0]["id"], "a1")

@@ -1645,7 +1645,7 @@ def _group_lane_candidate_sets(group):
     return combinations
 
 
-def _select_group_lane_segments(preview, group_id, entry, exit_point):
+def _select_group_lane_segments(preview, group_id, entry, exit_point=None):
     """
     为指定区域选择一组最适合入口和出口的 S 形清扫顺序。
 
@@ -1655,7 +1655,9 @@ def _select_group_lane_segments(preview, group_id, entry, exit_point):
     3. 整组清扫线逆序，第一条正向。
     4. 整组清扫线逆序，第一条反向。
 
-    评分为“入口到首线起点距离 + 末线终点到出口距离”，选择总距离最小的组合。
+    有出口约束时，评分为“入口到首线起点距离 + 末线终点到出口距离”。
+    不需要返回原点时，最后一个区域没有出口约束，只按入口、重叠和区域内总长度
+    选择方案，让最后一条清扫线自然结束在该区域中最合适的位置。
     """
     # 先取得目标区域的预览数据，其中包含每个子区域的全部合法奇偶清扫线候选。
     group = _preview_group(preview, group_id)
@@ -1703,7 +1705,13 @@ def _select_group_lane_segments(preview, group_id, entry, exit_point):
                 # d_entry=|入口桥头(或原点)-首线起点|。
                 entry_distance = _length_cm(entry, segments[0]["start"])
                 # d_exit=|末线终点-出口桥头(或回程参考点)|。
-                exit_distance = _length_cm(segments[-1]["end"], exit_point)
+                # 不返回原点的最后区域没有出口目标，因此该项为0，不能用原点影响
+                # 它的清扫线条数、先扫哪侧或最后停在哪一侧。
+                exit_distance = (
+                    _length_cm(segments[-1]["end"], exit_point)
+                    if exit_point is not None
+                    else 0.0
+                )
                 # 区域内部相邻清扫线之间的换行总距离。
                 transfer_distance = sum(
                     _length_cm(segments[index]["end"], segments[index + 1]["start"])
@@ -1764,6 +1772,7 @@ def _select_group_lane_segments(preview, group_id, entry, exit_point):
             "laneCount": len(selected["segments"]),
             "entryDistanceCm": round(selected["entryDistance"], 1),
             "exitDistanceCm": round(selected["exitDistance"], 1),
+            "hasExitReference": exit_point is not None,
             "reverseOrder": selected["reverseOrder"],
             "reverseFirst": selected["reverseFirst"],
             "subAreas": selected["subAreas"],
@@ -2187,7 +2196,7 @@ def _task_xy(task, prefix):
     )
 
 
-def _validate_continuous_round_trip(tasks, origin):
+def _validate_continuous_round_trip(tasks, origin, return_to_origin=True):
     """
     在保存和执行前校验路线闭环性。
 
@@ -2195,7 +2204,7 @@ def _validate_continuous_round_trip(tasks, origin):
     1. 任务列表不能为空。
     2. 第一段起点必须等于建模原点。
     3. 每一段终点必须等于下一段起点。
-    4. 最后一段终点必须回到建模原点。
+    4. return_to_origin=true 时，最后一段终点必须回到建模原点。
 
     任何一项不满足都拒绝生成 taskPlan，避免小车执行断裂或跳点路径。
     """
@@ -2233,7 +2242,7 @@ def _validate_continuous_round_trip(tasks, origin):
                 )
             )
 
-    if _task_xy(tasks[-1], "end") != rounded_origin:
+    if return_to_origin and _task_xy(tasks[-1], "end") != rounded_origin:
         raise ModelingTaskGenerationError("generated task path does not return to the modeling origin")
 
 
@@ -2472,8 +2481,9 @@ def _transition_exit_reference(preview, from_group_id, to_group_id, mapper, fall
     return route_edges[0]["points"][0]
 
 
-def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
-    """按默认或前端指定区域顺序，统一规划单区域和任意多区域闭环路线。"""
+def _generate_area_order_plan(
+        draft, preview, mapper, route_policy, now=None, return_to_origin=True):
+    """按区域顺序规划路线，并按 return_to_origin 决定是否生成最终返程。"""
     # 把前端areaOrder（区域编号或groupId）解析为不遗漏、不重复的区域对象列表。
     ordered_groups = _resolve_area_order(preview, route_policy)
     # 第一个有效建模点既是统一坐标原点，也是整条闭环路线的起点/终点。
@@ -2491,12 +2501,13 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
     # 按areaOrder逐个规划区域；每完成一个区域，current更新为该区域末线终点。
     for index, group in enumerate(ordered_groups):
         group_id = group.get("groupId")
-        # 当前区域不是最后一个时，出口指向areaOrder中的下一区域；
-        # 最后一个区域的下一目标是原点所属区域，用于规划闭环返程。
+        is_last_group = index + 1 == len(ordered_groups)
+        # 当前区域不是最后一个时，出口指向areaOrder中的下一区域。
+        # 需要返回原点时，最后一个区域的出口指向原点所属区域；不返回时不设出口。
         next_group_id = (
             ordered_groups[index + 1].get("groupId")
             if index + 1 < len(ordered_groups)
-            else origin_group_id
+            else (origin_group_id if return_to_origin else None)
         )
         # 入口参考：同区域时用当前位置，跨区时用到达目标区域的最后一个桥头。
         entry_reference = _transition_entry_reference(
@@ -2506,14 +2517,17 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
             mapper,
             current,
         )
-        # 出口参考：跨区时用离开当前区域的第一个桥头，最后区域则指向返程桥/原点。
-        exit_reference = _transition_exit_reference(
-            preview,
-            group_id,
-            next_group_id,
-            mapper,
-            origin,
-        )
+        # 出口参考：跨区时用离开当前区域的第一个桥头，闭环路线最后区域指向
+        # 返程桥/原点；不返回原点的最后区域传入None，使其独立重选清扫方案。
+        exit_reference = None
+        if not is_last_group or return_to_origin:
+            exit_reference = _transition_exit_reference(
+                preview,
+                group_id,
+                next_group_id,
+                mapper,
+                origin,
+            )
         # 在满足最低重叠的奇偶候选中，结合入口/出口选出当前区域唯一S形方案。
         selected = _select_group_lane_segments(
             preview,
@@ -2564,8 +2578,8 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
     if not tasks or clean_count == 0:
         raise ModelingTaskGenerationError("路径预览中没有可生成的清扫线")
 
-    # 清扫完最后区域后，如果尚未回到原点，按连接图和边界锚点生成闭环返程。
-    if not _is_same_point(current, origin):
+    # 只有返回原点版本才追加闭环返程；不返回版本在最后区域末线终点直接结束。
+    if return_to_origin and not _is_same_point(current, origin):
         task_id = _append_transition_tasks(
             tasks,
             current,
@@ -2585,14 +2599,15 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
     # 边界折线的多个mode=1子段属于同一条清扫线，不能改变cleanTaskCount的历史含义。
     clean_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
     transfer_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 2)
-    # 保存前执行最终安全校验：首段从原点开始、段段连续、末段回到原点。
-    _validate_continuous_round_trip(tasks, origin)
+    # 两种版本都必须从原点开始且段段连续；只有返回版本要求末段回到原点。
+    _validate_continuous_round_trip(tasks, origin, return_to_origin=return_to_origin)
     total_length = sum(int(task.get("length") or 0) for task in tasks)
     return {
         "status": "ready",
         "generatedAt": int(now if now is not None else time.time()),
         "taskName": draft.get("name") or draft.get("id") or "",
         "routeType": "area_order",
+        "returnToOrigin": bool(return_to_origin),
         "areaOrder": [group.get("areaNumber") for group in ordered_groups],
         "routeSelections": selections,
         "summary": {
@@ -2606,7 +2621,7 @@ def _generate_area_order_plan(draft, preview, mapper, route_policy, now=None):
     }
 
 
-def generate_task_plan(draft, now=None):
+def generate_task_plan(draft, now=None, return_to_origin=True):
     """
     把路径预览转换为小车真正执行的 taskPlan。
 
@@ -2635,7 +2650,7 @@ def generate_task_plan(draft, now=None):
     mapper = _CoordinateMapper(draft)
     # 显式历史策略继续兼容；所有新建模型统一按区域顺序走通用候选规划。
     route_policy = draft.get("routePolicy") or {}
-    if route_policy.get("type") == "bridge_round_trip":
+    if route_policy.get("type") == "bridge_round_trip" and return_to_origin:
         # 业务明确指定先清扫远端区域、再返回起始区域时，使用专用闭环策略。
         return _generate_bridge_round_trip_plan(
             draft,
@@ -2650,4 +2665,5 @@ def generate_task_plan(draft, now=None):
         mapper,
         route_policy,
         now=now,
+        return_to_origin=return_to_origin,
     )

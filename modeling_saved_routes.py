@@ -85,7 +85,9 @@ def discover_saved_task_names(file_names, load_task_config):
     return sorted(set(names))
 
 
-def build_saved_routes(task_names, current_task_name, load_task_config, load_model):
+def build_saved_routes(
+        task_names, current_task_name, load_task_config, load_model,
+        current_return_to_origin=True):
     """构建 ``get_saved_routes`` 命令最终返回的业务数据。
 
     参数：
@@ -128,8 +130,18 @@ def build_saved_routes(task_names, current_task_name, load_task_config, load_mod
         if not isinstance(model, dict):
             model = {}
 
-        # taskList 是机器人实际执行的数据，也是 pathPoints 唯一的数据源。
+        is_current = task_name == current_task_name
+        selected_return_to_origin = (
+            bool(current_return_to_origin) if is_current else True
+        )
+        variants = task_config.get('routeVariants') or {}
+        variant_key = 'return' if selected_return_to_origin else 'noReturn'
+        selected_variant = variants.get(variant_key) or {}
+
+        # 当前路线返回它真正选中的版本；其他路线默认展示返回原点版本。
         task_list = task_config.get('taskList')
+        if isinstance(selected_variant.get('tasks'), list):
+            task_list = selected_variant.get('tasks')
         if not isinstance(task_list, list):
             task_list = []
 
@@ -137,7 +149,8 @@ def build_saved_routes(task_names, current_task_name, load_task_config, load_mod
         routes.append({
             'taskName': task_name,
             'modelId': model_id,
-            'current': task_name == current_task_name,
+            'current': is_current,
+            'returnToOrigin': selected_return_to_origin,
             'taskCount': len(task_list),
             'areaOrder': _saved_area_order(task_config, model),
             'areaPoints': frontend_area_points(model),
@@ -148,4 +161,5 @@ def build_saved_routes(task_names, current_task_name, load_task_config, load_mod
     return {
         'routes': routes,
         'currentTaskName': current_task_name,
+        'currentReturnToOrigin': bool(current_return_to_origin),
     }

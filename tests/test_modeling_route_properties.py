@@ -463,8 +463,18 @@ class ModelingRoutePropertyTest(unittest.TestCase):
         }
         draft["taskPreview"] = build_model_preview(draft, now=1000)
         plan = generate_task_plan(draft, now=2000)
+        no_return_plan = generate_task_plan(
+            draft,
+            now=2000,
+            return_to_origin=False,
+        )
         current_path = {"modelId": draft["id"], "taskPlan": plan}
-        saved = build_named_task({}, current_path, "deep-test-route")
+        saved = build_named_task(
+            {},
+            current_path,
+            "deep-test-route",
+            no_return_task_plan=no_return_plan,
+        )
         path_points = frontend_path_points(plan)
 
         self.assertEqual(saved["taskList"], plan["tasks"])

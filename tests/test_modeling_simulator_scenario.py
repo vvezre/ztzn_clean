@@ -87,6 +87,20 @@ class ModelingSimulatorScenarioTest(unittest.TestCase):
                 [1, 2, 3],
             )
 
+            selected = controller.set_current_task("ordered-route", False)
+            listed_no_return = controller.get_saved_routes()
+            selected_route = listed_no_return["data"]["routes"][0]
+
+            self.assertTrue(selected["success"])
+            self.assertFalse(selected["data"]["returnToOrigin"])
+            self.assertFalse(listed_no_return["data"]["currentReturnToOrigin"])
+            self.assertFalse(selected_route["returnToOrigin"])
+            self.assertNotEqual(
+                (selected_route["pathPoints"][-1]["x"],
+                 selected_route["pathPoints"][-1]["y"]),
+                (0, 0),
+            )
+
     def test_clear_all_returns_fixed_scenario_to_first_area_and_first_point(self):
         from modeling_simulator import ModelingSimulatorController
 

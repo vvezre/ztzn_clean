@@ -6,6 +6,8 @@ class _FakeController(object):
         self.model_id = None
         self.group_id = None
         self.link_id = None
+        self.current_task = None
+        self.return_to_origin = None
 
     def get_modeling_path(self, model_id=None):
         self.model_id = model_id
@@ -189,6 +191,17 @@ class _FakeController(object):
                     "pathPoints": [{"id": "p1"}, {"id": "p2"}],
                 }],
                 "currentTaskName": "route-a",
+            },
+        }
+
+    def set_current_task(self, task_name, return_to_origin=True):
+        self.current_task = task_name
+        self.return_to_origin = return_to_origin
+        return {
+            "success": True,
+            "data": {
+                "taskName": task_name,
+                "returnToOrigin": return_to_origin,
             },
         }
 
@@ -465,11 +478,26 @@ class MqttModelingBridgeTest(unittest.TestCase):
             base_url="http://127.0.0.1:7899",
         )
         with patch.object(adapter_module, "urlopen", side_effect=fake_urlopen):
-            result = adapter.set_current_task(u"8.12\u6d4b\u8bd5")
+            result = adapter.set_current_task(u"8.12\u6d4b\u8bd5", False)
 
         self.assertTrue(result["success"])
         self.assertEqual(result["data"]["taskName"], u"8.12\u6d4b\u8bd5")
         self.assertIn("taskName=8.12%E6%B5%8B%E8%AF%95", captured["url"])
+        self.assertIn("returnToOrigin=false", captured["url"])
+
+    def test_handler_forwards_selected_return_variant(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        controller = _FakeController()
+        result = MQTTCommandHandler(controller).handle({
+            "command": "set_current_task",
+            "params": {"taskName": "route-a", "returnToOrigin": False},
+        })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(controller.current_task, "route-a")
+        self.assertFalse(controller.return_to_origin)
+        self.assertFalse(result["data"]["returnToOrigin"])
 
     def test_adapter_preserves_modeling_http_error_payload(self):
         import io

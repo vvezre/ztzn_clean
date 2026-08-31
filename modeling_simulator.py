@@ -23,6 +23,7 @@ from manual_steering import ManualSteeringController, ManualSteeringError
 from modeling_session import ModelingSession, ModelingSessionError
 from modeling_store import ModelingStore
 from modeling_task_persistence import normalize_task_name
+from modeling_task_generator import generate_task_plan
 from mqtt_handler import MQTTCommandHandler
 from mqtt_vehicle_adapter import (
     _frontend_area_points,
@@ -320,6 +321,7 @@ class ModelingSimulatorController(object):
         self._tasks_lock = threading.RLock()
         self._saved_tasks = {}
         self._current_task_name = None
+        self._current_return_to_origin = True
         self._current_position = dict(scenario_point(0), local_x=0, local_y=0, mode=2)
         self.player = ModelingPathPlayer(
             on_position=self._on_playback_position,
@@ -333,6 +335,7 @@ class ModelingSimulatorController(object):
             apply_trim=self._simulate_trim,
             start_rotation=self._simulate_rotation_start,
             stop_rotation=self._simulate_rotation_stop,
+            travel_speed_provider=self._simulate_manual_speed,
             moving_value=700,
             tap_duration=0.3,
             keepalive_timeout=1.5,
@@ -368,8 +371,16 @@ class ModelingSimulatorController(object):
             return "auto"
         return self._sim_motion_state
 
-    def _simulate_trim(self, value, motion_state):
-        self._manual_events.append({"event": "trim", "value": int(value), "motionState": motion_state})
+    def _simulate_manual_speed(self, motion_state):
+        return 350 if motion_state == "forward" else 100
+
+    def _simulate_trim(self, value, motion_state, travel_speed):
+        self._manual_events.append({
+            "event": "trim",
+            "value": int(value),
+            "motionState": motion_state,
+            "travelSpeed": int(travel_speed),
+        })
 
     def _simulate_rotation_start(self, direction):
         self._manual_events.append({"event": "rotation_start", "direction": direction})
@@ -637,10 +648,16 @@ class ModelingSimulatorController(object):
                         "taskName already exists",
                     )
                 model_id = current_path.get("modelId")
+                model = copy.deepcopy(self.store.get_model(model_id))
+                no_return_plan = generate_task_plan(model, return_to_origin=False)
                 self._saved_tasks[name] = {
                     "modelId": model_id,
                     "taskPlan": copy.deepcopy(task_plan),
-                    "model": copy.deepcopy(self.store.get_model(model_id)),
+                    "routeVariants": {
+                        "return": copy.deepcopy(task_plan),
+                        "noReturn": copy.deepcopy(no_return_plan),
+                    },
+                    "model": model,
                 }
             return {
                 "taskName": name,
@@ -655,6 +672,7 @@ class ModelingSimulatorController(object):
                 return {
                     "taskNames": sorted(self._saved_tasks.keys()),
                     "currentTaskName": self._current_task_name,
+                    "currentReturnToOrigin": self._current_return_to_origin,
                 }
         return self._call("simulation task names fetched", action)
 
@@ -663,15 +681,24 @@ class ModelingSimulatorController(object):
             with self._tasks_lock:
                 saved_tasks = copy.deepcopy(self._saved_tasks)
                 current_task_name = self._current_task_name
+                current_return_to_origin = self._current_return_to_origin
             routes = []
             for name in sorted(saved_tasks.keys()):
                 saved = saved_tasks[name]
-                task_plan = saved.get("taskPlan") or {}
+                is_current = name == current_task_name
+                return_to_origin = current_return_to_origin if is_current else True
+                variant_key = "return" if return_to_origin else "noReturn"
+                task_plan = (
+                    (saved.get("routeVariants") or {}).get(variant_key)
+                    or saved.get("taskPlan")
+                    or {}
+                )
                 model = saved.get("model") or {}
                 routes.append({
                     "taskName": name,
                     "modelId": saved.get("modelId"),
-                    "current": name == current_task_name,
+                    "current": is_current,
+                    "returnToOrigin": return_to_origin,
                     "taskCount": len(task_plan.get("tasks") or []),
                     # Match the real FSM saved-routes response: every named
                     # route carries the area order used to generate its path.
@@ -683,10 +710,11 @@ class ModelingSimulatorController(object):
             return {
                 "routes": routes,
                 "currentTaskName": current_task_name,
+                "currentReturnToOrigin": current_return_to_origin,
             }
         return self._call("simulation saved routes fetched", action)
 
-    def set_current_task(self, task_name):
+    def set_current_task(self, task_name, return_to_origin=True):
         def action():
             name = normalize_task_name(task_name)
             with self._tasks_lock:
@@ -696,10 +724,23 @@ class ModelingSimulatorController(object):
                         "TASK_NOT_FOUND",
                         "saved task does not exist",
                     )
+                variant_key = "return" if return_to_origin else "noReturn"
+                selected_plan = copy.deepcopy(
+                    (saved.get("routeVariants") or {}).get(variant_key) or {}
+                )
+                if not selected_plan.get("tasks"):
+                    raise ModelingSimulatorError(
+                        "ROUTE_VARIANT_NOT_AVAILABLE",
+                        "selected route variant does not exist",
+                    )
                 self._current_task_name = name
-                selected_plan = copy.deepcopy(saved.get("taskPlan") or {})
+                self._current_return_to_origin = bool(return_to_origin)
             self.player.load(selected_plan)
-            return {"taskName": name}
+            return {
+                "taskName": name,
+                "returnToOrigin": bool(return_to_origin),
+                "taskCount": len(selected_plan.get("tasks") or []),
+            }
         return self._call("simulation task selected", action)
 
     def auto_drive(self):
