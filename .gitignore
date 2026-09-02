@@ -1,4 +1,5 @@
 ntrip_config.json
+lan_auth.json
 __pycache__/
 app.log
 modeling_models/

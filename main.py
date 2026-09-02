@@ -115,6 +115,7 @@ from dev_console.state_readers import (
     read_log_lines,
 )
 from modeling_routes import register_modeling_routes
+from lan_cloud_compat import register_lan_cloud_compat_routes
 from modeling_sampler import sample_current_point
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
@@ -9679,6 +9680,23 @@ def listenerRTK():
 
 # mqtt模块
 global_mqtt_integration = None
+
+
+def _get_lan_cloud_command_handler():
+    """Reuse the exact MQTT command router for direct LAN HTTP requests."""
+    integration = global_mqtt_integration
+    return integration.command_handler if integration is not None else None
+
+
+# The LAN facade only translates cloud-compatible HTTP requests.  All motion,
+# modeling and route commands still pass through MQTTCommandHandler and the
+# existing local vehicle/modeling endpoints.
+lan_cloud_compatibility = register_lan_cloud_compat_routes(
+    app,
+    _get_lan_cloud_command_handler,
+)
+
+
 def init_mqtt(redis_client=None):
     """
     初始化MQTT集成（单例模式）
@@ -9812,7 +9830,12 @@ def main():
         _mark_runtime_initialized('初始化完成，已停车待命')
 
         # 启动flask后台服务
-        app.run(host='0.0.0.0', port=7899)
+        # LAN cloud-compatible query endpoints reuse the proven local HTTP
+        # adapter.  Keep Flask threaded so a facade request can call the
+        # existing /vehicle or /modeling endpoint without self-deadlocking.
+        # Modern Flask already defaults to threaded mode; the explicit option
+        # also protects the older Python 2 Flask version used on the Jetson.
+        app.run(host='0.0.0.0', port=7899, threaded=True)
     except Exception as exc:
         _mark_runtime_blocked(
             'INIT_FAILED',
