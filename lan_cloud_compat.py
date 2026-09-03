@@ -368,7 +368,8 @@ class LanCloudCompatibility(object):
 
 def register_lan_cloud_compat_routes(
         app, command_handler_provider, status_store=None, auth_manager=None,
-        device_identity_provider=None):
+        device_identity_provider=None, realtime_position_provider=None,
+        position_history_provider=None):
     """Register cloud-compatible LAN routes on an existing Flask app."""
 
     bridge = LanCloudCompatibility(command_handler_provider, status_store=status_store)
@@ -444,6 +445,74 @@ def register_lan_cloud_compat_routes(
         if data is None:
             data = {}
         return data, None
+
+    def require_local_product(product_id):
+        product_id = validate_product(product_id)
+        identity = local_identity()
+        if not product_id or identity is None or product_id != identity.get('productId'):
+            return None, error_response('设备不存在或不是当前局域网小车', 404)
+        return product_id, None
+
+    def position_number(value):
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def strict_realtime_position(raw):
+        raw = raw if isinstance(raw, dict) else {}
+        ready = bool(raw.get('coordinateReady'))
+        fixed = bool(raw.get('rtkFixAvailable'))
+        x = position_number(raw.get('x')) if ready and fixed else None
+        y = position_number(raw.get('y')) if ready and fixed else None
+        return {
+            'x': x,
+            'y': y,
+            'coordinateReady': ready,
+            'rtkFixAvailable': fixed,
+        }
+
+    @app.route('/api/t-railcar/realtime-position/<string:product_id>', methods=['GET'])
+    def lan_cloud_realtime_position(product_id):
+        product_id, error = require_local_product(product_id)
+        if error is not None:
+            return error
+        try:
+            raw = realtime_position_provider() if callable(realtime_position_provider) else {}
+        except Exception:
+            return error_response('实时位置读取失败', 500)
+        return jsonify({
+            'success': True,
+            'data': strict_realtime_position(raw),
+        })
+
+    @app.route('/api/t-railcar/position-history/<string:product_id>', methods=['GET'])
+    def lan_cloud_position_history(product_id):
+        product_id, error = require_local_product(product_id)
+        if error is not None:
+            return error
+        try:
+            raw = position_history_provider() if callable(position_history_provider) else {}
+        except Exception:
+            return error_response('历史轨迹读取失败', 500)
+        raw = raw if isinstance(raw, dict) else {}
+        points = []
+        for item in raw.get('points') or []:
+            if not isinstance(item, dict):
+                continue
+            x = position_number(item.get('x'))
+            y = position_number(item.get('y'))
+            if x is None or y is None:
+                continue
+            points.append({'x': x, 'y': y})
+        return jsonify({
+            'success': True,
+            'data': {
+                'points': points,
+                'coordinateReady': bool(raw.get('coordinateReady')),
+                'rtkFixAvailable': bool(raw.get('rtkFixAvailable')),
+            },
+        })
 
     @app.route('/api/t-railcar/command', methods=['POST'])
     def lan_cloud_send_command():

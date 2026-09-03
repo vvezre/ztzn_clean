@@ -76,6 +76,132 @@ class ManualSteeringControllerTest(unittest.TestCase):
         finally:
             controller.close()
 
+    def test_rapid_stopped_clicks_ignore_residual_forward_feedback(self):
+        controller, state, events = self._controller("stopped")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "click", "sequence": 1})
+
+            # Mode-4 in-place rotation can temporarily look like positive
+            # longitudinal speed in the lower-machine report.
+            state["motion"] = "forward"
+            first_stop = controller.handle({"action": "hold_stop", "direction": "right", "controlId": "click", "sequence": 6})
+            second_start = controller.handle({"action": "hold_start", "direction": "right", "controlId": "click", "sequence": 1})
+            second_stop = controller.handle({"action": "hold_stop", "direction": "right", "controlId": "click", "sequence": 6})
+            third_start = controller.handle({"action": "hold_start", "direction": "left", "controlId": "click-left", "sequence": 1})
+            third_stop = controller.handle({"action": "hold_stop", "direction": "left", "controlId": "click-left", "sequence": 6})
+
+            self.assertEqual("stopped", first_stop["data"]["motionState"])
+            self.assertEqual("in_place_rotate", second_start["data"]["manualSteeringMode"])
+            self.assertEqual("stopped", second_stop["data"]["motionState"])
+            self.assertEqual("in_place_rotate", third_start["data"]["manualSteeringMode"])
+            self.assertEqual("stopped", third_stop["data"]["motionState"])
+            self.assertEqual([
+                ("rotate", "right"),
+                ("stop_rotate",),
+                ("rotate", "right"),
+                ("stop_rotate",),
+                ("rotate", "left"),
+                ("stop_rotate",),
+            ], events)
+            self.assertFalse(any(event[0] == "trim" for event in events))
+        finally:
+            controller.close()
+
+    def test_many_stopped_left_right_clicks_never_drive_on_signed_residual_speed(self):
+        for residual_motion in ("forward", "reverse"):
+            controller, state, events = self._controller("stopped")
+            try:
+                directions = ("right", "left", "right", "right", "left", "left")
+                for index, direction in enumerate(directions):
+                    control_id = "{}-{}".format(residual_motion, index)
+                    started = controller.handle({
+                        "action": "hold_start",
+                        "direction": direction,
+                        "controlId": control_id,
+                        "sequence": 1,
+                    })
+                    # After the first rotation starts, retain a deliberately
+                    # misleading signed wheel-speed report for every later
+                    # click.  Command intent must still remain stopped.
+                    state["motion"] = residual_motion
+                    stopped = controller.handle({
+                        "action": "hold_stop",
+                        "direction": direction,
+                        "controlId": control_id,
+                        "sequence": 6,
+                    })
+                    self.assertEqual("in_place_rotate", started["data"]["manualSteeringMode"])
+                    self.assertEqual("stopped", stopped["data"]["motionState"])
+
+                self.assertEqual(len(directions) * 2, len(events))
+                self.assertTrue(all(event[0] in ("rotate", "stop_rotate") for event in events))
+                self.assertFalse(any(event[0] == "trim" for event in events))
+            finally:
+                controller.close()
+
+    def test_five_repeated_stopped_clicks_same_direction_never_drive(self):
+        for residual_motion in ("forward", "reverse"):
+            for direction in ("right", "left"):
+                controller, state, events = self._controller("stopped")
+                try:
+                    for index in range(5):
+                        started = controller.handle({
+                            "action": "hold_start",
+                            "direction": direction,
+                            "controlId": "same-button",
+                            "sequence": 1,
+                        })
+                        # Keep reporting misleading signed wheel speed after
+                        # every release, exactly as the real lower machine did.
+                        state["motion"] = residual_motion
+                        stopped = controller.handle({
+                            "action": "hold_stop",
+                            "direction": direction,
+                            "controlId": "same-button",
+                            "sequence": 6,
+                        })
+                        self.assertEqual("in_place_rotate", started["data"]["manualSteeringMode"])
+                        self.assertEqual("stopped", stopped["data"]["motionState"])
+
+                    expected = []
+                    for index in range(5):
+                        expected.extend([("rotate", direction), ("stop_rotate",)])
+                    self.assertEqual(expected, events)
+                    self.assertFalse(any(event[0] == "trim" for event in events))
+                finally:
+                    controller.close()
+
+    def test_explicit_forward_command_releases_stopped_rotation_latch(self):
+        controller, state, events = self._controller("stopped")
+        try:
+            controller.handle({"action": "hold_start", "direction": "right", "controlId": "rotate", "sequence": 1})
+            state["motion"] = "forward"
+            controller.handle({"action": "hold_stop", "direction": "right", "controlId": "rotate", "sequence": 6})
+
+            controller.set_commanded_motion("forward")
+            started = controller.handle({"action": "hold_start", "direction": "right", "controlId": "drive", "sequence": 1})
+            controller.handle({"action": "hold_stop", "direction": "right", "controlId": "drive", "sequence": 6})
+
+            self.assertEqual("forward_trim", started["data"]["manualSteeringMode"])
+            self.assertEqual(("trim", 700, "forward", 350), events[-2])
+            self.assertEqual(("trim", 0, "forward", 350), events[-1])
+        finally:
+            controller.close()
+
+    def test_live_auto_state_overrides_stopped_command_latch(self):
+        controller, state, events = self._controller("stopped")
+        try:
+            controller.set_commanded_motion("stopped")
+            state["motion"] = "auto"
+
+            with self.assertRaises(ManualSteeringError) as blocked:
+                controller.handle({"action": "hold_start", "direction": "right", "controlId": "auto", "sequence": 1})
+
+            self.assertEqual("MANUAL_STEERING_BLOCKED", blocked.exception.code)
+            self.assertEqual([], events)
+        finally:
+            controller.close()
+
     def test_rotation_watchdog_stops_hardware(self):
         controller, state, events = self._controller("stopped", timeout=0.2)
         try:

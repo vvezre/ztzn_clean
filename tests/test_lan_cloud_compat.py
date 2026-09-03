@@ -54,11 +54,28 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
             'serialNumber': '-T01250006',
             'deviceId': '-T01250006',
         }
+        self.realtime_position = {
+            'x': 123,
+            'y': 456,
+            'coordinateReady': True,
+            'rtkFixAvailable': True,
+        }
+        self.position_history = {
+            'points': [
+                {'x': 0, 'y': 0},
+                {'x': 5, 'y': 1},
+                {'x': 11, 'y': 2},
+            ],
+            'coordinateReady': True,
+            'rtkFixAvailable': True,
+        }
         self.bridge = register_lan_cloud_compat_routes(
             self.app,
             lambda: self.handler,
             auth_manager=self.auth_manager,
             device_identity_provider=lambda: self.identity,
+            realtime_position_provider=lambda: self.realtime_position,
+            position_history_provider=lambda: self.position_history,
         )
         self.client = self.app.test_client()
         login = self.client.post('/auth/login', json={
@@ -257,6 +274,45 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
         }
         response = self.client.get('/api/t-railcar/modeling-points/250006')
         self.assertEqual({'points': [{'id': 'p1', 'areaNumber': 1}]}, response.get_json())
+
+    def test_realtime_position_returns_the_exact_frontend_contract(self):
+        response = self.client.get('/api/t-railcar/realtime-position/250006')
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({
+            'success': True,
+            'data': {
+                'x': 123,
+                'y': 456,
+                'coordinateReady': True,
+                'rtkFixAvailable': True,
+            },
+        }, response.get_json())
+
+    def test_position_history_returns_the_exact_frontend_contract(self):
+        response = self.client.get('/api/t-railcar/position-history/250006')
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({
+            'success': True,
+            'data': {
+                'points': [
+                    {'x': 0, 'y': 0},
+                    {'x': 5, 'y': 1},
+                    {'x': 11, 'y': 2},
+                ],
+                'coordinateReady': True,
+                'rtkFixAvailable': True,
+            },
+        }, response.get_json())
+
+    def test_position_routes_require_token_and_local_product(self):
+        wrong_product = self.client.get('/api/t-railcar/realtime-position/999999')
+        self.assertEqual(404, wrong_product.status_code)
+
+        self.client.environ_base.pop('HTTP_AUTHORIZATION', None)
+        unauthorized = self.client.get('/api/t-railcar/position-history/250006')
+        self.assertEqual(401, unauthorized.status_code)
 
     def test_device_status_and_shadow_are_built_from_local_status(self):
         self.handler.results['get_status'] = {

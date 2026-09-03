@@ -18,7 +18,13 @@ import sys
 import threading
 import time
 
+from flask import Flask
+from flask_cors import CORS
+from werkzeug.serving import make_server
+
 from AppLogger import logger
+from lan_cloud_compat import register_lan_cloud_compat_routes
+from lan_local_auth import LocalAuthManager, create_password_record
 from manual_steering import ManualSteeringController, ManualSteeringError
 from modeling_session import ModelingSession, ModelingSessionError
 from modeling_store import ModelingStore
@@ -39,6 +45,9 @@ SIMULATOR_DEVICE_ID = SIMULATOR_PRODUCT_MODEL + SIMULATOR_PRODUCT_ID
 SIMULATOR_ORIGIN_LAT = 32.03647857
 SIMULATOR_ORIGIN_LON = 118.92448993
 EARTH_RADIUS_M = 6371000.0
+SIMULATOR_LAN_USERNAME = "admin"
+SIMULATOR_LAN_PASSWORD = "admin123"
+SIMULATOR_LAN_TOKEN_SECRET = "cleanbot-modeling-simulator-lan-secret-2026"
 
 
 # 固定场景使用最近一次真实双区域建模的相对尺寸和倾斜程度。
@@ -85,6 +94,160 @@ class ModelingSimulatorError(Exception):
         super(ModelingSimulatorError, self).__init__(message)
         self.code = code
         self.message = message
+
+
+class SimulatorPositionHistory(object):
+    """Keep the simulator's latest position and a bounded local trajectory."""
+
+    def __init__(self, controller, max_points=10000, min_distance_cm=3.0):
+        self.controller = controller
+        self.max_points = max(1, int(max_points))
+        self.min_distance_cm = max(0.0, float(min_distance_cm))
+        self._lock = threading.RLock()
+        self._latest = {
+            "x": None,
+            "y": None,
+            "coordinateReady": False,
+            "rtkFixAvailable": False,
+        }
+        self._points = []
+        self._model_id = None
+        self.observe(controller.current_position())
+
+    def _active_model_id(self):
+        try:
+            state = self.controller.session.current()
+            if isinstance(state, dict):
+                return state.get("modelId")
+        except Exception:
+            pass
+        return None
+
+    def _sync_model(self):
+        model_id = self._active_model_id()
+        if model_id == self._model_id:
+            return
+        self._model_id = model_id
+        self._points = []
+
+    @staticmethod
+    def _coordinate(position, local_name, fallback_name):
+        value = position.get(local_name)
+        if value is None:
+            value = position.get(fallback_name)
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def observe(self, position):
+        position = position if isinstance(position, dict) else {}
+        x = self._coordinate(position, "local_x", "x")
+        y = self._coordinate(position, "local_y", "y")
+        ready = x is not None and y is not None
+        with self._lock:
+            self._sync_model()
+            self._latest = {
+                "x": x if ready else None,
+                "y": y if ready else None,
+                "coordinateReady": ready,
+                "rtkFixAvailable": ready,
+            }
+            if not ready:
+                return
+            point = {"x": x, "y": y}
+            if self._points:
+                previous = self._points[-1]
+                distance = math.hypot(x - previous["x"], y - previous["y"])
+                if distance < self.min_distance_cm:
+                    return
+            self._points.append(point)
+            if len(self._points) > self.max_points:
+                self._points = self._points[-self.max_points:]
+
+    def realtime(self):
+        self.observe(self.controller.current_position())
+        with self._lock:
+            return dict(self._latest)
+
+    def history(self):
+        self.observe(self.controller.current_position())
+        with self._lock:
+            return {
+                "points": [dict(point) for point in self._points],
+                "coordinateReady": bool(self._latest.get("coordinateReady")),
+                "rtkFixAvailable": bool(self._latest.get("rtkFixAvailable")),
+            }
+
+
+def simulator_device_identity():
+    return {
+        "id": 1,
+        "productId": SIMULATOR_PRODUCT_ID,
+        "productType": SIMULATOR_PRODUCT_MODEL,
+        "productModel": SIMULATOR_PRODUCT_MODEL,
+        "companyCode": SIMULATOR_COMPANY_CODE,
+        "serialNumber": SIMULATOR_DEVICE_ID,
+        "deviceId": SIMULATOR_DEVICE_ID,
+    }
+
+
+def build_simulator_auth_manager():
+    return LocalAuthManager(config={
+        "tokenSecret": SIMULATOR_LAN_TOKEN_SECRET,
+        "users": [{
+            "userId": 1,
+            "username": SIMULATOR_LAN_USERNAME,
+            "passwordHash": create_password_record(SIMULATOR_LAN_PASSWORD),
+            "realName": "模拟器管理员",
+            "roleId": 1,
+            "roleName": "admin",
+            "permissions": [],
+            "status": "enable",
+        }],
+    })
+
+
+def build_simulator_lan_app(controller, command_handler=None, position_history=None,
+                            auth_manager=None):
+    """Build the cloud-compatible LAN API used by the local frontend."""
+    app = Flask("cleanbot_modeling_simulator_lan")
+    CORS(app)
+    position_history = position_history or SimulatorPositionHistory(controller)
+    command_handler = command_handler or MQTTCommandHandler(controller)
+    register_lan_cloud_compat_routes(
+        app,
+        lambda: command_handler,
+        auth_manager=auth_manager or build_simulator_auth_manager(),
+        device_identity_provider=simulator_device_identity,
+        realtime_position_provider=position_history.realtime,
+        position_history_provider=position_history.history,
+    )
+    app.config["SIMULATOR_POSITION_HISTORY"] = position_history
+    return app
+
+
+class ModelingSimulatorLanServer(object):
+    """Run the simulator LAN facade without blocking MQTT playback."""
+
+    def __init__(self, app, host="0.0.0.0", port=7899):
+        self.host = host
+        self.port = int(port)
+        self._server = make_server(self.host, self.port, app, threaded=True)
+        self._thread = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._server.serve_forever)
+        self._thread.daemon = True
+        self._thread.start()
+
+    def stop(self):
+        self._server.shutdown()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._server.server_close()
 
 
 def xy_to_lat_lon(x, y, origin_lat=SIMULATOR_ORIGIN_LAT, origin_lon=SIMULATOR_ORIGIN_LON):
@@ -745,21 +908,25 @@ class ModelingSimulatorController(object):
 
     def auto_drive(self):
         self.manual_steering_controller.reset(send_hardware=False)
+        self.manual_steering_controller.set_commanded_motion("stopped")
         self._sim_motion_state = "stopped"
         return self._call("simulation path playback started", self.player.start)
 
     def drive(self, distance=0, speed=None):
         self.manual_steering_controller.reset(send_hardware=False)
+        self.manual_steering_controller.set_commanded_motion("forward")
         self._sim_motion_state = "forward"
         return self._success("simulation forward motion started")
 
     def back(self, distance=0, speed=None):
         self.manual_steering_controller.reset(send_hardware=False)
+        self.manual_steering_controller.set_commanded_motion("reverse")
         self._sim_motion_state = "reverse"
         return self._success("simulation reverse motion started")
 
     def stop(self):
         self.manual_steering_controller.reset(send_hardware=False)
+        self.manual_steering_controller.set_commanded_motion("stopped")
         self._sim_motion_state = "stopped"
         return self._call("simulation path playback paused", self.player.pause)
 
@@ -769,6 +936,7 @@ class ModelingSimulatorController(object):
     def parking(self):
         def action():
             self.manual_steering_controller.reset(send_hardware=False)
+            self.manual_steering_controller.set_commanded_motion("stopped")
             self._sim_motion_state = "stopped"
             self.player.cancel()
             return self.player.snapshot()
@@ -826,7 +994,7 @@ class ModelingSimulatorController(object):
 
 
 class ModelingSimulatorMQTTService(object):
-    def __init__(self, config, controller, mqtt_client=None):
+    def __init__(self, config, controller, mqtt_client=None, position_observers=None):
         self.config = build_simulator_mqtt_config(config)
         self.controller = controller
         if mqtt_client is None:
@@ -841,10 +1009,19 @@ class ModelingSimulatorMQTTService(object):
         self.mqtt_client = mqtt_client
         self.command_handler = MQTTCommandHandler(controller)
         self.mqtt_client.set_message_callback(self._on_message)
-        self.controller.set_position_callback(self.publish_position)
+        self.position_observers = list(position_observers or [])
+        self.controller.set_position_callback(self._publish_and_observe_position)
         self.status_interval = float(self.config.get("mqtt", {}).get("status_interval", 2))
         self.running = False
         self.status_thread = None
+
+    def _publish_and_observe_position(self, position):
+        for observer in self.position_observers:
+            try:
+                observer(dict(position))
+            except Exception as error:
+                logger.warning("Simulator position observer failed: {}".format(str(error)))
+        return self.publish_position(position)
 
     def _publish_ack(self, message):
         self.mqtt_client.publish_status({
@@ -943,6 +1120,9 @@ def main(argv=None):
     parser.add_argument("--data-dir", default="modeling_simulator_data", help="simulator-only data root")
     parser.add_argument("--step-cm", type=float, default=25.0, help="playback position spacing in cm")
     parser.add_argument("--interval", type=float, default=0.2, help="playback publish interval in seconds")
+    parser.add_argument("--lan-host", default="0.0.0.0", help="LAN HTTP listen address")
+    parser.add_argument("--lan-port", type=int, default=7899, help="LAN HTTP listen port")
+    parser.add_argument("--no-lan", action="store_true", help="disable the simulator LAN HTTP API")
     parser.add_argument(
         "--preload",
         action="store_true",
@@ -964,7 +1144,20 @@ def main(argv=None):
                 "SIMULATOR_PRELOAD_FAILED",
                 preload_result.get("message") or "simulator scenario preload failed",
             )
-    service = ModelingSimulatorMQTTService(config, controller)
+    position_history = SimulatorPositionHistory(controller)
+    service = ModelingSimulatorMQTTService(
+        config,
+        controller,
+        position_observers=[position_history.observe],
+    )
+    lan_server = None
+    if not args.no_lan:
+        lan_app = build_simulator_lan_app(
+            controller,
+            command_handler=service.command_handler,
+            position_history=position_history,
+        )
+        lan_server = ModelingSimulatorLanServer(lan_app, args.lan_host, args.lan_port)
 
     print("=" * 68)
     print("MODELING SIMULATOR ONLY - NO HARDWARE CONTROL")
@@ -973,6 +1166,13 @@ def main(argv=None):
     print("publish: {}".format(config["topics"]["publish"]))
     print("data: {}".format(run_dir))
     print("preloaded: {}".format(bool(args.preload)))
+    if lan_server is not None:
+        print("LAN API: http://<computer-lan-ip>:{}".format(args.lan_port))
+        print("LAN login: {}/{}".format(SIMULATOR_LAN_USERNAME, SIMULATOR_LAN_PASSWORD))
+        print("realtime: /api/t-railcar/realtime-position/{}".format(SIMULATOR_PRODUCT_ID))
+        print("history: /api/t-railcar/position-history/{}".format(SIMULATOR_PRODUCT_ID))
+    else:
+        print("LAN API: disabled")
     print("Press Ctrl+C to stop")
     print("=" * 68)
 
@@ -988,6 +1188,8 @@ def main(argv=None):
     except ValueError:
         pass
 
+    if lan_server is not None:
+        lan_server.start()
     service.start()
     try:
         while not stopped.wait(0.5):
@@ -996,6 +1198,8 @@ def main(argv=None):
         pass
     finally:
         service.stop()
+        if lan_server is not None:
+            lan_server.stop()
     return 0
 
 

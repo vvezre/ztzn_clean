@@ -116,6 +116,7 @@ from dev_console.state_readers import (
 )
 from modeling_routes import register_modeling_routes
 from lan_cloud_compat import register_lan_cloud_compat_routes
+from position_history import ModelingPositionHistory
 from modeling_sampler import sample_current_point
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
@@ -3298,6 +3299,7 @@ modeling_store = register_modeling_routes(app,
     task_stop_handler=_stop_modeling_task_runtime,
     task_save_handler=_save_modeling_task,
 )
+modeling_position_history = ModelingPositionHistory(MODELING_STORE_DIR)
 
 
 @app.route("/vehicle/login", methods=['POST'])
@@ -5107,7 +5109,7 @@ def correctByRTK():
 # 急停
 @app.route("/vehicle/parking", methods=['GET'])
 def parking():
-    _reset_manual_steering(send_hardware=False)
+    _reset_manual_steering(send_hardware=False, commanded_motion='stopped')
     _request_runtime_stop('manual_parking', clear_auto_task=True, update_runtime=True,
                           message='已执行停车指令')
     response = make_response("1")
@@ -5117,6 +5119,7 @@ def parking():
 
 def doParking(update_runtime=True, message='任务已停止并进入停车状态'):
     global global_pointToPoint_flag, global_go
+    _reset_manual_steering(send_hardware=False, commanded_motion='stopped')
     redis_cli.set("ultraSonic", "false")
     redis_cli.set('action', 'false')
     redis_cli.set("correct", "false")
@@ -6954,7 +6957,7 @@ def turnCheckPoint(originHeading):
 # 前进
 @app.route("/vehicle/drive", methods=['GET'])
 def driving():
-    _reset_manual_steering(send_hardware=False)
+    _reset_manual_steering(send_hardware=False, commanded_motion='forward')
     redis_cli.set("correct", "false")
     redis_cli.set("reverse", "false")
     forward_speed = int(redis_cli.get("forwardSpeed"))
@@ -6998,7 +7001,7 @@ def drive():
 # 后退
 @app.route("/vehicle/back", methods=['GET'])
 def reverse():
-    _reset_manual_steering(send_hardware=False)
+    _reset_manual_steering(send_hardware=False, commanded_motion='reverse')
     redis_cli.set("correct", "false")
     redis_cli.set('reverse', 'true')
     redis_cli.set('action', 'true')
@@ -7350,6 +7353,17 @@ def joystick_move(distance, dirX, dirY):
         response = make_response("1")
         return response
 
+    # The joystick is another explicit source of manual travel intent.  Keep
+    # the steering state machine synchronized without relying on transient
+    # wheel-speed feedback from the lower machine.
+    if floatY > 0.2:
+        joystick_motion = 'forward'
+    elif floatY < -0.2:
+        joystick_motion = 'reverse'
+    else:
+        joystick_motion = 'stopped'
+    _reset_manual_steering(send_hardware=False, commanded_motion=joystick_motion)
+
     forwardSpeed = int(intDistance / 50 * 250)
     brushSpeed = int(redis_cli.get('brushSpeed'))
     setBrushSpeed(brushSpeed)
@@ -7669,10 +7683,14 @@ def _get_manual_steering_controller():
         return manual_steering_controller
 
 
-def _reset_manual_steering(send_hardware=False):
+def _reset_manual_steering(send_hardware=False, commanded_motion=None):
     controller = manual_steering_controller
+    if commanded_motion is not None and controller is None:
+        controller = _get_manual_steering_controller()
     if controller is not None:
         controller.reset(send_hardware=send_hardware)
+        if commanded_motion is not None:
+            controller.set_commanded_motion(commanded_motion)
 
 
 def _manual_steering_status_snapshot(live_speed=None, control_state=None, fault_state=None):
@@ -9682,6 +9700,44 @@ def listenerRTK():
 global_mqtt_integration = None
 
 
+def _update_modeling_position_history(lat=None, lon=None, force_context=False):
+    """Feed the read-only LAN position cache from the latest RTK snapshot."""
+    if lat is None:
+        lat = global_cur_rtk_lat
+    if lon is None:
+        lon = global_cur_rtk_lon
+    rtk_detail = _build_rtk_runtime_detail()
+    return modeling_position_history.update(
+        lat,
+        lon,
+        bool(rtk_detail.get('rtkFixAvailable')),
+        force_context=force_context,
+    )
+
+
+def _get_lan_realtime_position():
+    return _update_modeling_position_history(force_context=True)
+
+
+def _get_lan_position_history():
+    _update_modeling_position_history(force_context=True)
+    return modeling_position_history.history()
+
+
+def _modeling_position_history_loop():
+    """Sample RTK for the UI without blocking the RTK correction callback."""
+    last_error_at = 0.0
+    while True:
+        try:
+            _update_modeling_position_history()
+        except Exception as e:
+            now = time.time()
+            if now - last_error_at >= 10.0:
+                logger.warning("更新建模实时位置失败: {}".format(str(e)))
+                last_error_at = now
+        time.sleep(0.2)
+
+
 def _get_lan_cloud_command_handler():
     """Reuse the exact MQTT command router for direct LAN HTTP requests."""
     integration = global_mqtt_integration
@@ -9694,6 +9750,8 @@ def _get_lan_cloud_command_handler():
 lan_cloud_compatibility = register_lan_cloud_compat_routes(
     app,
     _get_lan_cloud_command_handler,
+    realtime_position_provider=_get_lan_realtime_position,
+    position_history_provider=_get_lan_position_history,
 )
 
 
@@ -9802,6 +9860,12 @@ def main():
         watchdog_thread.start()
         listener_rtk_thread = threading.Thread(target=listenerRTK)
         listener_rtk_thread.start()
+
+        # UI-only position sampling is isolated from the RTK observer so file
+        # persistence and frontend reads cannot delay steering correction.
+        position_history_thread = threading.Thread(target=_modeling_position_history_loop)
+        position_history_thread.daemon = True
+        position_history_thread.start()
 
         # 向服务器发送心跳值
         # sendHearbeatThread = threading.Thread(target=sendHeartbeat)

@@ -54,6 +54,12 @@ class ManualSteeringController(object):
         # Reading live wheel feedback on every frame makes the speed ratchet
         # down because a diagonal command naturally reports a lower X speed.
         self._travel_speed = None
+        # The lower machine can briefly report a signed longitudinal speed
+        # after an in-place joystick rotation has already been released.  The
+        # signed value describes wheel feedback, not a new forward/reverse
+        # command.  Keep the last explicit manual travel command separately so
+        # rapid left/right clicks while parked can never start straight travel.
+        self._commanded_motion = None
         # A frontend/network retry may deliver keepalive after hold_stop.  Keep
         # a small bounded tombstone set so such frames can never revive a
         # released gesture.  A new explicit hold_start removes its tombstone.
@@ -83,8 +89,28 @@ class ManualSteeringController(object):
             return 'unknown'
         return self._text(value).lower() or 'unknown'
 
+    def _resolved_motion_locked(self):
+        """Resolve a new gesture from command intent plus live safety state."""
+        live_motion = self._motion()
+        # Automatic control, a fault, an unknown state, or a real lower-machine
+        # turn must always win over the manual command latch.
+        if live_motion in ('auto', 'fault', 'unknown', 'turning'):
+            return live_motion
+        if self._commanded_motion in ('forward', 'reverse', 'stopped'):
+            return self._commanded_motion
+        return live_motion
+
+    def set_commanded_motion(self, motion_state):
+        """Record an explicit forward/reverse/stop command from the host."""
+        motion = self._text(motion_state).lower()
+        if motion not in ('forward', 'reverse', 'stopped'):
+            raise ValueError('commanded motion must be forward, reverse, or stopped')
+        with self._lock:
+            self._commanded_motion = motion
+        self._notify_state()
+
     def _snapshot_locked(self, motion_state=None):
-        motion = motion_state or self._motion()
+        motion = motion_state or self._resolved_motion_locked()
         if self._mode == 'in_place_rotate':
             motion = 'turning'
         return {
@@ -233,7 +259,8 @@ class ManualSteeringController(object):
         worker.start()
 
     def _tap(self, direction, control_id, sequence):
-        motion = self._motion()
+        with self._lock:
+            motion = self._resolved_motion_locked()
         if motion == 'stopped':
             raise ManualSteeringError(
                 'TAP_REQUIRES_MOVEMENT',
@@ -261,6 +288,8 @@ class ManualSteeringController(object):
             elif self._mode != 'none':
                 raise ManualSteeringError('CONTROL_SESSION_ACTIVE', 'another manual steering hold is active')
             self._apply_moving_direction_locked(direction, motion)
+            if self._commanded_motion is None:
+                self._commanded_motion = motion
             self._mode = '{}_tap'.format(motion)
             self._direction = direction
             self._control_id = control_id
@@ -315,7 +344,7 @@ class ManualSteeringController(object):
                     return self._response('in-place rotation direction switched')
                 raise ManualSteeringError('CONTROL_SESSION_ACTIVE', 'another manual steering hold is active')
 
-            motion = self._motion()
+            motion = self._resolved_motion_locked()
             if motion not in ('forward', 'reverse', 'stopped'):
                 raise ManualSteeringError(
                     'MANUAL_STEERING_BLOCKED',
@@ -324,9 +353,15 @@ class ManualSteeringController(object):
             if motion == 'stopped':
                 self.start_rotation(direction)
                 self._mode = 'in_place_rotate'
+                # Retain the stopped command intent after release.  Residual
+                # positive wheel feedback from this rotation must not turn the
+                # next rapid click into a forward-diagonal command.
+                self._commanded_motion = 'stopped'
             else:
                 self._apply_moving_direction_locked(direction, motion)
                 self._mode = '{}_trim'.format(motion)
+                if self._commanded_motion is None:
+                    self._commanded_motion = motion
             self._direction = direction
             self._control_id = control_id
             self._last_sequence = sequence
@@ -344,7 +379,7 @@ class ManualSteeringController(object):
                 # Be tolerant of a lost/delayed hold_start: the first orphan
                 # keepalive can establish the hold, but never after a known
                 # hold_stop for the same controlId.
-                motion = self._motion()
+                motion = self._resolved_motion_locked()
                 if motion not in ('forward', 'reverse', 'stopped'):
                     raise ManualSteeringError(
                         'MANUAL_STEERING_BLOCKED',
@@ -353,9 +388,12 @@ class ManualSteeringController(object):
                 if motion == 'stopped':
                     self.start_rotation(direction)
                     self._mode = 'in_place_rotate'
+                    self._commanded_motion = 'stopped'
                 else:
                     self._apply_moving_direction_locked(direction, motion)
                     self._mode = '{}_trim'.format(motion)
+                    if self._commanded_motion is None:
+                        self._commanded_motion = motion
                 self._direction = direction
                 self._control_id = control_id
                 self._last_sequence = sequence
