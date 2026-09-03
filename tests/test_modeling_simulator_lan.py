@@ -12,8 +12,12 @@ from modeling_simulator import (
 class ModelingSimulatorLanTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
+        self.clock = [100.0]
         self.controller = ModelingSimulatorController(self.directory.name, now=lambda: 1000)
-        self.history = SimulatorPositionHistory(self.controller)
+        self.history = SimulatorPositionHistory(
+            self.controller,
+            now=lambda: self.clock[0],
+        )
         self.app = build_simulator_lan_app(
             self.controller,
             position_history=self.history,
@@ -61,9 +65,14 @@ class ModelingSimulatorLanTests(unittest.TestCase):
 
     def test_history_records_simulator_playback_positions(self):
         client = self._authorized_client()
+        self.assertEqual(1.0, self.history.history_interval)
+        self.assertEqual(1500, self.history.max_points)
         self.controller._on_playback_position({'local_x': 5, 'local_y': 1})
         self.history.observe(self.controller.current_position())
+        self.clock[0] += 1.0
+        self.history.observe(self.controller.current_position())
         self.controller._on_playback_position({'local_x': 11, 'local_y': 2})
+        self.clock[0] += 1.0
         self.history.observe(self.controller.current_position())
         response = client.get('/api/t-railcar/position-history/999999')
         self.assertEqual(200, response.status_code)

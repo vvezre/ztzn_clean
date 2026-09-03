@@ -84,6 +84,34 @@ class ModelingPositionHistoryTests(unittest.TestCase):
             self.assertEqual(0, second["y"])
             self.assertEqual([{"x": 0, "y": 0}, {"x": 10, "y": 0}], tracker.history()["points"])
 
+    def test_default_history_policy_is_one_second_and_1500_points(self):
+        with temporary_directory() as root:
+            lat = 32.0364
+            lon = 118.9244
+            self._write_model(root, points=[{
+                "id": "p1", "lat": lat, "lon": lon,
+            }])
+            clock = [100.0]
+            tracker = ModelingPositionHistory(
+                root,
+                now=lambda: clock[0],
+                flush_interval=0.0,
+            )
+            self.assertEqual(1.0, tracker.history_interval)
+            self.assertEqual(1500, tracker.max_points)
+
+            tracker.update(lat, lon, True, force_context=True)
+            clock[0] += 0.9
+            tracker.update(lat, lon + longitude_offset_cm(lat, 10), True)
+            self.assertEqual([{"x": 0, "y": 0}], tracker.history()["points"])
+
+            clock[0] += 0.1
+            tracker.update(lat, lon + longitude_offset_cm(lat, 20), True)
+            self.assertEqual(
+                [{"x": 0, "y": 0}, {"x": 20, "y": 0}],
+                tracker.history()["points"],
+            )
+
     def test_missing_first_area_point_returns_not_ready_and_saves_nothing(self):
         with temporary_directory() as root:
             self._write_model(root, points=[])
@@ -156,4 +184,3 @@ class ModelingPositionHistoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

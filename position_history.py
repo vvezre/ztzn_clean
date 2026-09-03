@@ -57,8 +57,8 @@ def _file_signature(path):
 class ModelingPositionHistory(object):
     """Track the active modeling session in its own x/y coordinate frame."""
 
-    def __init__(self, modeling_root, now=None, max_points=10000,
-                 history_interval=0.2, minimum_distance_cm=3.0,
+    def __init__(self, modeling_root, now=None, max_points=1500,
+                 history_interval=1.0, minimum_distance_cm=3.0,
                  flush_interval=2.0):
         self.modeling_root = os.path.abspath(modeling_root)
         self.state_path = os.path.join(self.modeling_root, "active_session.json")
@@ -324,4 +324,3 @@ class ModelingPositionHistory(object):
                 "coordinateReady": bool(self._latest.get("coordinateReady")),
                 "rtkFixAvailable": bool(self._latest.get("rtkFixAvailable")),
             }
-

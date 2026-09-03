@@ -99,10 +99,13 @@ class ModelingSimulatorError(Exception):
 class SimulatorPositionHistory(object):
     """Keep the simulator's latest position and a bounded local trajectory."""
 
-    def __init__(self, controller, max_points=10000, min_distance_cm=3.0):
+    def __init__(self, controller, max_points=1500, history_interval=1.0,
+                 min_distance_cm=3.0, now=None):
         self.controller = controller
         self.max_points = max(1, int(max_points))
+        self.history_interval = max(0.0, float(history_interval))
         self.min_distance_cm = max(0.0, float(min_distance_cm))
+        self._now = now or time.time
         self._lock = threading.RLock()
         self._latest = {
             "x": None,
@@ -112,6 +115,7 @@ class SimulatorPositionHistory(object):
         }
         self._points = []
         self._model_id = None
+        self._last_history_at = None
         self.observe(controller.current_position())
 
     def _active_model_id(self):
@@ -129,6 +133,7 @@ class SimulatorPositionHistory(object):
             return
         self._model_id = model_id
         self._points = []
+        self._last_history_at = None
 
     @staticmethod
     def _coordinate(position, local_name, fallback_name):
@@ -145,6 +150,7 @@ class SimulatorPositionHistory(object):
         x = self._coordinate(position, "local_x", "x")
         y = self._coordinate(position, "local_y", "y")
         ready = x is not None and y is not None
+        now = float(self._now())
         with self._lock:
             self._sync_model()
             self._latest = {
@@ -155,6 +161,10 @@ class SimulatorPositionHistory(object):
             }
             if not ready:
                 return
+            if (
+                    self._last_history_at is not None
+                    and now - self._last_history_at < self.history_interval):
+                return
             point = {"x": x, "y": y}
             if self._points:
                 previous = self._points[-1]
@@ -162,6 +172,7 @@ class SimulatorPositionHistory(object):
                 if distance < self.min_distance_cm:
                     return
             self._points.append(point)
+            self._last_history_at = now
             if len(self._points) > self.max_points:
                 self._points = self._points[-self.max_points:]
 
