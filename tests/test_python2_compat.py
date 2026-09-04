@@ -13,6 +13,7 @@ FILES_TO_CHECK = (
     "lan_cloud_compat.py",
     "lan_local_auth.py",
     "configure_lan_auth.py",
+    "position_history.py",
 )
 ANNOTATION_RE = re.compile(r"^\s*def\s+\w+\s*\([^)]*:\s*[^)]*\)", re.MULTILINE)
 FSTRING_RE = re.compile(r"(^|[^A-Za-z0-9_])([fF][rRbBuU]{0,2}|[rRbBuU]{0,2}[fF])(['\"])", re.MULTILINE)

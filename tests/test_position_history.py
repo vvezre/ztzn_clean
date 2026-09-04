@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 
-from position_history import ModelingPositionHistory
+from position_history import ModelingPositionHistory, history_capture_metadata
 
 
 @contextmanager
@@ -39,6 +39,9 @@ class ModelingPositionHistoryTests(unittest.TestCase):
         write_json(os.path.join(root, "active_session.json"), {
             "status": "recording",
             "modelId": model_id,
+            "currentGroupId": "g1",
+            "captureMode": None,
+            "currentPointType": "area",
         })
         write_json(os.path.join(root, "drafts", model_id + ".json"), {
             "id": model_id,
@@ -46,9 +49,126 @@ class ModelingPositionHistoryTests(unittest.TestCase):
                 "id": "g1",
                 "areaNumber": 1,
                 "points": list(points or []),
-            }],
-            "groupLinks": [],
+            }, {"id": "g2", "areaNumber": 2, "points": []},
+                {"id": "g3", "areaNumber": 3, "points": []}],
+            "groupLinks": [{"id": "bridge1", "linkNumber": 1, "points": []}],
         })
+
+    def _switch_capture(self, root, area=1, link=None, status="recording"):
+        # Atomic replacement also mirrors ModelingSession._write_state.
+        path = os.path.join(root, "active_session.json")
+        with io.open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        state.update({"currentGroupId": "g{}".format(area),
+                      "currentLinkId": None, "pendingLinkNumber": link,
+                      "captureMode": "link" if link else None,
+                      "currentPointType": "link" if link else "area", "status": status})
+        write_json(path + ".tmp", state)
+        os.replace(path + ".tmp", path)
+
+    def test_area_queries_exclude_bridges_and_keep_one_global_frame(self):
+        with temporary_directory() as root:
+            self._write_model(root, points=[{"id": "p1", "lat": 32.0, "lon": 118.0}])
+            clock = [100.0]
+            tracker = ModelingPositionHistory(root, now=lambda: clock[0], flush_interval=0)
+
+            def sample(x):
+                tracker.update(32.0, 118.0 + longitude_offset_cm(32.0, x), True, force_context=True)
+                clock[0] += 1
+
+            sample(0)
+            sample(10)
+            self._switch_capture(root, link=1)
+            sample(20)  # Includes the interval before the first bridge point.
+            self._switch_capture(root, area=2)
+            sample(30)
+            sample(40)
+            self._switch_capture(root, area=2, link=2)
+            sample(50)
+            self._switch_capture(root, area=3)
+            sample(60)
+            self._switch_capture(root, area=3, status="ready")
+            sample(70)  # Preview/execution positions are not area-recording points.
+            self.assertEqual([{"x": x, "y": 0} for x in (0, 10)], tracker.history(1)["points"])
+            self.assertEqual([{"x": x, "y": 0} for x in (30, 40)], tracker.history(2)["points"])
+            self.assertEqual([{"x": 60, "y": 0}], tracker.history(3)["points"])
+            self.assertEqual([], tracker.history(4)["points"])
+            self.assertEqual([{"x": x, "y": 0} for x in range(0, 80, 10)], tracker.history()["points"])
+            restarted = ModelingPositionHistory(root, now=lambda: clock[0])
+            restarted.update(32, 118, False, force_context=True)
+            for area in (1, 2, 3):
+                self.assertEqual(tracker.history(area)["points"], restarted.history(area)["points"])
+
+    def test_area_switch_obeys_global_interval_but_keeps_same_position_in_new_area(self):
+        with temporary_directory() as root:
+            self._write_model(root, points=[{"id": "p1", "lat": 32, "lon": 118}])
+            clock = [100.0]
+            tracker = ModelingPositionHistory(root, now=lambda: clock[0])
+            tracker.update(32, 118, True, force_context=True)
+            self._switch_capture(root, area=2)
+            clock[0] += 0.9
+            tracker.update(32, 118, True, force_context=True)
+            self.assertEqual([], tracker.history(2)["points"])
+            clock[0] += 0.1
+            tracker.update(32, 118, True, force_context=True)
+            self.assertEqual([{"x": 0, "y": 0}], tracker.history(2)["points"])
+            clock[0] += 1
+            tracker.update(32, 118 + longitude_offset_cm(32, 2), True)
+            self.assertEqual(2, len(tracker.history()["points"]))
+            tracker.update(32, 118 + longitude_offset_cm(32, 10), False)
+            self.assertEqual(1, len(tracker.history(2)["points"]))
+            self.assertFalse(tracker.history(2)["rtkFixAvailable"])
+
+    def test_history_cap_is_shared_across_all_areas(self):
+        with temporary_directory() as root:
+            self._write_model(root, points=[{"id": "p1", "lat": 32, "lon": 118}])
+            clock = [100.0]
+            tracker = ModelingPositionHistory(root, now=lambda: clock[0], max_points=3)
+            for index in range(5):
+                self._switch_capture(root, area=1 if index < 3 else 2)
+                tracker.update(32, 118 + longitude_offset_cm(32, index * 10), True, force_context=True)
+                clock[0] += 1
+            self.assertEqual(3, len(tracker.history()["points"]))
+            self.assertEqual([{"x": 20, "y": 0}], tracker.history(1)["points"])
+            self.assertEqual([{"x": 30, "y": 0}, {"x": 40, "y": 0}], tracker.history(2)["points"])
+
+    def test_new_model_does_not_expose_old_area_history(self):
+        with temporary_directory() as root:
+            origin = [{"id": "p1", "lat": 32, "lon": 118}]
+            self._write_model(root, points=origin)
+            tracker = ModelingPositionHistory(root, now=lambda: 100)
+            tracker.update(32, 118, True, force_context=True)
+            self.assertEqual(1, len(tracker.history(1)["points"]))
+            self._write_model(root, model_id="model-2", points=[])
+            tracker.update(32, 118, True, force_context=True)
+            self.assertEqual([], tracker.history()["points"])
+            self.assertEqual([], tracker.history(1)["points"])
+            self.assertFalse(tracker.history(1)["coordinateReady"])
+
+    def test_legacy_points_are_not_guessed_into_an_area(self):
+        with temporary_directory() as root:
+            self._write_model(root, points=[{"id": "p1", "lat": 32, "lon": 118}])
+            tracker = ModelingPositionHistory(root, now=lambda: 100)
+            tracker.update(32, 118, True, force_context=True)
+            tracker.history()
+            path = os.path.join(root, "position_history", "model-1.json")
+            with io.open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload.update({"version": 1, "points": [{"x": 10, "y": 5}]})
+            write_json(path, payload)
+            restarted = ModelingPositionHistory(root, now=lambda: 101)
+            restarted.update(32, 118, False, force_context=True)
+            self.assertEqual([{"x": 10, "y": 5}], restarted.history()["points"])
+            self.assertEqual([], restarted.history(1)["points"])
+
+    def test_capture_mode_wins_over_last_edited_point_type(self):
+        draft = {"groups": [{"id": "g2", "areaNumber": 2}],
+                 "groupLinks": [{"id": "l1", "linkNumber": 1}]}
+        state = {"status": "recording", "currentGroupId": "g2", "captureMode": None,
+                 "currentPointType": "link"}
+        self.assertEqual({"pointType": "area", "areaNumber": 2}, history_capture_metadata(state, draft))
+        state.update({"captureMode": "link", "currentPointType": "area", "currentLinkId": "l1"})
+        self.assertEqual({"pointType": "link", "linkNumber": 1}, history_capture_metadata(state, draft))
 
     def test_fixed_rtk_uses_first_area_point_frame_and_builds_history(self):
         with temporary_directory() as root:

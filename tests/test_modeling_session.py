@@ -41,6 +41,70 @@ class ModelingSessionTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
 
+    def test_start_after_process_reload_drops_unfinished_multi_area_capture(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+        from position_history import ModelingPositionHistory
+
+        store = ModelingStore(self.tmpdir, now=lambda: 1000)
+        provider = _PointProvider([
+            _point("a1", 0, 0), _point("a2", 0, 200),
+            _point("a3", 400, 200), _point("a4", 400, 0),
+            _point("l1", 0, 220), _point("l2", 0, 280),
+            _point("b1", 0, 300),
+        ])
+        session = ModelingSession(store, provider, now=lambda: 1000)
+        old = session.start("yesterday")
+        for _ in range(4):
+            session.record_area_point()
+        session.new_link()
+        session.record_link_point()
+        session.record_link_point()
+        session.new_area()
+        session.record_area_point()
+        old_draft = store.get_draft(old["modelId"])
+        history = ModelingPositionHistory(self.tmpdir)
+        history.update(32.0, 118.0, True, force_context=True)
+        self.assertTrue(history.history()["points"])
+
+        reloaded = ModelingSession(store, _PointProvider([_point("today", 100, 100)]), now=lambda: 87400)
+        self.assertEqual(old["modelId"], reloaded.current()["modelId"])
+        fresh = reloaded.start("today")
+        self.assertNotEqual(old["modelId"], fresh["modelId"])
+        self.assertEqual("recording", fresh["status"])
+        self.assertEqual(1, fresh["currentAreaNumber"])
+        self.assertEqual(1, fresh["groupCount"])
+        self.assertEqual(0, fresh["totalAreaPointCount"])
+        self.assertEqual(0, fresh["totalLinkPointCount"])
+        self.assertIsNone(fresh["currentLinkNumber"])
+        draft = store.get_draft(fresh["modelId"])
+        self.assertEqual([], draft.get("captureSequence") or [])
+        self.assertIsNone(draft.get("taskPlan"))
+        self.assertIsNone(draft.get("taskPreview"))
+        current_position = history.update(32.0, 118.0, True, force_context=True)
+        self.assertFalse(current_position["coordinateReady"])
+        self.assertIsNone(current_position["x"])
+        self.assertEqual([], history.history()["points"])
+        self.assertEqual([], history.history(2)["points"])
+        self.assertEqual(old_draft, store.get_draft(old["modelId"]))
+        point = reloaded.record_area_point()
+        self.assertEqual(1, point["pointNo"])
+        self.assertEqual(1, point["point"]["areaNumber"])
+
+    def test_each_start_is_fresh_even_with_legacy_restart_false(self):
+        from modeling_session import ModelingSession
+        from modeling_store import ModelingStore
+
+        session = ModelingSession(ModelingStore(self.tmpdir),
+                                  _PointProvider([_point("p{}".format(i), i * 100, 0) for i in range(4)]))
+        previous = session.start()
+        for kwargs in ({}, {"restart": False}, {"restart": True}):
+            session.record_area_point()
+            fresh = session.start(**kwargs)
+            self.assertNotEqual(previous["modelId"], fresh["modelId"])
+            self.assertEqual(0, fresh["totalAreaPointCount"])
+            previous = fresh
+
     def test_start_record_finish_and_reload_current_path(self):
         from modeling_session import ModelingSession
         from modeling_store import ModelingStore

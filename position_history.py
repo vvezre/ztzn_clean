@@ -23,7 +23,55 @@ from modeling_coordinates import find_model_origin, lat_lon_to_model_xy_cm
 
 
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-HISTORY_SCHEMA_VERSION = 1
+HISTORY_SCHEMA_VERSION = 2
+
+
+def _positive_integer(value):
+    text = str(value or "")
+    return int(text) if re.match(r"^[0-9]+$", text) and int(text) > 0 else None
+
+
+def history_capture_metadata(state, draft):
+    """Attribute a sample to the active recording area/bridge, not its geometry.
+
+    The capture mode is authoritative: deleting/undoing an older point can
+    change currentPointType without switching the current recording group.
+    Non-recording and old unclassified samples stay available only in the
+    unfiltered history. No modeling state or recorded points are modified.
+    """
+    if not state or state.get("status") != "recording":
+        return {}
+    draft = draft or {}
+    is_link = (
+        state.get("captureMode") == "link"
+        or state.get("currentLinkId")
+        or state.get("pendingLinkNumber")
+        or ("captureMode" not in state and state.get("currentPointType") == "link")
+    )
+    if is_link:
+        link = next((item for item in draft.get("groupLinks") or []
+                     if item.get("id") == state.get("currentLinkId")), {})
+        number = _positive_integer(link.get("linkNumber") or state.get("pendingLinkNumber"))
+        result = {"pointType": "link"}
+        if number is not None:
+            result["linkNumber"] = number
+        return result
+    group = next((item for item in draft.get("groups") or []
+                  if item.get("id") == state.get("currentGroupId")), {})
+    number = _positive_integer(group.get("areaNumber"))
+    return {"pointType": "area", "areaNumber": number} if number is not None else {}
+
+
+def history_points_for_area(points, area_number=None):
+    """Keep the public x/y contract; never infer an area for legacy samples."""
+    return [{"x": point["x"], "y": point["y"]} for point in points
+            if area_number is None or (
+                point.get("pointType") == "area" and point.get("areaNumber") == area_number)]
+
+
+def _same_capture(left, right):
+    return all(left.get(key) == right.get(key)
+               for key in ("pointType", "areaNumber", "linkNumber"))
 
 
 def _finite_number(value):
@@ -192,6 +240,7 @@ class ModelingPositionHistory(object):
                 "origin": origin,
                 "frame": frame,
                 "coordinateReady": frame is not None,
+                "capture": history_capture_metadata(state, draft),
             }
         return self._cached_context
 
@@ -204,7 +253,15 @@ class ModelingPositionHistory(object):
             y = _finite_number(raw.get("y"))
             if x is None or y is None:
                 continue
-            normalized.append({"x": int(round(x)), "y": int(round(y))})
+            point = {"x": int(round(x)), "y": int(round(y))}
+            point_type = raw.get("pointType")
+            if point_type in ("area", "link"):
+                key = "areaNumber" if point_type == "area" else "linkNumber"
+                number = _positive_integer(raw.get(key))
+                point["pointType"] = point_type
+                if number is not None:
+                    point[key] = number
+            normalized.append(point)
         return normalized[-self.max_points:]
 
     def _load_history(self, model_id, frame):
@@ -270,14 +327,15 @@ class ModelingPositionHistory(object):
         self._dirty = False
         self._last_flush_at = now
 
-    def _append_history(self, x, y, now):
+    def _append_history(self, x, y, now, capture):
         if self._last_history_at is not None and now - self._last_history_at < self.history_interval:
             return
         current = {"x": int(x), "y": int(y)}
+        current.update(capture)
         if self._points:
             previous = self._points[-1]
             distance = math.hypot(current["x"] - previous["x"], current["y"] - previous["y"])
-            if distance < self.minimum_distance_cm:
+            if _same_capture(current, previous) and distance < self.minimum_distance_cm:
                 return
         self._points.append(current)
         if len(self._points) > self.max_points:
@@ -302,7 +360,7 @@ class ModelingPositionHistory(object):
                 if xy is not None:
                     x = int(round(xy[0]))
                     y = int(round(xy[1]))
-                    self._append_history(x, y, now)
+                    self._append_history(x, y, now, context.get("capture") or {})
             self._latest = {
                 "x": x,
                 "y": y,
@@ -316,11 +374,11 @@ class ModelingPositionHistory(object):
         with self._lock:
             return dict(self._latest)
 
-    def history(self):
+    def history(self, area_number=None):
         with self._lock:
             self._flush(float(self._now()), force=True)
             return {
-                "points": [dict(point) for point in self._points],
+                "points": history_points_for_area(self._points, area_number),
                 "coordinateReady": bool(self._latest.get("coordinateReady")),
                 "rtkFixAvailable": bool(self._latest.get("rtkFixAvailable")),
             }

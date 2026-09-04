@@ -30,6 +30,7 @@ from modeling_session import ModelingSession, ModelingSessionError
 from modeling_store import ModelingStore
 from modeling_task_persistence import normalize_task_name
 from modeling_task_generator import generate_task_plan
+from position_history import history_capture_metadata, history_points_for_area, _same_capture
 from mqtt_handler import MQTTCommandHandler
 from mqtt_vehicle_adapter import (
     _frontend_area_points,
@@ -118,17 +119,21 @@ class SimulatorPositionHistory(object):
         self._last_history_at = None
         self.observe(controller.current_position())
 
-    def _active_model_id(self):
+    def _active_context(self):
         try:
-            state = self.controller.session.current()
-            if isinstance(state, dict):
-                return state.get("modelId")
+            # Read a consistent snapshot; share robot attribution rules rather
+            # than using the type of the last deleted/recorded point.
+            session = self.controller.session
+            with session._lock:
+                state = session._read_state() or {}
+                model_id = state.get("modelId")
+                draft = session.store.get_draft(model_id) if model_id else {}
+                return model_id, history_capture_metadata(state, draft)
         except Exception:
             pass
-        return None
+        return None, {}
 
-    def _sync_model(self):
-        model_id = self._active_model_id()
+    def _sync_model(self, model_id):
         if model_id == self._model_id:
             return
         self._model_id = model_id
@@ -152,7 +157,8 @@ class SimulatorPositionHistory(object):
         ready = x is not None and y is not None
         now = float(self._now())
         with self._lock:
-            self._sync_model()
+            model_id, capture = self._active_context()
+            self._sync_model(model_id)
             self._latest = {
                 "x": x if ready else None,
                 "y": y if ready else None,
@@ -166,10 +172,11 @@ class SimulatorPositionHistory(object):
                     and now - self._last_history_at < self.history_interval):
                 return
             point = {"x": x, "y": y}
+            point.update(capture)
             if self._points:
                 previous = self._points[-1]
                 distance = math.hypot(x - previous["x"], y - previous["y"])
-                if distance < self.min_distance_cm:
+                if _same_capture(point, previous) and distance < self.min_distance_cm:
                     return
             self._points.append(point)
             self._last_history_at = now
@@ -181,11 +188,11 @@ class SimulatorPositionHistory(object):
         with self._lock:
             return dict(self._latest)
 
-    def history(self):
+    def history(self, area_number=None):
         self.observe(self.controller.current_position())
         with self._lock:
             return {
-                "points": [dict(point) for point in self._points],
+                "points": history_points_for_area(self._points, area_number),
                 "coordinateReady": bool(self._latest.get("coordinateReady")),
                 "rtkFixAvailable": bool(self._latest.get("rtkFixAvailable")),
             }
@@ -621,10 +628,10 @@ class ModelingSimulatorController(object):
         if callable(self.position_callback):
             self.position_callback(dict(sample))
 
-    def start_modeling(self, name=None, restart=False):
+    def start_modeling(self, name=None, restart=True):
         def action():
             self.player.cancel()
-            result = self.session.start(name or "simulator-two-areas", restart=restart)
+            result = self.session.start(name or "simulator-two-areas", restart=True)
             events = self._capture_events()
             index = max(0, min(len(events) - 1, len(SCENARIO_POINTS) - 1))
             point = scenario_point(index)

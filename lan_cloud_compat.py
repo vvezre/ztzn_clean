@@ -16,6 +16,7 @@ from __future__ import absolute_import
 import datetime
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -491,8 +492,20 @@ def register_lan_cloud_compat_routes(
         product_id, error = require_local_product(product_id)
         if error is not None:
             return error
+        area_number = None
+        if 'areaNumber' in request.args:
+            values = request.args.getlist('areaNumber')
+            value = values[0]
+            if len(values) != 1 or not re.match(r'^[0-9]{1,9}\Z', value) or int(value) < 1:
+                return error_response('areaNumber必须是正整数且只能传一次', 400)
+            area_number = int(value)
         try:
-            raw = position_history_provider() if callable(position_history_provider) else {}
+            if not callable(position_history_provider):
+                raw = {}
+            elif area_number is None:
+                raw = position_history_provider()
+            else:
+                raw = position_history_provider(area_number=area_number)
         except Exception:
             return error_response('历史轨迹读取失败', 500)
         raw = raw if isinstance(raw, dict) else {}
@@ -505,14 +518,14 @@ def register_lan_cloud_compat_routes(
             if x is None or y is None:
                 continue
             points.append({'x': x, 'y': y})
-        return jsonify({
-            'success': True,
-            'data': {
-                'points': points,
-                'coordinateReady': bool(raw.get('coordinateReady')),
-                'rtkFixAvailable': bool(raw.get('rtkFixAvailable')),
-            },
-        })
+        data = {
+            'points': points,
+            'coordinateReady': bool(raw.get('coordinateReady')),
+            'rtkFixAvailable': bool(raw.get('rtkFixAvailable')),
+        }
+        if area_number is not None:
+            data['areaNumber'] = area_number
+        return jsonify({'success': True, 'data': data})
 
     @app.route('/api/t-railcar/command', methods=['POST'])
     def lan_cloud_send_command():

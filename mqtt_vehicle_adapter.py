@@ -311,14 +311,14 @@ class VehicleControllerAdapter(object):
             'data': response.get('data') or {},
         }
 
-    def start_modeling(self, name=None, restart=False):
+    def start_modeling(self, name=None, restart=True):
         """
         启动小车本地建模会话。
 
         name 可以作为建模阶段的临时名称；
-        restart 明确表示是否丢弃现有未完成会话并重新开始。
+        每次调用都重新开始；restart 参数只保留调用兼容性，不再用于续接。
         """
-        payload = {'restart': bool(restart)}
+        payload = {'restart': True}
         if name:
             payload['name'] = str(name)
         return self._normalize_modeling_response(

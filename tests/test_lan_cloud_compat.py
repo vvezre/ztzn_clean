@@ -69,13 +69,24 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
             'coordinateReady': True,
             'rtkFixAvailable': True,
         }
+        self.history_queries = []
+
+        def read_history(area_number=None):
+            self.history_queries.append(area_number)
+            if area_number is None:
+                return self.position_history
+            result = dict(self.position_history)
+            result['points'] = [point for point in result['points']
+                                if point.get('areaNumber') == area_number]
+            return result
+
         self.bridge = register_lan_cloud_compat_routes(
             self.app,
             lambda: self.handler,
             auth_manager=self.auth_manager,
             device_identity_provider=lambda: self.identity,
             realtime_position_provider=lambda: self.realtime_position,
-            position_history_provider=lambda: self.position_history,
+            position_history_provider=read_history,
         )
         self.client = self.app.test_client()
         login = self.client.post('/auth/login', json={
@@ -313,6 +324,39 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
         self.client.environ_base.pop('HTTP_AUTHORIZATION', None)
         unauthorized = self.client.get('/api/t-railcar/position-history/250006')
         self.assertEqual(401, unauthorized.status_code)
+
+    def test_position_history_filters_requested_area_and_returns_area_number(self):
+        self.position_history['points'] = [
+            {'x': 10, 'y': 20, 'areaNumber': 1},
+            {'x': 100, 'y': 200, 'areaNumber': 2},
+        ]
+        response = self.client.get('/api/t-railcar/position-history/250006?areaNumber=2')
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({'success': True, 'data': {
+            'areaNumber': 2, 'points': [{'x': 100, 'y': 200}],
+            'coordinateReady': True, 'rtkFixAvailable': True,
+        }}, response.get_json())
+        self.assertEqual([2], self.history_queries)
+        empty = self.client.get('/api/t-railcar/position-history/250006?areaNumber=3')
+        self.assertEqual(200, empty.status_code)
+        self.assertEqual([], empty.get_json()['data']['points'])
+        self.assertEqual([], self.handler.calls)
+
+    def test_invalid_area_number_is_rejected_before_reading_history(self):
+        for query in ('', '0', '-1', 'abc', '1.5', 'true', '1e2', '1%0A',
+                      '1&areaNumber=2', '1000000000'):
+            response = self.client.get('/api/t-railcar/position-history/250006?areaNumber=' + query)
+            self.assertEqual(400, response.status_code, query)
+        self.assertEqual([], self.history_queries)
+        self.assertEqual([], self.handler.calls)
+
+    def test_filtered_history_still_requires_token_and_local_device(self):
+        response = self.client.get('/api/t-railcar/position-history/999999?areaNumber=2')
+        self.assertEqual(404, response.status_code)
+        self.client.environ_base.pop('HTTP_AUTHORIZATION', None)
+        response = self.client.get('/api/t-railcar/position-history/250006?areaNumber=2')
+        self.assertEqual(401, response.status_code)
+        self.assertEqual([], self.history_queries)
 
     def test_device_status_and_shadow_are_built_from_local_status(self):
         self.handler.results['get_status'] = {

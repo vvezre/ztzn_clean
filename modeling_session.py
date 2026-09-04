@@ -290,12 +290,14 @@ class ModelingSession(object):
             "updatedAt": state.get("updatedAt") or draft.get("updatedAt"),
         }
 
-    def start(self, name=None, restart=False):
-        with self._lock:
-            current = self._read_state()
-            if current and current.get("status") == "recording" and not restart:
-                return self._summary(current)
+    def start(self, name=None, restart=True):
+        """Start a fresh draft; never resume yesterday's unfinished capture.
 
+        Keep the legacy restart argument so old callers still work, but even
+        restart=False now starts over. Read current() to inspect the session
+        without changing it. Saved tasks and earlier model files are untouched.
+        """
+        with self._lock:
             timestamp = self._timestamp()
             model = self.store.create_model(name or "modeling-{}".format(timestamp), now=timestamp)
             group = self.store.create_group(model["id"], None, now=timestamp)["group"]

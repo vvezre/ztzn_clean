@@ -71,7 +71,7 @@ def register_modeling_routes(app, storage_dir=None, store=None, sample_point_pro
         try:
             return _ok(modeling_session.start(
                 name=payload.get("name"),
-                restart=bool(payload.get("restart", False)),
+                restart=True,
             ))
         except Exception as error:
             return _handle_store_error(error)

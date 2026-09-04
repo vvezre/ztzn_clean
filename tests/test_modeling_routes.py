@@ -114,6 +114,20 @@ class ModelingRoutesTest(unittest.TestCase):
         self.assertEqual(recorded.get_json()["data"]["pointNo"], 1)
         self.assertEqual(current.get_json()["data"]["areaPointCount"], 1)
 
+    def test_session_start_endpoint_always_starts_with_empty_points(self):
+        old = self.client.post("/modeling/session/start", json={}).get_json()["data"]
+        for payload in ({}, {"restart": False}, {"restart": True}):
+            recorded = self.client.post("/modeling/session/record-area-point", json={})
+            self.assertEqual(200, recorded.status_code)
+            response = self.client.post("/modeling/session/start", json=payload)
+            self.assertEqual(200, response.status_code)
+            fresh = response.get_json()["data"]
+            self.assertNotEqual(old["modelId"], fresh["modelId"])
+            self.assertEqual(0, fresh["totalAreaPointCount"])
+            self.assertEqual(0, fresh["totalLinkPointCount"])
+            self.assertEqual(1, fresh["currentAreaNumber"])
+            old = fresh
+
     def test_session_new_link_route_selects_empty_bridge(self):
         self.client.post("/modeling/session/start", json={"name": "bridge-route"})
         for _ in range(4):

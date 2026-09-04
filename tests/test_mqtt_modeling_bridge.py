@@ -940,6 +940,32 @@ class MqttModelingBridgeTest(unittest.TestCase):
         invalid = handler.handle({"command": "undo_modeling_point", "params": {"pointType": "bad"}})
         self.assertFalse(invalid["success"])
 
+    def test_start_command_always_requests_fresh_model(self):
+        from mqtt_handler import MQTTCommandHandler
+
+        controller = _FakeController()
+        calls = []
+
+        def start_modeling(name=None, restart=False):
+            calls.append((name, restart))
+            return {"success": True, "data": {}}
+
+        controller.start_modeling = start_modeling
+        handler = MQTTCommandHandler(controller)
+        for params in ({}, {"restart": False}, {"restart": True}):
+            self.assertTrue(handler.handle({"command": "start_modeling", "params": params})["success"])
+        self.assertEqual([(None, True)] * 3, calls)
+
+    def test_adapter_start_always_forwards_restart_true(self):
+        from mqtt_vehicle_adapter import VehicleControllerAdapter
+
+        for kwargs in ({}, {"restart": False}, {"restart": True}):
+            adapter = _StubAdapter()
+            result = VehicleControllerAdapter.start_modeling(adapter, **kwargs)
+            self.assertTrue(result["success"])
+            self.assertEqual("/modeling/session/start", adapter.path)
+            self.assertEqual({"restart": True}, adapter.json_data)
+
     def test_adapter_calls_explicit_new_area_endpoint(self):
         from mqtt_vehicle_adapter import VehicleControllerAdapter
 

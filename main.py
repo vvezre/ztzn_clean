@@ -9719,9 +9719,9 @@ def _get_lan_realtime_position():
     return _update_modeling_position_history(force_context=True)
 
 
-def _get_lan_position_history():
+def _get_lan_position_history(area_number=None):
     _update_modeling_position_history(force_context=True)
-    return modeling_position_history.history()
+    return modeling_position_history.history(area_number=area_number)
 
 
 def _modeling_position_history_loop():

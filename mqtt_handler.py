@@ -556,11 +556,10 @@ class MQTTCommandHandler(object):
             return {'success': False, 'message': 'modeling link points fetch failed: {}'.format(exc)}
 
     def _handle_start_modeling(self, params):
-        # 创建新的建模会话，后续的打点命令都写入该会话。
-        # restart=false 时若已有活动会话则保护现有数据；restart=true 才明确重新开始。
+        # 每次开始建图都新建会话，前端不再需要额外传 restart。
+        # 即使旧客户端传 restart=false，也不能续接之前未完成的点位。
         name = str(params.get('name') or '').strip() if isinstance(params, dict) else ''
-        restart = bool(params.get('restart', False)) if isinstance(params, dict) else False
-        return self._call_controller('start_modeling', 'modeling started', name or None, restart)
+        return self._call_controller('start_modeling', 'modeling started', name or None, True)
 
     def _handle_new_modeling_area(self, params):
         # 连接点记录完成后显式创建下一区域；区域编号由 FSM 自动递增。
