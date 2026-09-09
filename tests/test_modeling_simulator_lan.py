@@ -54,7 +54,8 @@ class ModelingSimulatorLanTests(unittest.TestCase):
 
     def test_realtime_position_uses_simulator_coordinates(self):
         client = self._authorized_client()
-        self.controller._on_playback_position({'local_x': 123, 'local_y': 456})
+        self.controller._on_playback_position({
+            'local_x': 123, 'local_y': 456, 'heading': 92.6})
         self.history.observe(self.controller.current_position())
         response = client.get('/api/t-railcar/realtime-position/999999')
         self.assertEqual(200, response.status_code)
@@ -63,6 +64,7 @@ class ModelingSimulatorLanTests(unittest.TestCase):
             'data': {
                 'x': 123,
                 'y': 456,
+                'heading': 92.6,
                 'coordinateReady': True,
                 'rtkFixAvailable': True,
             },

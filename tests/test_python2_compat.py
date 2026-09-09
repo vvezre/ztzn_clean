@@ -5,6 +5,7 @@ import unittest
 
 RUNTIME_ROOT = os.path.dirname(os.path.dirname(__file__))
 FILES_TO_CHECK = (
+    "route_point_policy.py",
     "GPSuse.py",
     "Ntrip2Uart3.py",
     "vision_line_detection.py",

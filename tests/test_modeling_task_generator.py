@@ -76,6 +76,130 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual([task["turnAtStart"] for task in tasks], [True, True])
         self.assertEqual([task["stopAtEnd"] for task in tasks], [True, True])
 
+    def test_inside_bridge_endpoint_uses_polyline_boundary_intersection(self):
+        """桥头在区域内时沿桥折线裁到真实边界交点，不使用最近垂足。"""
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _route_edges_with_boundary_portals,
+        )
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id, "x": x, "y": y,
+                "lat": 32.0, "lon": 118.0,
+            }
+
+        draft = {
+            "groups": [
+                {"id": "g1", "points": [
+                    point("a1", 0, 0), point("a2", 0, 100),
+                    point("a3", 100, 100), point("a4", 100, 0),
+                ]},
+                {"id": "g2", "points": [
+                    point("b1", 200, 0), point("b2", 200, 100),
+                    point("b3", 300, 100), point("b4", 300, 0),
+                ]},
+            ],
+        }
+        edges = [{
+            "fromGroupId": "g1",
+            "toGroupId": "g2",
+            # 首点和第二点仍在区域1内，第三点才从右边界穿出；这也验证多点/L形桥。
+            "points": [(20.0, 20.0), (20.0, 80.0), (120.0, 80.0), (180.0, 80.0)],
+        }]
+
+        result = _route_edges_with_boundary_portals(
+            edges, draft, _CoordinateMapper(draft),
+        )
+
+        self.assertTrue(result[0]["startUsesBoundaryPortal"])
+        self.assertFalse(result[0]["endUsesBoundaryPortal"])
+        self.assertEqual(result[0]["points"], [
+            (100.0, 80.0), (120.0, 80.0), (180.0, 80.0),
+        ])
+
+        reverse_result = _route_edges_with_boundary_portals([{
+            "fromGroupId": "g2", "toGroupId": "g1",
+            "points": list(reversed(edges[0]["points"])),
+        }], draft, _CoordinateMapper(draft))
+        self.assertFalse(reverse_result[0]["startUsesBoundaryPortal"])
+        self.assertTrue(reverse_result[0]["endUsesBoundaryPortal"])
+        self.assertEqual(reverse_result[0]["points"], [
+            (180.0, 80.0), (120.0, 80.0), (100.0, 80.0),
+        ])
+
+    def test_outside_bridge_endpoint_keeps_original_connection_point(self):
+        """桥头在区域外时不延长桥线猜交点，继续交给原边界接入算法。"""
+        from modeling_task_generator import (
+            _CoordinateMapper,
+            _route_edges_with_boundary_portals,
+        )
+
+        def point(point_id, x, y):
+            return {
+                "id": point_id, "x": x, "y": y,
+                "lat": 32.0, "lon": 118.0,
+            }
+
+        draft = {"groups": [{"id": "g1", "points": [
+            point("a1", 0, 0), point("a2", 0, 100),
+            point("a3", 100, 100), point("a4", 100, 0),
+        ]}, {"id": "g2", "points": [
+            point("b1", 200, 0), point("b2", 200, 100),
+            point("b3", 300, 100), point("b4", 300, 0),
+        ]}]}
+        original = [(120.0, 50.0), (180.0, 50.0)]
+
+        result = _route_edges_with_boundary_portals([{
+            "fromGroupId": "g1", "toGroupId": "g2", "points": original,
+        }], draft, _CoordinateMapper(draft))
+
+        self.assertEqual(result[0]["points"], original)
+        self.assertFalse(result[0]["startUsesBoundaryPortal"])
+        self.assertFalse(result[0]["endUsesBoundaryPortal"])
+
+    def test_final_fifteen_cm_merge_prefers_true_bridge_point_and_refreshes_markers(self):
+        """15cm短任务不输出，桥口优先保留，连续折线标记按新几何重算。"""
+        from modeling_task_generator import (
+            _merge_near_executable_tasks,
+            _refresh_continuous_task_markers,
+        )
+
+        def task(task_id, start, end, preferred_start=False, preferred_end=False):
+            item = {
+                "id": task_id, "mode": 2,
+                "startX": start[0], "startY": start[1],
+                "endX": end[0], "endY": end[1],
+                "startLat": 32.0, "startLon": 118.0,
+                "endLat": 32.0, "endLon": 118.0,
+                "source": "modeling_transfer",
+                "continuousPathId": "bridge-path",
+                "turnAtStart": True, "stopAtEnd": True,
+            }
+            if preferred_start:
+                item["preferredStartPoint"] = True
+            if preferred_end:
+                item["preferredEndPoint"] = True
+            return item
+
+        merged = _merge_near_executable_tasks([
+            task(1, (0, 0), (100, 0)),
+            task(2, (100, 0), (106, 0), preferred_end=True),
+            task(3, (106, 0), (200, 0), preferred_start=True),
+        ])
+        refreshed = _refresh_continuous_task_markers(merged)
+
+        self.assertEqual([
+            (item["startX"], item["startY"], item["endX"], item["endY"])
+            for item in refreshed
+        ], [(0, 0, 106, 0), (106, 0, 200, 0)])
+        self.assertEqual([item["id"] for item in refreshed], [1, 2])
+        self.assertEqual([item["continuousPathIndex"] for item in refreshed], [1, 2])
+        self.assertEqual([item["continuousPathCount"] for item in refreshed], [2, 2])
+        self.assertEqual([item["turnAtStart"] for item in refreshed], [True, False])
+        self.assertEqual([item["stopAtEnd"] for item in refreshed], [False, True])
+        self.assertNotIn("preferredEndPoint", refreshed[0])
+
     def test_transition_path_removes_local_out_and_back_loop(self):
         from modeling_task_generator import _simplify_transition_path_points
 
@@ -787,14 +911,15 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         compacted = _compact_executable_tasks(tasks)
 
         self.assertEqual(len(compacted), 2)
-        self.assertEqual((compacted[0]["endX"], compacted[0]["endY"]), (40, 416))
-        self.assertEqual((compacted[1]["startX"], compacted[1]["startY"]), (40, 416))
+        # 统一15cm合并比较局部代价后保留(41,416)，不会再保留1cm独立任务。
+        self.assertEqual((compacted[0]["endX"], compacted[0]["endY"]), (41, 416))
+        self.assertEqual((compacted[1]["startX"], compacted[1]["startY"]), (41, 416))
         self.assertEqual((compacted[1]["endX"], compacted[1]["endY"]), (403, 382))
         self.assertEqual(compacted[1]["mode"], 1)
         self.assertAlmostEqual(compacted[1]["heading"], 95.4, places=1)
 
-    def test_three_centimeter_transfer_and_explicit_short_stop_are_preserved(self):
-        """达到3cm的真实移动和显式停车标记都不能被近点规则删除。"""
+    def test_fifteen_cm_merge_has_no_point_type_or_stop_exemption(self):
+        """15cm规则统一作用于执行点，旧3cm阈值和显式停车不再产生短任务。"""
         from modeling_task_generator import _compact_executable_tasks
 
         def task(task_id, start, end, preserve=False):
@@ -819,10 +944,18 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             task(2, (1, 0), (1, 100)),
         ])
 
-        self.assertEqual(len(three_cm), 2)
-        self.assertEqual((three_cm[0]["startX"], three_cm[0]["endX"]), (0, 3))
-        self.assertEqual(len(explicit_one_cm), 2)
-        self.assertTrue(explicit_one_cm[0]["preserveEndStop"])
+        self.assertEqual(len(three_cm), 1)
+        self.assertEqual(
+            (three_cm[0]["startX"], three_cm[0]["startY"],
+             three_cm[0]["endX"], three_cm[0]["endY"]),
+            (0, 0, 3, 100),
+        )
+        self.assertEqual(len(explicit_one_cm), 1)
+        self.assertEqual(
+            (explicit_one_cm[0]["startX"], explicit_one_cm[0]["startY"],
+             explicit_one_cm[0]["endX"], explicit_one_cm[0]["endY"]),
+            (0, 0, 1, 100),
+        )
 
     def test_explicit_stop_boundary_is_not_removed_by_transition_simplification(self):
         from modeling_task_generator import _compact_executable_tasks
@@ -1219,9 +1352,9 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         preview = {
             "status": "ready",
             "groups": [
-                preview_group("g1", 1, 0, 10),
-                preview_group("g2", 2, 20, 30),
-                preview_group("g3", 3, 40, 50),
+                preview_group("g1", 1, 0, 100),
+                preview_group("g2", 2, 200, 300),
+                preview_group("g3", 3, 400, 500),
             ],
             "groupLinks": [
                 {
@@ -1229,8 +1362,8 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                     "startGroupId": "g1",
                     "endGroupId": "g2",
                     "points": [
-                        {"id": "l12-a", "x": 10, "y": 0},
-                        {"id": "l12-b", "x": 20, "y": 0},
+                        {"id": "l12-a", "x": 100, "y": 0},
+                        {"id": "l12-b", "x": 200, "y": 0},
                     ],
                 },
                 {
@@ -1238,9 +1371,9 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                     "startGroupId": "g2",
                     "endGroupId": "g3",
                     "points": [
-                        {"id": "l23-a", "x": 30, "y": 0},
-                        {"id": "l23-mid", "x": 35, "y": 5},
-                        {"id": "l23-b", "x": 40, "y": 0},
+                        {"id": "l23-a", "x": 300, "y": 0},
+                        {"id": "l23-mid", "x": 350, "y": 50},
+                        {"id": "l23-b", "x": 400, "y": 0},
                     ],
                 },
             ],
@@ -1249,8 +1382,8 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
             "id": "three-area-route",
             "groups": [
                 {"id": "g1", "points": [{"id": "p1", "x": 0, "y": 0, "lat": 32.0, "lon": 118.0}]},
-                {"id": "g2", "points": [{"id": "p2", "x": 20, "y": 0, "lat": 32.0, "lon": 118.0}]},
-                {"id": "g3", "points": [{"id": "p3", "x": 40, "y": 0, "lat": 32.0, "lon": 118.0}]},
+                {"id": "g2", "points": [{"id": "p2", "x": 200, "y": 0, "lat": 32.0, "lon": 118.0}]},
+                {"id": "g3", "points": [{"id": "p3", "x": 400, "y": 0, "lat": 32.0, "lon": 118.0}]},
             ],
             "taskPreview": preview,
         }
@@ -1261,7 +1394,7 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
         self.assertEqual(task_plan["summary"]["cleanTaskCount"], 3)
         self.assertEqual((tasks[0]["startX"], tasks[0]["startY"]), (0, 0))
         self.assertEqual((tasks[-1]["endX"], tasks[-1]["endY"]), (0, 0))
-        self.assertTrue(any((task["startX"], task["startY"]) == (35, 5) for task in tasks))
+        self.assertTrue(any((task["startX"], task["startY"]) == (350, 50) for task in tasks))
         for index in range(1, len(tasks)):
             self.assertEqual(
                 (tasks[index - 1]["endX"], tasks[index - 1]["endY"]),
@@ -1829,6 +1962,63 @@ class ModelingTaskGeneratorTest(unittest.TestCase):
                 for task in tasks
             },
         )
+
+    def test_hhh123_uses_true_home_portal_and_has_no_fifteen_cm_task(self):
+        """hhh123实数回归：区域内L1换成交点，区域外L2仍按原方法接入。"""
+        from modeling_preview import build_model_preview
+        from modeling_task_generator import generate_task_plan
+
+        def point(point_id, x, y, lat, lon):
+            return {
+                "id": point_id, "x": x, "y": y,
+                "lat": lat, "lon": lon,
+            }
+
+        area_one = [
+            point("a1", 0.0, 0.0, 32.036478348, 118.924489846),
+            point("a2", 9.85, 99.975, 32.036487339, 118.924490891),
+            point("a3", 928.745, 20.471, 32.036480189, 118.924588375),
+            point("a4", 929.584, -94.727, 32.036469829, 118.924588464),
+        ]
+        area_two = [
+            point("b1", 37.968, 252.891, 32.036501091, 118.924493874),
+            point("b2", 359.813, 244.562, 32.036500342, 118.924528018),
+            point("b3", 373.283, 359.46, 32.036510675, 118.924529447),
+            point("b4", 24.564, 397.355, 32.036514083, 118.924492452),
+        ]
+        bridge = [
+            point("l1", 14.526, 73.155, 32.036484927, 118.924491387),
+            point("l2", 26.025, 257.55, 32.036501510, 118.924492607),
+        ]
+        draft = {
+            "id": "hhh123-regression",
+            "recognition": {"confirmed": True},
+            "groups": [
+                {"id": "g1", "areaNumber": 1, "points": area_one,
+                 "subAreas": [{"id": "sa1", "pointIds": [p["id"] for p in area_one]}]},
+                {"id": "g2", "areaNumber": 2, "points": area_two,
+                 "subAreas": [{"id": "sa2", "pointIds": [p["id"] for p in area_two]}]},
+            ],
+            "groupLinks": [{
+                "id": "link", "startGroupId": "g1", "endGroupId": "g2",
+                "status": "ready", "points": bridge,
+            }],
+            "routePolicy": {"type": "area_order", "areaOrder": [2, 1]},
+        }
+        draft["taskPreview"] = build_model_preview(draft, now=1000)
+
+        plan = generate_task_plan(draft, now=2000, return_to_origin=True)
+        endpoints = {
+            (task[prefix + "X"], task[prefix + "Y"])
+            for task in plan["tasks"] for prefix in ("start", "end")
+        }
+
+        self.assertEqual(plan["summary"]["taskCount"], 18)
+        self.assertEqual(plan["summary"]["cleanTaskCount"], 8)
+        self.assertIn((16, 99), endpoints)   # L1->L2方向与区域1边界的真实交点
+        self.assertNotIn((15, 73), endpoints)  # 区域内部L1不再是执行目标
+        self.assertIn((26, 258), endpoints)  # 区域外L2仍保留原接入语义
+        self.assertFalse(any(task["length"] <= 15 for task in plan["tasks"]))
 
     def test_generate_task_plan_requires_ready_preview(self):
         from modeling_task_generator import ModelingTaskGenerationError, generate_task_plan

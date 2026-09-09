@@ -85,7 +85,7 @@ from RTKDataManager import RTKDataManager
 from mqtt_integration import MQTTIntegration
 from mqtt_vehicle_adapter import VehicleControllerAdapter
 from manual_steering import ManualSteeringController, ManualSteeringError
-from motion_state import derive_motion_state
+from motion_state import derive_manual_motion_state
 from vision_line_detection import GuidanceBandTracker, find_vertical_bright_band, resolve_guidance_command
 from go_to_point import build_go_to_point_plan
 from turn_heading_control import (
@@ -117,6 +117,7 @@ from dev_console.state_readers import (
 from modeling_routes import register_modeling_routes
 from lan_cloud_compat import register_lan_cloud_compat_routes
 from position_history import ModelingPositionHistory
+from cleaning_position import CleaningPositionHistory, CleaningPositionService
 from modeling_sampler import sample_current_point
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
@@ -853,6 +854,11 @@ def dispatch_runtime_event(event_type, message='', payload=None, detail=None):
 
     legacy_fields = legacy_fields_for_state(fsm_state)
     _mirror_runtime_state_to_redis(fsm_state, legacy_fields)
+    # UI telemetry receives accepted state transitions only. Enqueueing does
+    # not compress/write files or send a hardware command on this thread.
+    position_observer = globals().get('_notify_cleaning_position_state')
+    if callable(position_observer):
+        position_observer(fsm_state.get('controlState'))
 
     runtime_detail = fsm_state.get('detail')
     if not isinstance(runtime_detail, dict):
@@ -1410,6 +1416,9 @@ def _request_runtime_stop(reason, clear_auto_task=False, clear_waypoints=False,
     global global_doCleanThreadStop, global_pointToPoint_flag, global_go, global_status
     global active_runtime_task_token, active_runtime_task_action
 
+    # Every explicit runtime stop cancels old tap/hold timers and records a
+    # stopped intent. No forward/reverse frame is emitted during takeover.
+    _reset_manual_steering(send_hardware=False, commanded_motion='stopped')
     global_auto_clean_stop = 1
     global_waypoint_nav_stop = 1
     global_loop_auto_clean_stop = 1
@@ -1739,6 +1748,7 @@ def _apply_lower_machine_status_frame(data, source):
         z_speed = _frame_i16_to_int(data, 6)
         if z_speed is not None:
             global_get_ZSpeed = z_speed
+            redis_cli.set("zSpeed", z_speed)
 
     brush_speed = byte_at(8)
     if brush_speed is not None:
@@ -3169,6 +3179,10 @@ def _modelingTaskThread(task_token=None, execution_plan=None):
     global_doCleanThreadStop = 0
     global_pointToPoint_flag = 0
     redis_cli.set("correct", "true")
+    _begin_cleaning_position_run({
+        'taskName': None, 'modelId': execution_plan.get('modelId'),
+        'taskList': execution_plan.get('segments') or [],
+    }, task_token)
     _mark_runtime_running('建模任务执行启动', {
         'action': 'modeling_task',
         'modelingTask': execution_plan,
@@ -3300,6 +3314,11 @@ modeling_store = register_modeling_routes(app,
     task_save_handler=_save_modeling_task,
 )
 modeling_position_history = ModelingPositionHistory(MODELING_STORE_DIR)
+cleaning_position_service = CleaningPositionService(
+    CleaningPositionHistory(os.path.join(MODELING_STORE_DIR, 'cleaning_history', 'latest.json')),
+    model_loader=modeling_store.get_model,
+    on_error=lambda error: logger.warning('cleaning position telemetry: {}'.format(error)),
+)
 
 
 @app.route("/vehicle/login", methods=['POST'])
@@ -4269,6 +4288,7 @@ def autoDriveByRTK():
             validation.get('message', '启动条件未通过'),
             validation.get('data')
         )
+        _notify_cleaning_position_start_failed()
         return jsonify(validation)
 
     global_doCleanThreadStop = 0
@@ -4504,6 +4524,7 @@ def autoDriveByRTKThread(task_token=None):
 
     global_status = 'working'
     global_doCleanThreadStop = 0
+    _begin_cleaning_position_run(taskObj, task_token)
     _mark_runtime_running('自动清扫启动成功，任务执行中', {'action': 'auto_drive'})
 
     # 根据缓存中是否存在任务，来构建新的任务
@@ -4688,6 +4709,7 @@ def auto_driving():
             validation.get('message', '启动条件未通过'),
             validation.get('data')
         )
+        _notify_cleaning_position_start_failed()
         return jsonify(validation)
 
     global_doCleanThreadStop = 0
@@ -5109,7 +5131,6 @@ def correctByRTK():
 # 急停
 @app.route("/vehicle/parking", methods=['GET'])
 def parking():
-    _reset_manual_steering(send_hardware=False, commanded_motion='stopped')
     _request_runtime_stop('manual_parking', clear_auto_task=True, update_runtime=True,
                           message='已执行停车指令')
     response = make_response("1")
@@ -6524,6 +6545,11 @@ def goOnDoCleanByRTK(task_token=None):
     _mark_runtime_running('RTK继续清扫启动', {'action': 'go_on'})
     # 未完成的任务列表
     previousTaskList = [json.loads(item) for item in redis_cli.lrange('taskList', 0, -1)]
+    if previousTaskList:
+        try:
+            _begin_cleaning_position_run(util.readConfig('config.json'), task_token, resume=True)
+        except Exception as error:
+            logger.warning('resume cleaning telemetry: {}'.format(error))
     # 执行任务
     for index, task in enumerate(previousTaskList):
         logger.warn("执行任务{}".format(task['id']))
@@ -7584,11 +7610,15 @@ def _manual_steering_base_motion():
     """Derive motion from live lower-machine data, never from frontend input."""
     hardware_report_at = _get_hardware_report_at()
     live_speed = live_value_from_report(_coerce_int(global_get_XSpeed, None), hardware_report_at)
-    return derive_motion_state(
+    return derive_manual_motion_state(
         live_speed,
         lower_status=global_get_status,
         control_state=_derive_control_state(),
         fault_state=_derive_fault_state(),
+        stop_requested=_runtime_action() == 'parking',
+        z_speed=global_get_ZSpeed,
+        power_on=_get_power_on_state(),
+        report_at=hardware_report_at,
     )
 
 
@@ -7704,6 +7734,11 @@ def manual_steering_api():
     try:
         return jsonify(_get_manual_steering_controller().handle(params))
     except ManualSteeringError as error:
+        logger.warning('manual steering rejected: code={}, lowerStatus={}, '
+                       'xSpeed={}, zSpeed={}, controlState={}, reportAge={}'.format(
+                           error.code, global_get_status, global_get_XSpeed,
+                           global_get_ZSpeed, _derive_control_state(),
+                           _get_hardware_report_age_sec()))
         return jsonify({
             'success': False,
             'message': error.message,
@@ -9700,6 +9735,51 @@ def listenerRTK():
 global_mqtt_integration = None
 
 
+def _cleaning_position_sample():
+    return (global_cur_rtk_lat, global_cur_rtk_lon,
+            bool(_build_rtk_runtime_detail().get('rtkFixAvailable')))
+
+
+def _begin_cleaning_position_run(task_config, task_token, resume=False):
+    """Called only after a real cleaning start passed task validation."""
+    try:
+        service = globals().get('cleaning_position_service')
+        if service is not None:
+            service.begin(task_config, task_token, resume=resume, sample=_cleaning_position_sample())
+    except Exception as error:
+        logger.warning('begin cleaning telemetry: {}'.format(error))
+
+
+def _notify_cleaning_position_state(control_state):
+    try:
+        service = globals().get('cleaning_position_service')
+        if service is not None:
+            service.state(control_state, active_runtime_task_token, _cleaning_position_sample())
+    except Exception as error:
+        logger.warning('cleaning telemetry state: {}'.format(error))
+
+
+def _notify_cleaning_position_start_failed():
+    """Publish a rejected start without creating or clearing route history."""
+    try:
+        service = globals().get('cleaning_position_service')
+        if service is not None:
+            service.start_failed()
+    except Exception as error:
+        logger.warning('cleaning telemetry start failure: {}'.format(error))
+
+
+def _cleaning_position_history_loop():
+    """Separate UI worker: never blocks the RTK steering observer."""
+    while True:
+        try:
+            state = robot_lifecycle_fsm.get_state().get('controlState')
+            cleaning_position_service.poll(_cleaning_position_sample(), state, active_runtime_task_token)
+        except Exception as error:
+            logger.warning('cleaning position sampler: {}'.format(error))
+        time.sleep(0.2)
+
+
 def _update_modeling_position_history(lat=None, lon=None, force_context=False):
     """Feed the read-only LAN position cache from the latest RTK snapshot."""
     if lat is None:
@@ -9716,12 +9796,36 @@ def _update_modeling_position_history(lat=None, lon=None, force_context=False):
 
 
 def _get_lan_realtime_position():
-    return _update_modeling_position_history(force_context=True)
+    raw = dict(_update_modeling_position_history(force_context=True) or {})
+    raw['heading'] = (
+        _get_current_rtk_heading()
+        if raw.get('rtkFixAvailable') else None
+    )
+    return raw
 
 
 def _get_lan_position_history(area_number=None):
     _update_modeling_position_history(force_context=True)
     return modeling_position_history.history(area_number=area_number)
+
+
+def _get_lan_cleaning_realtime_position():
+    """Add current task-origin presence without changing x/y availability."""
+    raw = cleaning_position_service.realtime()
+    raw = dict(raw or {})
+    raw['heading'] = (
+        _get_current_rtk_heading()
+        if raw.get('rtkFixAvailable') else None
+    )
+    try:
+        origin_status = _build_task_origin_status_fields(_load_task_params_snapshot())
+        raw['atTaskOrigin'] = bool(
+            raw.get('rtkFixAvailable') and
+            origin_status.get('isAtTaskOrigin') is True
+        )
+    except Exception:
+        raw['atTaskOrigin'] = False
+    return raw
 
 
 def _modeling_position_history_loop():
@@ -9752,6 +9856,8 @@ lan_cloud_compatibility = register_lan_cloud_compat_routes(
     _get_lan_cloud_command_handler,
     realtime_position_provider=_get_lan_realtime_position,
     position_history_provider=_get_lan_position_history,
+    cleaning_realtime_provider=_get_lan_cleaning_realtime_position,
+    cleaning_history_provider=cleaning_position_service.history,
 )
 
 
@@ -9866,6 +9972,10 @@ def main():
         position_history_thread = threading.Thread(target=_modeling_position_history_loop)
         position_history_thread.daemon = True
         position_history_thread.start()
+
+        cleaning_history_thread = threading.Thread(target=_cleaning_position_history_loop)
+        cleaning_history_thread.daemon = True
+        cleaning_history_thread.start()
 
         # 向服务器发送心跳值
         # sendHearbeatThread = threading.Thread(target=sendHeartbeat)

@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 from flask import Flask
 from flask_cors import CORS
@@ -31,6 +32,7 @@ from modeling_store import ModelingStore
 from modeling_task_persistence import normalize_task_name
 from modeling_task_generator import generate_task_plan
 from position_history import history_capture_metadata, history_points_for_area, _same_capture
+from cleaning_position import CleaningPositionHistory, CleaningPositionService
 from mqtt_handler import MQTTCommandHandler
 from mqtt_vehicle_adapter import (
     _frontend_area_points,
@@ -111,6 +113,7 @@ class SimulatorPositionHistory(object):
         self._latest = {
             "x": None,
             "y": None,
+            "heading": None,
             "coordinateReady": False,
             "rtkFixAvailable": False,
         }
@@ -150,11 +153,23 @@ class SimulatorPositionHistory(object):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _heading(position):
+        try:
+            heading = float(position.get("heading"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isnan(heading) or math.isinf(heading):
+            return None
+        heading = round(heading % 360.0, 3)
+        return 0.0 if heading >= 360.0 else heading
+
     def observe(self, position):
         position = position if isinstance(position, dict) else {}
         x = self._coordinate(position, "local_x", "x")
         y = self._coordinate(position, "local_y", "y")
         ready = x is not None and y is not None
+        heading = self._heading(position) if ready else None
         now = float(self._now())
         with self._lock:
             model_id, capture = self._active_context()
@@ -162,6 +177,7 @@ class SimulatorPositionHistory(object):
             self._latest = {
                 "x": x if ready else None,
                 "y": y if ready else None,
+                "heading": heading,
                 "coordinateReady": ready,
                 "rtkFixAvailable": ready,
             }
@@ -240,6 +256,8 @@ def build_simulator_lan_app(controller, command_handler=None, position_history=N
         device_identity_provider=simulator_device_identity,
         realtime_position_provider=position_history.realtime,
         position_history_provider=position_history.history,
+        cleaning_realtime_provider=controller.cleaning_realtime_position,
+        cleaning_history_provider=controller.cleaning_position_history,
     )
     app.config["SIMULATOR_POSITION_HISTORY"] = position_history
     return app
@@ -276,6 +294,15 @@ def xy_to_lat_lon(x, y, origin_lat=SIMULATOR_ORIGIN_LAT, origin_lon=SIMULATOR_OR
     mean_lat = math.radians((float(origin_lat) + lat) / 2.0)
     lon = float(origin_lon) + math.degrees(dx_m / (EARTH_RADIUS_M * math.cos(mean_lat)))
     return round(lat, 8), round(lon, 8)
+
+
+def xy_heading(start_x, start_y, end_x, end_y):
+    """Return an RTK-style heading: north=0, east=90, clockwise."""
+    dx = float(end_x) - float(start_x)
+    dy = float(end_y) - float(start_y)
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return None
+    return round(math.degrees(math.atan2(dx, dy)) % 360.0, 3)
 
 
 def scenario_point(index):
@@ -340,6 +367,7 @@ def build_playback_samples(task_plan, step_cm=25.0):
                 "task {} has invalid local coordinates".format(task_index + 1),
             )
         length = math.hypot(end_x - start_x, end_y - start_y)
+        heading = xy_heading(start_x, start_y, end_x, end_y)
         step_count = max(1, int(math.ceil(length / step_cm)))
         first_step = 0 if task_index == 0 else 1
         for step_index in range(first_step, step_count + 1):
@@ -352,6 +380,7 @@ def build_playback_samples(task_plan, step_cm=25.0):
                 "local_y": local_y,
                 "lat": lat,
                 "lon": lon,
+                "heading": heading,
                 "taskId": task.get("id"),
                 "taskIndex": task_index + 1,
                 "taskTotal": len(tasks),
@@ -364,8 +393,10 @@ def build_playback_samples(task_plan, step_cm=25.0):
 
 
 class ModelingPathPlayer(object):
-    def __init__(self, on_position=None, step_cm=25.0, interval=0.2):
+    def __init__(self, on_position=None, step_cm=25.0, interval=0.2, on_start=None, on_state=None):
         self.on_position = on_position
+        self.on_start = on_start
+        self.on_state = on_state
         self.step_cm = max(float(step_cm), 1.0)
         self.interval = max(float(interval), 0.01)
         self._lock = threading.RLock()
@@ -392,11 +423,15 @@ class ModelingPathPlayer(object):
                 raise ModelingSimulatorError("SIMULATOR_PATH_EMPTY", "generate a modeling path first")
             if self._thread and self._thread.is_alive():
                 if self._state == "paused":
+                    if callable(self.on_start):
+                        self.on_start(True)
                     self._state = "running"
                     self._resume_event.set()
                     return {"state": self._state, "positionCount": len(self._samples)}
                 return {"state": self._state, "positionCount": len(self._samples)}
             self._index = 0
+            if callable(self.on_start):
+                self.on_start(False)
             self._state = "running"
             self._cancel_event = threading.Event()
             self._resume_event.set()
@@ -412,6 +447,8 @@ class ModelingPathPlayer(object):
             with self._lock:
                 if self._index >= len(self._samples):
                     self._state = "complete"
+                    if callable(self.on_state):
+                        self.on_state('COMPLETE')
                     return
                 sample = dict(self._samples[self._index])
                 self._index += 1
@@ -429,12 +466,16 @@ class ModelingPathPlayer(object):
                 return {"state": self._state, "positionIndex": self._index}
             self._state = "paused"
             self._resume_event.clear()
+            if callable(self.on_state):
+                self.on_state('PAUSED')
             return {"state": self._state, "positionIndex": self._index}
 
     def resume(self):
         with self._lock:
             if self._state != "paused":
                 return self.start()
+            if callable(self.on_start):
+                self.on_start(True)
             self._state = "running"
             self._resume_event.set()
             return {"state": self._state, "positionIndex": self._index}
@@ -450,6 +491,8 @@ class ModelingPathPlayer(object):
             self._thread = None
             self._index = 0
             self._state = "ready" if self._samples else "idle"
+            if callable(self.on_state):
+                self.on_state('STOPPED')
 
     def wait(self, timeout=None):
         with self._lock:
@@ -503,11 +546,19 @@ class ModelingSimulatorController(object):
         self._saved_tasks = {}
         self._current_task_name = None
         self._current_return_to_origin = True
+        self._cleaning_token = None
+        self.cleaning_service = CleaningPositionService(
+            CleaningPositionHistory(os.path.join(data_dir, 'cleaning_history', 'latest.json')),
+            model_loader=self.store.get_model,
+            on_error=lambda error: logger.warning('simulator cleaning telemetry: {}'.format(error)),
+        )
         self._current_position = dict(scenario_point(0), local_x=0, local_y=0, mode=2)
         self.player = ModelingPathPlayer(
             on_position=self._on_playback_position,
             step_cm=playback_step_cm,
             interval=playback_interval,
+            on_start=self._safe_cleaning_playback_start,
+            on_state=self._on_cleaning_playback_state,
         )
         self._sim_motion_state = "stopped"
         self._manual_events = []
@@ -625,8 +676,56 @@ class ModelingSimulatorController(object):
     def _on_playback_position(self, sample):
         with self._position_lock:
             self._current_position = dict(sample)
+        self._poll_cleaning_position()
         if callable(self.position_callback):
             self.position_callback(dict(sample))
+
+    def _on_cleaning_playback_start(self, resume):
+        with self._tasks_lock:
+            saved = self._saved_tasks.get(self._current_task_name)
+            if saved:
+                key = 'return' if self._current_return_to_origin else 'noReturn'
+                plan = (saved.get('routeVariants') or {}).get(key) or {}
+                task = {'taskName': self._current_task_name, 'modelId': saved.get('modelId'),
+                        'returnToOrigin': self._current_return_to_origin, 'taskList': plan.get('tasks') or []}
+            else:
+                path = self.session.current_path()
+                task = {'taskName': None, 'modelId': path.get('modelId'),
+                        'returnToOrigin': True, 'taskList': (path.get('taskPlan') or {}).get('tasks') or []}
+        self._cleaning_token = uuid.uuid4().hex
+        self.cleaning_service.begin(task, self._cleaning_token, resume=resume)
+
+    def _safe_cleaning_playback_start(self, resume):
+        try:
+            self._on_cleaning_playback_start(resume)
+        except Exception as error:
+            logger.warning('simulator cleaning start telemetry: {}'.format(error))
+
+    def _on_cleaning_playback_state(self, state):
+        try:
+            position = self.current_position()
+            sample = (position.get('lat'), position.get('lon'), position.get('rtkFixAvailable', True))
+            self.cleaning_service.state(state, self._cleaning_token, sample)
+            self.cleaning_service.poll(sample, state, self._cleaning_token)
+        except Exception as error:
+            logger.warning('simulator cleaning state telemetry: {}'.format(error))
+
+    def _poll_cleaning_position(self):
+        position = self.current_position()
+        state = {'running': 'RUNNING', 'paused': 'PAUSED', 'complete': 'COMPLETE'}.get(
+            self.player.snapshot()['state'], 'STOPPED')
+        sample = (position.get('lat'), position.get('lon'), position.get('rtkFixAvailable', True))
+        self.cleaning_service.poll(sample, state, self._cleaning_token)
+
+    def cleaning_realtime_position(self):
+        self._poll_cleaning_position()
+        result = dict(self.cleaning_service.realtime() or {})
+        result["heading"] = self.current_position().get("heading")
+        return result
+
+    def cleaning_position_history(self):
+        self._poll_cleaning_position()
+        return self.cleaning_service.history()
 
     def start_modeling(self, name=None, restart=True):
         def action():
@@ -928,7 +1027,11 @@ class ModelingSimulatorController(object):
         self.manual_steering_controller.reset(send_hardware=False)
         self.manual_steering_controller.set_commanded_motion("stopped")
         self._sim_motion_state = "stopped"
-        return self._call("simulation path playback started", self.player.start)
+        result = self._call("simulation path playback started", self.player.start)
+        if not result.get("success"):
+            self.cleaning_service.start_failed()
+            self._poll_cleaning_position()
+        return result
 
     def drive(self, distance=0, speed=None):
         self.manual_steering_controller.reset(send_hardware=False)

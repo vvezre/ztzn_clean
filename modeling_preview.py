@@ -13,6 +13,8 @@
 import math
 import time
 
+from route_point_policy import BOUNDARY_CLOSURE_MERGE_CM
+
 
 # 机器人一次直线通过时，滚刷在“垂直于行驶方向”上能够覆盖的有效宽度 W。
 # 单位统一使用厘米；当前设备实测/业务配置为 W=116cm。
@@ -28,7 +30,6 @@ EPSILON = 1e-6
 # 人工沿区域边界记录一圈后，最后一点经常会落在第一个点附近。二者距离
 # 不超过30cm时，规划几何把最后一点并入第一个点，避免闭合边界生成一条
 # 无意义的十几厘米清扫短线。这里只整理规划副本，不修改原始记录点数据。
-BOUNDARY_CLOSURE_MERGE_CM = 30.0
 
 
 class ModelingPreviewError(Exception):

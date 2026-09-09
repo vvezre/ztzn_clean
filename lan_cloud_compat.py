@@ -15,6 +15,7 @@ from __future__ import absolute_import
 
 import datetime
 import json
+import math
 import os
 import re
 import threading
@@ -27,7 +28,7 @@ try:
 except ImportError:
     import queue as queue_module
 
-from flask import g, jsonify, request
+from flask import g, jsonify, request, send_from_directory
 
 from lan_local_auth import (
     LocalAuthManager,
@@ -40,6 +41,7 @@ DEVICE_MODEL = '-T01'
 DEVICE_TYPE = 'T_PYTHON'
 COMPANY_CODE = 'ZTZN-PVC'
 DEFAULT_TIMEOUT_MS = 30000
+DEFAULT_LAN_WEB_ROOT = '/usr/share/nginx/html'
 
 
 try:
@@ -65,6 +67,44 @@ def _now_ms():
 
 def _new_id(prefix):
     return '{}_{}'.format(prefix, uuid.uuid4().hex[:12])
+
+
+def register_lan_web_routes(app, web_root=None):
+    """Serve the deployed H5 from the same Flask port as the LAN API.
+
+    Only the known H5 directories are exposed.  Existing API, authentication,
+    vehicle and modeling routes keep their own handlers and are not affected.
+    ``send_from_directory`` also rejects attempts to escape ``web_root``.
+    """
+    web_root = os.path.abspath(
+        _text(web_root or os.environ.get('CLEANBOT_WEB_ROOT')) or
+        DEFAULT_LAN_WEB_ROOT
+    )
+
+    # Flask creates /static/<path:filename> when the app is constructed.  Its
+    # view reads app.static_folder at request time, so point that existing
+    # route at the deployed H5 package's static subdirectory.
+    app.static_folder = os.path.join(web_root, 'static')
+
+    @app.route('/', methods=['GET'])
+    @app.route('/index', methods=['GET'])
+    @app.route('/index.html', methods=['GET'])
+    def lan_web_index():
+        return send_from_directory(web_root, 'index.html')
+
+    @app.route('/js/<path:filename>', methods=['GET'])
+    def lan_web_js(filename):
+        return send_from_directory(os.path.join(web_root, 'js'), filename)
+
+    @app.route('/css/<path:filename>', methods=['GET'])
+    def lan_web_css(filename):
+        return send_from_directory(os.path.join(web_root, 'css'), filename)
+
+    @app.route('/chunk/<path:filename>', methods=['GET'])
+    def lan_web_chunk(filename):
+        return send_from_directory(os.path.join(web_root, 'chunk'), filename)
+
+    return web_root
 
 
 def _device_id(product_id):
@@ -370,9 +410,11 @@ class LanCloudCompatibility(object):
 def register_lan_cloud_compat_routes(
         app, command_handler_provider, status_store=None, auth_manager=None,
         device_identity_provider=None, realtime_position_provider=None,
-        position_history_provider=None):
+        position_history_provider=None, cleaning_realtime_provider=None,
+        cleaning_history_provider=None, web_root=None):
     """Register cloud-compatible LAN routes on an existing Flask app."""
 
+    register_lan_web_routes(app, web_root=web_root)
     bridge = LanCloudCompatibility(command_handler_provider, status_store=status_store)
     auth_manager = auth_manager or LocalAuthManager()
     device_identity_provider = device_identity_provider or _load_local_device_identity
@@ -457,8 +499,19 @@ def register_lan_cloud_compat_routes(
     def position_number(value):
         try:
             return int(round(float(value)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
+
+    def heading_number(value):
+        """Return a finite RTK heading in the public [0, 360) range."""
+        try:
+            heading = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isnan(heading) or math.isinf(heading):
+            return None
+        heading = round(heading % 360.0, 3)
+        return 0.0 if heading >= 360.0 else heading
 
     def strict_realtime_position(raw):
         raw = raw if isinstance(raw, dict) else {}
@@ -466,12 +519,20 @@ def register_lan_cloud_compat_routes(
         fixed = bool(raw.get('rtkFixAvailable'))
         x = position_number(raw.get('x')) if ready and fixed else None
         y = position_number(raw.get('y')) if ready and fixed else None
+        heading = heading_number(raw.get('heading')) if fixed else None
         return {
             'x': x,
             'y': y,
+            'heading': heading,
             'coordinateReady': ready,
             'rtkFixAvailable': fixed,
         }
+
+    def cleaning_control_state(raw):
+        state = _text(raw.get('controlState')).upper()
+        if state in ('IDLE', 'RUNNING', 'STOPPED', 'START_FAILED', 'COMPLETE'):
+            return state
+        return 'STOPPED' if raw.get('runId') else 'IDLE'
 
     @app.route('/api/t-railcar/realtime-position/<string:product_id>', methods=['GET'])
     def lan_cloud_realtime_position(product_id):
@@ -526,6 +587,58 @@ def register_lan_cloud_compat_routes(
         if area_number is not None:
             data['areaNumber'] = area_number
         return jsonify({'success': True, 'data': data})
+
+    @app.route('/api/t-railcar/cleaning-realtime-position/<string:product_id>', methods=['GET'])
+    def lan_cloud_cleaning_realtime_position(product_id):
+        product_id, error = require_local_product(product_id)
+        if error is not None:
+            return error
+        try:
+            raw = cleaning_realtime_provider() if callable(cleaning_realtime_provider) else {}
+        except Exception:
+            return error_response('清扫实时位置读取失败', 500)
+        raw = raw if isinstance(raw, dict) else {}
+        # strict_realtime_position still uses the internal coordinate-frame
+        # readiness flag to decide whether x/y are valid.  Only after that do
+        # we expose coordinateReady with its cleaning-page meaning: whether the
+        # vehicle is currently inside the task-origin tolerance.
+        data = strict_realtime_position(raw)
+        data.update({
+            'coordinateReady': bool(raw.get('atTaskOrigin')),
+            'taskName': raw.get('taskName'),
+            'runId': raw.get('runId'),
+            'controlState': cleaning_control_state(raw),
+        })
+        return jsonify({'success': True, 'data': data})
+
+    @app.route('/api/t-railcar/cleaning-position-history/<string:product_id>', methods=['GET'])
+    def lan_cloud_cleaning_position_history(product_id):
+        product_id, error = require_local_product(product_id)
+        if error is not None:
+            return error
+        try:
+            raw = cleaning_history_provider() if callable(cleaning_history_provider) else {}
+        except Exception:
+            return error_response('清扫历史轨迹读取失败', 500)
+        raw = raw if isinstance(raw, dict) else {}
+        points = []
+        for item in raw.get('points') or []:
+            if not isinstance(item, dict):
+                continue
+            x, y = position_number(item.get('x')), position_number(item.get('y'))
+            if x is None or y is None:
+                continue
+            point = {'x': x, 'y': y}
+            if item.get('breakBefore'):
+                point['breakBefore'] = True
+            points.append(point)
+        return jsonify({'success': True, 'data': {
+            'taskName': raw.get('taskName'), 'runId': raw.get('runId'), 'points': points,
+            'coordinateReady': bool(raw.get('coordinateReady')),
+            'rtkFixAvailable': bool(raw.get('rtkFixAvailable')),
+            'simplified': bool(raw.get('simplified')),
+            'pointLimitExceeded': bool(raw.get('pointLimitExceeded')),
+        }})
 
     @app.route('/api/t-railcar/command', methods=['POST'])
     def lan_cloud_send_command():

@@ -13,7 +13,7 @@ import util
 from AppLogger import logger
 from mqtt_client import MQTTClient, get_mqtt_client
 from mqtt_handler import MQTTCommandHandler
-from motion_state import derive_motion_state, manual_steering_allowed
+from motion_state import derive_manual_motion_state, manual_steering_allowed
 from status_values import (
     live_heading_from_location,
     live_value_from_report,
@@ -179,12 +179,16 @@ class MQTTIntegration:
             )
             manual_mode = self._get_redis_value('manualSteeringMode', str, 'none') or 'none'
             fault_state = self._build_fault_state(runtime_state)
-            motion_state = derive_motion_state(
+            motion_state = derive_manual_motion_state(
                 live_speed,
                 lower_status=self._get_redis_value('lowerMachineStatus', int, None),
                 control_state=control_state,
                 fault_state=fault_state,
                 manual_mode=manual_mode,
+                stop_requested=current_action == 'parking',
+                z_speed=self._get_redis_value('zSpeed', int, None),
+                power_on=self._get_redis_value('powerOnState', int, None),
+                report_at=hardware_report_at,
             )
             status = {
                 'speed': live_speed,

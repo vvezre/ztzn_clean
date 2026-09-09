@@ -9,7 +9,8 @@
 4. 区域内沿人工记录边界比较正反两个方向，不允许用斜线穿过区域。
 5. 每两个连续路径点生成一条任务：mode=1 是清扫，mode=2 是对接、换行或连接桥移动。
 6. 合并近似直行的普通移动点；清扫折线仅合并5cm内同位点和30cm内明确直行/折返近点。
-7. 输出前强制检查起点、终点和每一段连续性，防止小车执行断裂路线。
+7. 最终统一吸收不超过15cm的相邻执行点，并重新计算连续折线的停车转向标记。
+8. 输出前强制检查起点、终点和每一段连续性，防止小车执行断裂路线。
 
 坐标单位为厘米；航向角约定0度=+y、90度=+x、180度=-y、270度=-x。
 """
@@ -17,64 +18,24 @@ import itertools
 import math
 import time
 
+from route_point_policy import (
+    BOUNDARY_CLASSIFICATION_TOLERANCE_CM, BOUNDARY_CLOSURE_MERGE_CM,
+    BOUNDARY_CORNER_SNAP_CM,
+    BRIDGE_BOUNDARY_JOIN_CM, CLEAN_BACKTRACK_DEG, CLEAN_DUPLICATE_POINT_CM,
+    CLEAN_NEAR_POINT_CM, CLEAN_PATH_HARD_TURN_DEG,
+    EXECUTION_POINT_MERGE_CM, LANE_ENDPOINT_ANCHOR_SNAP_CM,
+    SAME_EDGE_DIRECT_MAX_OFFSET_CM, TRANSITION_BACKTRACK_DEG,
+    TRANSITION_DUPLICATE_POINT_CM, TRANSITION_NEAR_POINT_CM,
+    TRANSFER_HARD_TURN_DEG, TRANSFER_MAX_LATERAL_DEVIATION_CM,
+)
+
 
 # 经纬度与局部厘米坐标互相换算时使用的地球平均半径，单位米。
 EARTH_RADIUS_M = 6371000.0
 # 几何计算的近零阈值。
 EPSILON_CM = 1e-6
-# 区域边界和连接桥由人工遥控打点，RTK 抖动会让本来接近直线的点左右偏几厘米。
-# 只有普通移动 mode=2 使用这条20厘米走廊；清扫线 mode=1 不使用容差合并。
-TRANSFER_MAX_LATERAL_DEVIATION_CM = 20.0
-# 只有边界投影点距离记录角点不超过5cm时，才将它们视为同一物理位置。
-# 5cm以内可能来自RTK抖动、浮点求交和整数厘米取整；超过5cm的边界段必须保留，
-# 不再把16～20cm的真实路线当成误差吸回角点，避免“先退回角点、再掉头返回”。
-BOUNDARY_CORNER_SNAP_CM = 5.0
-# 连接桥首尾点由人工遥控记录，和区域边界可能存在数厘米RTK偏差。桥头距离
-# 最近边界不超过10cm，且从相邻边界锚点直连桥头不会穿过区域内部时，把桥头
-# 直接作为区域与连接桥的接入点，不再保留“边界投影Q -> 桥头L1”的几厘米短任务。
-# 这条阈值只用于桥头接边，不扩大普通点、真实短边和桥内中间点的5cm去重范围。
-BRIDGE_BOUNDARY_JOIN_CM = 10.0
-# 只有当前点和目标点本身都贴在边界上，才允许使用“同边直达”。连接桥可能
-# 位于区域外侧，即使两个最近投影碰巧落在同一边，也仍须经过人工边界锚点。
-SAME_EDGE_DIRECT_MAX_OFFSET_CM = 2.0
-# 清扫线求交端点距真实记录点5cm以内时直接使用记录点。这样既保留人工点，
-# 又不会为了回到只差几厘米的角点额外生成停车掉头任务。
-LANE_ENDPOINT_ANCHOR_SNAP_CM = 5.0
-
-# 跨区域转场会把“区域边界路径、连接桥点、下一片区域边界路径”拼成一条折线。
-# 不同几何步骤可能把同一个物理位置算成相差几厘米的两个点；如果原样落成任务，
-# 小车会为这些 RTK/投影误差停车、掉头，甚至形成 A->B->A 的短距离往返。
-# 5cm 内视为同一个物理连接点。相邻的两个普通中间点若相距不超过30cm，
-# 会组成一个近点簇，并比较保留簇内哪个点能让前后局部路线最短；原点、目标点
-# 和人工连接桥点属于保护点，永远不参加近点删除。孤立的短直角仍按转角规则保留。
-TRANSITION_DUPLICATE_POINT_CM = 5.0
-TRANSITION_NEAR_POINT_CM = 30.0
-TRANSITION_BACKTRACK_DEG = 150.0
-
-# 局部方向变化达到55度才认为是真实硬转弯，必须保留为任务端点，让小车停车重新转向。
-# 记录边界上的小幅摆动和中等方向修正会连续通过，实际接近90度的拐角仍会停车转向。
-TRANSFER_HARD_TURN_DEG = 55.0
-# 同一条边界清扫折线也使用55度作为“必须停车重新转向”的阈值。小于该角度时，
-# 相邻点仍作为真实路径点保留，但执行器连续驶过，不关闭滚刷、不执行原地转向。
-CLEAN_PATH_HARD_TURN_DEG = 55.0
-
-# 人工记录的边界清扫折线中，两点不超过5cm时视为同一物理位置，
-# 禁止拆成“停车转向 -> 行走1cm -> 再停车”的独立清扫任务。5～30cm
-# 只有当其中一点在上下文中属于近似直行或明显原路折返时才删除；
-# 真实的90度短边仍然保留。这些阈值只作用于边界 laneType=boundary。
-CLEAN_DUPLICATE_POINT_CM = 5.0
-CLEAN_NEAR_POINT_CM = 30.0
-CLEAN_BACKTRACK_DEG = 150.0
-# 与预览几何保持一致：同一区域最后记录点回到第一记录点30cm以内时，
-# 规划阶段将末点并入首点。原始建模数据不删除，只有执行转场使用合并后的锚点。
-BOUNDARY_CLOSURE_MERGE_CM = 30.0
-
-# 小于3厘米的普通转场低于当前RTK点到点导航的有效执行尺度，不应单独形成
-# “移动几乎看不见、但停车并重新下发下一任务”的伪任务。这里只处理mode=2
-# 普通转场；清扫线本身以及带preserveStartStop/preserveEndStop的显式停车点
-# 永远保留。被吸收后，下一任务的起点会回填到上一任务终点，并重新计算
-# 航向与长度，因此真正的90度转向仍然存在，只是不再多停一次。
-MIN_EXECUTABLE_TRANSFER_CM = 3.0
+# 点位阈值统一从route_point_policy导入；几何规则在各自阶段执行，最终任务
+# 统一执行15cm相邻点合并。全部规则和调用顺序见docs/route_point_rules.md。
 
 # 入口和出口首先决定清扫线奇偶及S形方向；在端点代价相近时，再用目标重叠
 # 偏差区分候选。该权重只参与同一端点方案内的排序，不是覆盖硬限制。
@@ -321,6 +282,10 @@ def _reanchor_task_start(task, source_task):
     task["startY"] = source_task.get("startY")
     task["startLat"] = source_task.get("startLat")
     task["startLon"] = source_task.get("startLon")
+    if source_task.get("preferredStartPoint"):
+        task["preferredStartPoint"] = True
+    else:
+        task.pop("preferredStartPoint", None)
     return _refresh_task_geometry(task)
 
 
@@ -331,17 +296,28 @@ def _reanchor_task_end(task, source_task):
     task["endY"] = source_task.get("endY")
     task["endLat"] = source_task.get("endLat")
     task["endLon"] = source_task.get("endLon")
+    if source_task.get("preferredEndPoint"):
+        task["preferredEndPoint"] = True
+    else:
+        task.pop("preferredEndPoint", None)
     return _refresh_task_geometry(task)
 
 
-def _remove_short_transfer_tasks(tasks):
-    """
-    吸收低于导航有效尺度的普通转场，同时保持整条任务链首尾连续。
+def _merge_near_executable_tasks(tasks):
+    """在最终规划结果中吸收不超过15cm的相邻执行点。
 
-    典型情况是记录点A6与浮点计算得到的首条清扫线起点实际只差零点几
-    毫米，却因分别取整落在40cm和41cm，形成1cm独立任务。中间短转场
-    被删除时，下一任务起点改为短转场起点；末尾短转场则把上一任务终点
-    延伸到短转场终点。这样不会跳点，也不会删除下一段自身的目标方向。
+    每条任务代表相邻执行点 ``P -> Q``。当 ``|P-Q| <= 15cm`` 时，不再把
+    它交给小车形成一次独立的“停车、转向、到点”过程，而是把P/Q合成一个
+    执行位置：
+
+    - 路线第一点必须保留，防止改变建模原点；
+    - 路线最终点必须保留，防止改变“回原点/不回原点”的最终目标；
+    - 中间短段同时比较保留P或Q后的局部路线长度，选择改动更小的一侧；
+    - 合并只修改任务计划副本，不删除区域点或连接桥原始记录。
+
+    这里不按清扫点、边界点、桥点或保护标记豁免。原因是这些点一旦已经
+    落成相邻执行目标，就必须服从同一个车辆有效执行尺度，不能再生成一条
+    实车几乎不会前进的独立任务。
     """
     compacted = [dict(task) for task in (tasks or [])]
     index = 0
@@ -349,38 +325,131 @@ def _remove_short_transfer_tasks(tasks):
         task = compacted[index]
         start = (_number(task.get("startX")), _number(task.get("startY")))
         end = (_number(task.get("endX")), _number(task.get("endY")))
-        length = None if None in start or None in end else _length_cm(start, end)
-        removable = (
-            int(task.get("mode") or 0) == 2
-            and length is not None
-            and length < MIN_EXECUTABLE_TRANSFER_CM
-            and not task.get("preserveStartStop")
-            and not task.get("preserveEndStop")
-            and not task.get("preserveRecordedPath")
-        )
-        if not removable:
+        if (
+                None in start or None in end
+                or _length_cm(start, end) > EXECUTION_POINT_MERGE_CM):
             index += 1
             continue
 
         previous = compacted[index - 1] if index > 0 else None
         following = compacted[index + 1] if index + 1 < len(compacted) else None
 
-        # 中间或开头的短转场：下一任务从短转场起点直接出发。前一任务
-        # 仍会正常停车；下一任务仍按自己的终点重新计算航向。
-        if following is not None:
+        if previous is None and following is None:
+            # 整条路线都小于有效执行尺度时不能生成空任务，交给最终校验明确拒绝。
+            compacted = []
+            break
+
+        if previous is None:
+            # 第一段必须保留路线原始起点P；下一段改为从P直接前往其原目标。
             compacted[index + 1] = _reanchor_task_start(following, task)
             del compacted[index]
             continue
 
-        # 末尾短转场：上一任务直接落到原短转场终点，保证闭环终点不变。
-        if previous is not None:
+        if following is None:
+            # 最后一段必须保留路线最终目标Q；上一段直接落到Q。
             compacted[index - 1] = _reanchor_task_end(previous, task)
             del compacted[index]
             index = max(0, index - 1)
             continue
 
+        previous_start = (
+            _number(previous.get("startX")), _number(previous.get("startY")),
+        )
+        following_end = (
+            _number(following.get("endX")), _number(following.get("endY")),
+        )
+        if None in previous_start or None in following_end:
+            # 坐标不完整的任务稍后会由连续性校验拒绝；这里不猜测保留哪一端。
+            index += 1
+            continue
+
+        keep_start_cost = (
+            _length_cm(previous_start, start)
+            + _length_cm(start, following_end)
+        )
+        keep_end_cost = (
+            _length_cm(previous_start, end)
+            + _length_cm(end, following_end)
+        )
+        start_is_preferred = bool(task.get("preferredStartPoint"))
+        end_is_preferred = bool(task.get("preferredEndPoint"))
+        keep_end = (
+            (end_is_preferred and not start_is_preferred)
+            or (
+                end_is_preferred == start_is_preferred
+                and _stable_cost_key(keep_end_cost) < _stable_cost_key(keep_start_cost)
+            )
+        )
+        if keep_end:
+            # 保留Q：上一段终点从P调整到Q，下一段原本已经从Q出发。
+            compacted[index - 1] = _reanchor_task_end(previous, task)
+        else:
+            # 保留P：下一段起点从Q调整到P，上一段原本已经落到P。
+            compacted[index + 1] = _reanchor_task_start(following, task)
         del compacted[index]
+        index = max(0, index - 1)
     return compacted
+
+
+def _refresh_continuous_task_markers(tasks):
+    """近点合并后按最终几何重新计算连续折线的停车、转向和序号。"""
+    refreshed = [dict(task) for task in (tasks or [])]
+    index = 0
+    while index < len(refreshed):
+        path_id = refreshed[index].get("continuousPathId")
+        if not path_id:
+            index += 1
+            continue
+        end_index = index + 1
+        while (
+                end_index < len(refreshed)
+                and refreshed[end_index].get("continuousPathId") == path_id):
+            end_index += 1
+        run = refreshed[index:end_index]
+        threshold = (
+            CLEAN_PATH_HARD_TURN_DEG
+            if int(run[0].get("mode") or 0) == 1
+            else TRANSFER_HARD_TURN_DEG
+        )
+        hard_turns = []
+        for run_index in range(len(run) - 1):
+            hard_turns.append(
+                _turn_angle_degrees(
+                    _task_xy(run[run_index], "start"),
+                    _task_xy(run[run_index], "end"),
+                    _task_xy(run[run_index + 1], "end"),
+                ) >= threshold
+            )
+        for run_index, task in enumerate(run):
+            task["continuousPathIndex"] = run_index + 1
+            task["continuousPathCount"] = len(run)
+            task["turnAtStart"] = bool(
+                run_index == 0 or hard_turns[run_index - 1]
+            )
+            task["stopAtEnd"] = bool(
+                run_index == len(run) - 1 or hard_turns[run_index]
+            )
+            if run_index == 0:
+                task.pop("turnAngleAtStart", None)
+            else:
+                task["turnAngleAtStart"] = round(
+                    _turn_angle_degrees(
+                        _task_xy(run[run_index - 1], "start"),
+                        _task_xy(task, "start"),
+                        _task_xy(task, "end"),
+                    ),
+                    1,
+                )
+        refreshed[index:end_index] = run
+        index = end_index
+
+    for task_id, task in enumerate(refreshed, start=1):
+        task["id"] = task_id
+        _refresh_task_geometry(task)
+        # 这两个字段只在规划阶段选择近点代表坐标，不属于保存接口或小车协议。
+        task.pop("preferredStartPoint", None)
+        task.pop("preferredEndPoint", None)
+    return refreshed
 
 
 def _remove_short_task_backtracks(tasks):
@@ -539,6 +608,10 @@ def _merge_task_span(tasks, start_index, end_index):
     merged["endY"] = last.get("endY")
     merged["endLat"] = last.get("endLat")
     merged["endLon"] = last.get("endLon")
+    if last.get("preferredEndPoint"):
+        merged["preferredEndPoint"] = True
+    else:
+        merged.pop("preferredEndPoint", None)
 
     start = (_number(merged.get("startX")), _number(merged.get("startY")))
     end = (_number(merged.get("endX")), _number(merged.get("endY")))
@@ -637,13 +710,12 @@ def _compact_executable_tasks(tasks):
     """
     合并同模式、同方向、同一直线上的普通中间任务段。
 
-    区域边界采样点、前端绘图点或连接桥中间点只有在真正形成拐角时才会留下；
-    清扫模式发生变化或显式标记为必须停车的位置永远不会被跨越合并。
+    先处理原有的折返、共线和普通移动走廊简化；最后统一合并15cm执行点。
+    15cm规则不因区域、桥、清扫或显式停车来源而产生例外。
     """
-    # 先删除跨“清扫末段/转场首段”边界的短距离原路折返，再吸收低于导航
-    # 有效尺度的普通短转场；随后执行原有的共线合并和转角简化。
+    # 先删除跨“清扫末段/转场首段”边界的短距离原路折返；随后执行
+    # 共线合并和普通移动转角简化。所有来源的15cm执行点只在末尾统一合并。
     tasks = _remove_short_task_backtracks(tasks)
-    tasks = _remove_short_transfer_tasks(tasks)
 
     # Preserve the old exact-collinear behaviour for every task mode first.
     # This also keeps compatibility with existing saved plans and tests.
@@ -680,6 +752,7 @@ def _compact_executable_tasks(tasks):
         compacted.extend(_simplify_transfer_run(run))
         index = next_index
 
+    compacted = _merge_near_executable_tasks(compacted)
     for index, task in enumerate(compacted, start=1):
         task["id"] = index
     return compacted
@@ -961,6 +1034,8 @@ def _append_transition_tasks(
     若两个区域没有可达的连接桥，直接报错，不允许机器人跨空直线行驶。
     """
     route_edges = _link_route_between(preview, from_group_id, to_group_id, mapper)
+    if route_edges:
+        route_edges = _route_edges_with_boundary_portals(route_edges, draft, mapper)
     # 连接桥点是人工明确记录的跨区通道，不能被30cm近点规则删掉。首尾任务点
     # 也会在简化函数内部自动保护；这里收集路线经过的全部桥点作为额外保护点。
     protected_transition_points = []
@@ -1029,6 +1104,7 @@ def _append_transition_tasks(
         task_id,
         source,
         preserve_recorded_path=len(path_points) > 2,
+        preferred_points=protected_transition_points,
     )
 
 
@@ -1390,6 +1466,103 @@ def _straight_segment_avoids_polygon_interior(start, end, polygon):
         if _point_strictly_inside_polygon(midpoint, polygon):
             return False
     return True
+
+
+def _segment_boundary_exit_from_inside(start, end, polygon):
+    """返回一条线段从多边形内部向外穿出时的第一个真实边界交点。"""
+    parameters = _segment_polygon_crossing_parameters(start, end, polygon)
+    for parameter_index in range(1, len(parameters)):
+        boundary_parameter = parameters[parameter_index]
+        previous_parameter = parameters[parameter_index - 1]
+        before_parameter = (previous_parameter + boundary_parameter) / 2.0
+        before = (
+            start[0] + (end[0] - start[0]) * before_parameter,
+            start[1] + (end[1] - start[1]) * before_parameter,
+        )
+        if not _point_strictly_inside_polygon(before, polygon):
+            continue
+
+        if boundary_parameter < 1.0 - EPSILON_CM:
+            next_parameter = parameters[parameter_index + 1]
+            after_parameter = (boundary_parameter + next_parameter) / 2.0
+            after = (
+                start[0] + (end[0] - start[0]) * after_parameter,
+                start[1] + (end[1] - start[1]) * after_parameter,
+            )
+            remains_inside = _point_strictly_inside_polygon(after, polygon)
+        else:
+            remains_inside = _point_strictly_inside_polygon(end, polygon)
+        if remains_inside:
+            # 与凹多边形边界相切但仍留在区域内部，不把切点误当作桥口。
+            continue
+        return (
+            start[0] + (end[0] - start[0]) * boundary_parameter,
+            start[1] + (end[1] - start[1]) * boundary_parameter,
+        )
+    return None
+
+
+def _trim_inside_link_start_to_boundary(points, polygon):
+    """桥首点在区域内时，沿真实桥折线裁到第一次离开区域的交点。"""
+    original = _dedupe_xy_path(points)
+    start_projection = (
+        _nearest_boundary_projection(original[0], polygon)
+        if len(polygon) >= 3 and original else None
+    )
+    meaningfully_inside = (
+        start_projection is not None
+        and _point_strictly_inside_polygon(original[0], polygon)
+        and _length_cm(original[0], start_projection["point"])
+        > BOUNDARY_CLASSIFICATION_TOLERANCE_CM
+    )
+    if len(original) < 2 or len(polygon) < 3 or not meaningfully_inside:
+        return original, False
+
+    for index in range(len(original) - 1):
+        portal = _segment_boundary_exit_from_inside(
+            original[index], original[index + 1], polygon,
+        )
+        if portal is None:
+            continue
+        # 桥口以前位于区域内部的桥点不再成为执行目标；从真实交点开始使用
+        # 原桥折线，既保留L形/多点桥形状，也不会先去内部桥点再掉头。
+        return _dedupe_xy_path([portal] + original[index + 1:]), True
+    # 桥折线始终没有离开区域，无法得到可信交点，必须保留原接入方法。
+    return original, False
+
+
+def _route_edges_with_boundary_portals(route_edges, draft, mapper):
+    """仅将位于所属区域内部的桥端点替换为沿桥方向得到的真实桥口。
+
+    外部桥端点保持不变，后续继续执行最近边界投影的原接入算法；因此不会
+    为了求交而把一座尚未到达区域边界的连接桥凭空延长。
+    """
+    result = []
+    for raw_edge in route_edges or []:
+        edge = dict(raw_edge)
+        points = list(edge.get("points") or [])
+
+        from_polygon = _group_recorded_xy(
+            draft, edge.get("fromGroupId"), mapper,
+        )
+        points, start_replaced = _trim_inside_link_start_to_boundary(
+            points, from_polygon,
+        )
+
+        to_polygon = _group_recorded_xy(
+            draft, edge.get("toGroupId"), mapper,
+        )
+        reversed_points, end_replaced = _trim_inside_link_start_to_boundary(
+            list(reversed(points)), to_polygon,
+        )
+        if end_replaced:
+            points = list(reversed(reversed_points))
+
+        edge["points"] = _dedupe_xy_path(points)
+        edge["startUsesBoundaryPortal"] = bool(start_replaced)
+        edge["endUsesBoundaryPortal"] = bool(end_replaced)
+        result.append(edge)
+    return result
 
 
 def _boundary_anchor_candidates(projection, anchors):
@@ -1994,7 +2167,8 @@ def _append_xy_path(
         mapper,
         task_id,
         source,
-        preserve_recorded_path=False):
+        preserve_recorded_path=False,
+        preferred_points=None):
     """把相对坐标折线拆成连续mode=2任务，并可强制保留全部人工记录点。"""
     path_tasks = []
     for index in range(len(path_points) - 1):
@@ -2008,6 +2182,10 @@ def _append_xy_path(
             source,
         )
         if task is not None:
+            if _is_protected_transition_point(path_points[index], preferred_points):
+                task["preferredStartPoint"] = True
+            if _is_protected_transition_point(path_points[index + 1], preferred_points):
+                task["preferredEndPoint"] = True
             path_tasks.append(task)
     if preserve_recorded_path and path_tasks:
         _mark_continuous_path_tasks(
@@ -2211,19 +2389,16 @@ def _validate_continuous_round_trip(tasks, origin, return_to_origin=True):
     if not tasks:
         raise ModelingTaskGenerationError("generated task path is empty")
 
-    # 最终防线：边界近点应在拆任务前已被合并。如果这里仍出现
-    # 5cm以内的mode=1清扫段，说明某条新生成链路绕过了统一清理；
-    # 此时宁可拒绝保存，也不把“转向-走1cm-再转向”任务交给实车。
+    # 最终防线：任何来源的15cm执行点都应已在统一收尾阶段合并。如果仍有
+    # 短任务，说明某条新链路绕过了统一规则；此时拒绝保存，不交给实车。
     for task in tasks:
-        if int(task.get("mode") or 0) != 1 or task.get("source") != "modeling_clean":
-            continue
-        clean_start = _task_xy(task, "start")
-        clean_end = _task_xy(task, "end")
-        if _length_cm(clean_start, clean_end) <= CLEAN_DUPLICATE_POINT_CM:
+        task_start = _task_xy(task, "start")
+        task_end = _task_xy(task, "end")
+        if _length_cm(task_start, task_end) <= EXECUTION_POINT_MERGE_CM:
             raise ModelingTaskGenerationError(
-                "generated cleaning task {} is not longer than {}cm".format(
+                "generated task {} is not longer than {}cm".format(
                     task.get("id"),
-                    int(CLEAN_DUPLICATE_POINT_CM),
+                    int(EXECUTION_POINT_MERGE_CM),
                 )
             )
 
@@ -2244,6 +2419,25 @@ def _validate_continuous_round_trip(tasks, origin, return_to_origin=True):
 
     if return_to_origin and _task_xy(tasks[-1], "end") != rounded_origin:
         raise ModelingTaskGenerationError("generated task path does not return to the modeling origin")
+
+
+def _finalize_generated_tasks(tasks, origin, clean_count, return_to_origin=True):
+    """所有路线共用的收尾入口：压缩 -> 15cm合并 -> 刷新标记 -> 校验。
+
+    15cm规则必须在全部区域、桥和清扫线已经拼成一条完整任务链后执行，才能
+    不按点的来源区别对待。合并完成后再重新计算连续折线停车/转向标记，避免
+    保留被删除点对应的旧角度或序号。
+    """
+    tasks = _compact_executable_tasks(tasks)
+    tasks = _refresh_continuous_task_markers(tasks)
+    _validate_continuous_round_trip(tasks, origin, return_to_origin=return_to_origin)
+    return tasks, {
+        "taskCount": len(tasks),
+        "cleanTaskCount": clean_count,
+        "cleanSegmentTaskCount": sum(1 for task in tasks if int(task.get("mode") or 0) == 1),
+        "transferTaskCount": sum(1 for task in tasks if int(task.get("mode") or 0) == 2),
+        "totalLengthCm": sum(int(task.get("length") or 0) for task in tasks),
+    }
 
 
 def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=None):
@@ -2380,29 +2574,17 @@ def _generate_bridge_round_trip_plan(draft, preview, mapper, route_policy, now=N
 
     if not tasks or clean_count == 0:
         raise ModelingTaskGenerationError("route policy produced no cleaning tasks")
-    # 全部几何段生成后再合并近似直行的mode=2中间点，降低无意义停车次数。
-    tasks = _compact_executable_tasks(tasks)
-    # clean_count保持“清扫线数量”的历史含义；一条边界折线虽然会拆成多个连续
-    # mode=1执行子段，但对业务和前端仍然只算一条清扫线。
-    clean_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
-    transfer_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 2)
-    _validate_continuous_round_trip(
+    tasks, summary = _finalize_generated_tasks(
         tasks,
         (mapper.origin["x"], mapper.origin["y"]),
+        clean_count,
     )
-    total_length = sum(int(task.get("length") or 0) for task in tasks)
     return {
         "status": "ready",
         "generatedAt": int(now if now is not None else time.time()),
         "taskName": draft.get("name") or draft.get("id") or "",
         "routeType": "bridge_round_trip",
-        "summary": {
-            "taskCount": len(tasks),
-            "cleanTaskCount": clean_count,
-            "cleanSegmentTaskCount": clean_segment_count,
-            "transferTaskCount": transfer_segment_count,
-            "totalLengthCm": total_length,
-        },
+        "summary": summary,
         "tasks": tasks,
     }
 
@@ -2453,7 +2635,8 @@ def _resolve_area_order(preview, route_policy):
     return ordered_groups
 
 
-def _transition_entry_reference(preview, from_group_id, to_group_id, mapper, fallback):
+def _transition_entry_reference(
+        preview, draft, from_group_id, to_group_id, mapper, fallback):
     """返回跨区路线到达目标区域一侧的桥头，供S形入口评分使用。"""
     if from_group_id == to_group_id:
         return fallback
@@ -2463,11 +2646,14 @@ def _transition_entry_reference(preview, from_group_id, to_group_id, mapper, fal
         raise ModelingTaskGenerationError(
             "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
         )
-    # 最后一座桥的最后一个点位于目标区域一侧，是目标区域的入口评分参考点。
+    route_edges = _route_edges_with_boundary_portals(route_edges, draft, mapper)
+    # 目标侧桥点若在区域内部，这里返回沿桥方向求得的真实边界交点；若桥点
+    # 在区域外，则仍返回原桥点并由旧边界接入算法处理。
     return route_edges[-1]["points"][-1]
 
 
-def _transition_exit_reference(preview, from_group_id, to_group_id, mapper, fallback):
+def _transition_exit_reference(
+        preview, draft, from_group_id, to_group_id, mapper, fallback):
     """返回离开当前区域时应靠近的第一座桥头，供S形出口评分使用。"""
     if from_group_id == to_group_id:
         return fallback
@@ -2477,7 +2663,8 @@ def _transition_exit_reference(preview, from_group_id, to_group_id, mapper, fall
         raise ModelingTaskGenerationError(
             "modeling groups {} and {} are not connected".format(from_group_id, to_group_id)
         )
-    # 第一座桥的第一个点位于当前区域一侧，是当前区域的出口评分参考点。
+    route_edges = _route_edges_with_boundary_portals(route_edges, draft, mapper)
+    # 当前侧桥点若在区域内部，入口评分同样使用真实桥口而不是内部桥点。
     return route_edges[0]["points"][0]
 
 
@@ -2512,6 +2699,7 @@ def _generate_area_order_plan(
         # 入口参考：同区域时用当前位置，跨区时用到达目标区域的最后一个桥头。
         entry_reference = _transition_entry_reference(
             preview,
+            draft,
             current_group_id,
             group_id,
             mapper,
@@ -2523,6 +2711,7 @@ def _generate_area_order_plan(
         if not is_last_group or return_to_origin:
             exit_reference = _transition_exit_reference(
                 preview,
+                draft,
                 group_id,
                 next_group_id,
                 mapper,
@@ -2594,14 +2783,9 @@ def _generate_area_order_plan(
             source="modeling_return_origin",
         )
 
-    # 删除小于3cm伪转场、合并普通连续转向转场，同时保留55°以上真实拐点。
-    tasks = _compact_executable_tasks(tasks)
-    # 边界折线的多个mode=1子段属于同一条清扫线，不能改变cleanTaskCount的历史含义。
-    clean_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 1)
-    transfer_segment_count = sum(1 for task in tasks if int(task.get("mode") or 0) == 2)
-    # 两种版本都必须从原点开始且段段连续；只有返回版本要求末段回到原点。
-    _validate_continuous_round_trip(tasks, origin, return_to_origin=return_to_origin)
-    total_length = sum(int(task.get("length") or 0) for task in tasks)
+    tasks, summary = _finalize_generated_tasks(
+        tasks, origin, clean_count, return_to_origin=return_to_origin,
+    )
     return {
         "status": "ready",
         "generatedAt": int(now if now is not None else time.time()),
@@ -2610,13 +2794,7 @@ def _generate_area_order_plan(
         "returnToOrigin": bool(return_to_origin),
         "areaOrder": [group.get("areaNumber") for group in ordered_groups],
         "routeSelections": selections,
-        "summary": {
-            "taskCount": len(tasks),
-            "cleanTaskCount": clean_count,
-            "cleanSegmentTaskCount": clean_segment_count,
-            "transferTaskCount": transfer_segment_count,
-            "totalLengthCm": total_length,
-        },
+        "summary": summary,
         "tasks": tasks,
     }
 

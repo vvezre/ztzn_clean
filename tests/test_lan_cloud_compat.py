@@ -57,6 +57,7 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
         self.realtime_position = {
             'x': 123,
             'y': 456,
+            'heading': 92.6,
             'coordinateReady': True,
             'rtkFixAvailable': True,
         }
@@ -295,10 +296,27 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
             'data': {
                 'x': 123,
                 'y': 456,
+                'heading': 92.6,
                 'coordinateReady': True,
                 'rtkFixAvailable': True,
             },
         }, response.get_json())
+
+    def test_realtime_heading_is_normalized_and_requires_rtk_fix(self):
+        self.realtime_position['heading'] = -10.0
+        result = self.client.get(
+            '/api/t-railcar/realtime-position/250006').get_json()['data']
+        self.assertEqual(350.0, result['heading'])
+
+        self.realtime_position['heading'] = 370.25
+        result = self.client.get(
+            '/api/t-railcar/realtime-position/250006').get_json()['data']
+        self.assertEqual(10.25, result['heading'])
+
+        self.realtime_position['rtkFixAvailable'] = False
+        result = self.client.get(
+            '/api/t-railcar/realtime-position/250006').get_json()['data']
+        self.assertIsNone(result['heading'])
 
     def test_position_history_returns_the_exact_frontend_contract(self):
         response = self.client.get('/api/t-railcar/position-history/250006')
