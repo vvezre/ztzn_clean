@@ -14,7 +14,8 @@ class CleaningPositionApiTests(unittest.TestCase):
         self.live = {'taskName': u'清扫测试', 'runId': 'clean_test', 'x': 123, 'y': 456,
                      'heading': 92.6,
                      'coordinateReady': True, 'rtkFixAvailable': True,
-                     'atTaskOrigin': False, 'controlState': 'RUNNING'}
+                     'atTaskOrigin': False, 'cleaningCoordinateReady': True,
+                     'controlState': 'RUNNING'}
         self.history = dict(self.live, points=[{'x': 0, 'y': 0}, {'x': 5, 'y': 1},
                            {'x': 30, 'y': 40, 'breakBefore': True}], simplified=True)
         auth = LocalAuthManager(config={
@@ -56,7 +57,7 @@ class CleaningPositionApiTests(unittest.TestCase):
         self.assertEqual({'success': True, 'data': {
             'taskName': u'清扫测试', 'runId': 'clean_test', 'x': 123, 'y': 456,
             'heading': 92.6,
-            'coordinateReady': False, 'rtkFixAvailable': True,
+            'coordinateReady': True, 'rtkFixAvailable': True,
             'controlState': 'RUNNING',
         }}, self.payload(response))
         self.assertEqual([], self.calls)
@@ -74,16 +75,18 @@ class CleaningPositionApiTests(unittest.TestCase):
     def test_at_origin_flag_does_not_gate_valid_xy(self):
         self.login()
         self.live['atTaskOrigin'] = True
+        self.live['cleaningCoordinateReady'] = True
         result = self.payload(self.get('realtime-position'))['data']
         self.assertTrue(result['coordinateReady'])
         self.live['atTaskOrigin'] = False
+        self.live['cleaningCoordinateReady'] = False
         result = self.payload(self.get('realtime-position'))['data']
         self.assertFalse(result['coordinateReady'])
         self.assertEqual((123, 456), (result['x'], result['y']))
 
     def test_realtime_exposes_only_supported_control_states(self):
         self.login()
-        for state in ('IDLE', 'RUNNING', 'STOPPED', 'START_FAILED', 'COMPLETE'):
+        for state in ('IDLE', 'RUNNING', 'RETURNING', 'STOPPED', 'START_FAILED', 'COMPLETE'):
             self.live['controlState'] = state
             self.assertEqual(state, self.payload(self.get('realtime-position'))['data']['controlState'])
         self.live['controlState'] = 'FAULT'

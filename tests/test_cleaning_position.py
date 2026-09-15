@@ -11,7 +11,10 @@ import tempfile
 import unittest
 
 from cleaning_position import (CleaningPositionHistory, CleaningPositionService,
-    cleaning_origin, simplify_history, _distance_to_segment)
+    cleaning_origin, simplify_history, _distance_to_segment,
+    modeling_position_context_is_current, resolve_cleaning_coordinate_ready,
+    resolve_live_cleaning_control_state,
+    resolve_position_task_name, route_position_snapshot)
 from modeling_coordinates import EARTH_RADIUS_M
 
 
@@ -262,6 +265,65 @@ class CleaningHistoryTests(unittest.TestCase):
             shutil.rmtree(directory)
 
 
+class LiveCleaningControlStateTests(unittest.TestCase):
+    def test_live_auto_clean_running_overrides_stale_stopped_cache(self):
+        cached = {'runId': 'clean_old', 'controlState': 'STOPPED'}
+        live = {'controlState': 'RUNNING', 'action': 'auto_drive'}
+        self.assertEqual('RUNNING', resolve_live_cleaning_control_state(cached, live))
+
+    def test_auto_clean_ready_pause_and_stopping_remain_running_to_ui(self):
+        cached = {'runId': 'clean_current', 'controlState': 'STOPPED'}
+        for state in ('READY', 'PAUSED', 'STOPPING'):
+            live = {'controlState': state, 'action': 'auto_drive'}
+            self.assertEqual('RUNNING', resolve_live_cleaning_control_state(cached, live))
+
+    def test_stopped_runtime_clears_stale_running_cache(self):
+        cached = {'runId': 'clean_current', 'controlState': 'RUNNING'}
+        live = {'controlState': 'STOPPED', 'action': 'idle'}
+        self.assertEqual('STOPPED', resolve_live_cleaning_control_state(cached, live))
+
+    def test_manual_motion_is_not_reported_as_automatic_cleaning(self):
+        cached = {'runId': 'clean_old', 'controlState': 'RUNNING'}
+        live = {'controlState': 'RUNNING', 'action': 'manual_steering'}
+        self.assertEqual('STOPPED', resolve_live_cleaning_control_state(cached, live))
+
+    def test_return_and_completed_cleaning_use_live_runtime(self):
+        cached = {'runId': 'clean_current', 'controlState': 'STOPPED'}
+        returning = {'controlState': 'RUNNING', 'action': 'return_to_point'}
+        complete = {'controlState': 'COMPLETE', 'action': 'idle',
+                    'detail': {'action': 'auto_drive'}}
+        self.assertEqual('RETURNING', resolve_live_cleaning_control_state(cached, returning))
+        self.assertEqual('COMPLETE', resolve_live_cleaning_control_state(cached, complete))
+
+    def test_start_failure_and_never_started_idle_are_preserved(self):
+        failed = {'runId': 'clean_old', 'controlState': 'START_FAILED'}
+        self.assertEqual('START_FAILED', resolve_live_cleaning_control_state(
+            failed, {'controlState': 'BLOCKED', 'action': 'idle'}))
+        self.assertEqual('IDLE', resolve_live_cleaning_control_state(
+            {'runId': None, 'controlState': 'IDLE'},
+            {'controlState': 'STOPPED', 'action': 'idle'}))
+
+    def test_coordinate_ready_is_latched_only_during_accepted_cleaning_run(self):
+        for state in ('READY', 'RUNNING', 'PAUSED', 'STOPPING'):
+            self.assertTrue(resolve_cleaning_coordinate_ready(False, {
+                'controlState': state,
+                'action': 'auto_drive',
+            }))
+        self.assertFalse(resolve_cleaning_coordinate_ready(False, {
+            'controlState': 'COMPLETE',
+            'action': 'idle',
+            'detail': {'action': 'auto_drive'},
+        }))
+        self.assertFalse(resolve_cleaning_coordinate_ready(False, {
+            'controlState': 'BLOCKED',
+            'action': 'auto_drive',
+        }))
+        self.assertTrue(resolve_cleaning_coordinate_ready(True, {
+            'controlState': 'STOPPED',
+            'action': 'idle',
+        }))
+
+
 class CompressionTests(unittest.TestCase):
     def points(self, coords):
         return [dict(x=x, y=y, index=i) for i, (x, y) in enumerate(coords)]
@@ -305,6 +367,71 @@ class CompressionTests(unittest.TestCase):
 
 
 class OriginAndServiceTests(unittest.TestCase):
+    def test_saved_route_snapshot_uses_its_model_origin(self):
+        config = task()
+        lat, lon = gps(25)
+        snapshot = route_position_snapshot(config, lat, lon, True)
+        self.assertEqual((25, 0), (snapshot['x'], snapshot['y']))
+        self.assertTrue(snapshot['coordinateReady'])
+        self.assertTrue(snapshot['rtkFixAvailable'])
+        self.assertFalse(snapshot['atTaskOrigin'])
+
+    def test_saved_route_snapshot_without_fixed_rtk_keeps_frame_but_nulls_xy(self):
+        lat, lon = gps(25)
+        snapshot = route_position_snapshot(task(), lat, lon, False)
+        self.assertIsNone(snapshot['x'])
+        self.assertIsNone(snapshot['y'])
+        self.assertTrue(snapshot['coordinateReady'])
+        self.assertFalse(snapshot['rtkFixAvailable'])
+        self.assertFalse(snapshot['atTaskOrigin'])
+
+    def test_saved_route_snapshot_can_load_origin_from_saved_model(self):
+        seen = []
+        config = {'taskName': 'selected', 'modelId': 'model-1', 'taskList': []}
+        lat, lon = gps(8)
+        snapshot = route_position_snapshot(
+            config,
+            lat,
+            lon,
+            True,
+            lambda model_id: (
+                seen.append(model_id) or {'groups': [{'points': [dict(ORIGIN)]}]}
+            ),
+        )
+        self.assertEqual(['model-1'], seen)
+        self.assertEqual((8, 0), (snapshot['x'], snapshot['y']))
+        self.assertTrue(snapshot['atTaskOrigin'])
+
+    def test_selected_route_wins_over_stale_stopped_cleaning_cache(self):
+        cached = {'taskName': 'old', 'controlState': 'STOPPED'}
+        fsm = {'action': 'idle', 'controlState': 'STOPPED'}
+        self.assertEqual('selected', resolve_position_task_name('selected', cached, fsm))
+
+    def test_active_cleaning_and_return_route_win_over_selected_route(self):
+        running = {'taskName': 'running', 'controlState': 'RUNNING'}
+        cleaning_fsm = {'action': 'auto_drive', 'controlState': 'RUNNING'}
+        self.assertEqual('running', resolve_position_task_name('selected', running, cleaning_fsm))
+        return_fsm = {
+            'action': 'return_to_point',
+            'controlState': 'RUNNING',
+            'detail': {'taskName': 'returning'},
+        }
+        self.assertEqual('returning', resolve_position_task_name('selected', running, return_fsm))
+
+    def test_later_route_selection_overrides_abandoned_recording_session(self):
+        self.assertFalse(modeling_position_context_is_current(
+            'recording', 100.0, 101.0, 'selected'))
+        self.assertTrue(modeling_position_context_is_current(
+            'recording', 102.0, 101.0, 'selected'))
+        self.assertFalse(modeling_position_context_is_current(
+            'ready', 102.0, 101.0, 'selected'))
+
+    def test_pre_timestamp_migration_prefers_existing_selected_route(self):
+        self.assertFalse(modeling_position_context_is_current(
+            'recording', 100.0, None, 'selected'))
+        self.assertTrue(modeling_position_context_is_current(
+            'recording', 100.0, None, None))
+
     def test_model_loader_is_given_saved_model_id(self):
         seen = []
         def loader(model_id):

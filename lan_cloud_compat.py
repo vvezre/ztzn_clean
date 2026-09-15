@@ -520,17 +520,22 @@ def register_lan_cloud_compat_routes(
         x = position_number(raw.get('x')) if ready and fixed else None
         y = position_number(raw.get('y')) if ready and fixed else None
         heading = heading_number(raw.get('heading')) if fixed else None
-        return {
+        data = {
             'x': x,
             'y': y,
             'heading': heading,
             'coordinateReady': ready,
             'rtkFixAvailable': fixed,
         }
+        # Keep the modeling realtime contract unchanged in ordinary states.
+        # It gains this field only while the explicit return command is active.
+        if _text(raw.get('controlState')).upper() == 'RETURNING':
+            data['controlState'] = 'RETURNING'
+        return data
 
     def cleaning_control_state(raw):
         state = _text(raw.get('controlState')).upper()
-        if state in ('IDLE', 'RUNNING', 'STOPPED', 'START_FAILED', 'COMPLETE'):
+        if state in ('IDLE', 'RUNNING', 'RETURNING', 'STOPPED', 'START_FAILED', 'COMPLETE'):
             return state
         return 'STOPPED' if raw.get('runId') else 'IDLE'
 
@@ -599,12 +604,14 @@ def register_lan_cloud_compat_routes(
             return error_response('清扫实时位置读取失败', 500)
         raw = raw if isinstance(raw, dict) else {}
         # strict_realtime_position still uses the internal coordinate-frame
-        # readiness flag to decide whether x/y are valid.  Only after that do
-        # we expose coordinateReady with its cleaning-page meaning: whether the
-        # vehicle is currently inside the task-origin tolerance.
+        # readiness flag to decide whether x/y are valid. Only after that do
+        # we expose coordinateReady with its cleaning-page origin-check
+        # meaning. The provider latches it for an accepted active cleaning run.
         data = strict_realtime_position(raw)
         data.update({
-            'coordinateReady': bool(raw.get('atTaskOrigin')),
+            'coordinateReady': bool(raw.get('coordinateReady')) and bool(
+                raw.get('cleaningCoordinateReady', raw.get('atTaskOrigin'))
+            ),
             'taskName': raw.get('taskName'),
             'runId': raw.get('runId'),
             'controlState': cleaning_control_state(raw),

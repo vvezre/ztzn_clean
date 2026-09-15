@@ -10,6 +10,7 @@ from modeling_simulator import (
     SCENARIO_POINTS,
     SCENARIO_NEW_AREA_INDEXES,
     SCENARIO_NEW_LINK_INDEXES,
+    scenario_point,
 )
 from position_history import ModelingPositionHistory
 
@@ -54,6 +55,7 @@ class ModelingSimulatorLanTests(unittest.TestCase):
 
     def test_realtime_position_uses_simulator_coordinates(self):
         client = self._authorized_client()
+        self.assertTrue(self.controller.start_modeling()['success'])
         self.controller._on_playback_position({
             'local_x': 123, 'local_y': 456, 'heading': 92.6})
         self.history.observe(self.controller.current_position())
@@ -69,6 +71,58 @@ class ModelingSimulatorLanTests(unittest.TestCase):
                 'rtkFixAvailable': True,
             },
         }, response.get_json())
+
+    def test_selected_route_origin_replaces_stale_modeling_coordinates(self):
+        client = self._authorized_client()
+        self.assertTrue(self.controller.preload_scenario()['success'])
+        self.assertTrue(self.controller.save_modeling_task('selected-route')['success'])
+
+        # Reproduce the production failure mode: an unfinished newer modeling
+        # session currently owns local_x/local_y, then the frontend explicitly
+        # selects a saved route without starting automatic cleaning.
+        self.assertTrue(self.controller.start_modeling()['success'])
+        point = scenario_point(2)
+        point.update({'local_x': 777, 'local_y': 888})
+        self.controller._on_playback_position(point)
+        before = client.get(
+            '/api/t-railcar/realtime-position/999999'
+        ).get_json()['data']
+        self.assertEqual((777, 888), (before['x'], before['y']))
+
+        self.assertTrue(self.controller.set_current_task('selected-route')['success'])
+        ordinary = client.get(
+            '/api/t-railcar/realtime-position/999999'
+        ).get_json()['data']
+        cleaning = client.get(
+            '/api/t-railcar/cleaning-realtime-position/999999'
+        ).get_json()['data']
+
+        # The RTK sample corresponds to scenario point 3 in the saved route's
+        # frame. The stale 777/888 modeling values must no longer leak out.
+        self.assertEqual((344, 86), (ordinary['x'], ordinary['y']))
+        self.assertEqual((344, 86), (cleaning['x'], cleaning['y']))
+        self.assertTrue(ordinary['coordinateReady'])
+        # The public cleaning adapter intentionally exposes coordinateReady as
+        # "currently at this task origin"; x/y remain available away from it.
+        self.assertFalse(cleaning['coordinateReady'])
+        self.assertEqual('selected-route', cleaning['taskName'])
+        self.assertIsNone(cleaning['runId'])
+        self.assertEqual('IDLE', cleaning['controlState'])
+
+    def test_new_modeling_after_route_selection_reclaims_ordinary_position(self):
+        client = self._authorized_client()
+        self.assertTrue(self.controller.preload_scenario()['success'])
+        self.assertTrue(self.controller.save_modeling_task('selected-route')['success'])
+        self.assertTrue(self.controller.set_current_task('selected-route')['success'])
+        self.assertTrue(self.controller.start_modeling()['success'])
+
+        point = scenario_point(2)
+        point.update({'local_x': 555, 'local_y': 666})
+        self.controller._on_playback_position(point)
+        ordinary = client.get(
+            '/api/t-railcar/realtime-position/999999'
+        ).get_json()['data']
+        self.assertEqual((555, 666), (ordinary['x'], ordinary['y']))
 
     def test_history_records_simulator_playback_positions(self):
         client = self._authorized_client()
@@ -100,6 +154,23 @@ class ModelingSimulatorLanTests(unittest.TestCase):
         client = self._authorized_client()
         response = client.get('/api/t-railcar/realtime-position/250006')
         self.assertEqual(404, response.status_code)
+
+    def test_both_realtime_interfaces_expose_returning_only_during_return(self):
+        client = self._authorized_client()
+        self.assertTrue(self.controller.preload_scenario()['success'])
+        self.assertTrue(self.controller.save_modeling_task('return-test')['success'])
+        self.assertTrue(self.controller.set_current_task('return-test', False)['success'])
+
+        ordinary = client.get('/api/t-railcar/realtime-position/999999').get_json()['data']
+        self.assertNotIn('controlState', ordinary)
+        # Exercise the same LAN command endpoint used by the frontend instead
+        # of invoking the simulator controller directly.
+        self._command('return_to_point')
+
+        modeling = client.get('/api/t-railcar/realtime-position/999999').get_json()['data']
+        cleaning = client.get('/api/t-railcar/cleaning-realtime-position/999999').get_json()['data']
+        self.assertEqual('RETURNING', modeling['controlState'])
+        self.assertEqual('RETURNING', cleaning['controlState'])
 
     def test_full_three_area_flow_matches_robot_attribution_and_reset(self):
         client = self._authorized_client()

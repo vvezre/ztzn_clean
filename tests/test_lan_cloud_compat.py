@@ -318,6 +318,21 @@ class LanCloudCompatibilityRouteTests(unittest.TestCase):
             '/api/t-railcar/realtime-position/250006').get_json()['data']
         self.assertIsNone(result['heading'])
 
+    def test_modeling_realtime_adds_only_returning_control_state(self):
+        ordinary = self.client.get(
+            '/api/t-railcar/realtime-position/250006').get_json()['data']
+        self.assertNotIn('controlState', ordinary)
+
+        self.realtime_position['controlState'] = 'RETURNING'
+        returning = self.client.get(
+            '/api/t-railcar/realtime-position/250006').get_json()['data']
+        self.assertEqual('RETURNING', returning['controlState'])
+
+        self.realtime_position['controlState'] = 'RUNNING'
+        running = self.client.get(
+            '/api/t-railcar/realtime-position/250006').get_json()['data']
+        self.assertNotIn('controlState', running)
+
     def test_position_history_returns_the_exact_frontend_contract(self):
         response = self.client.get('/api/t-railcar/position-history/250006')
 

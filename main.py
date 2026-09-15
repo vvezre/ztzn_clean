@@ -117,7 +117,10 @@ from dev_console.state_readers import (
 from modeling_routes import register_modeling_routes
 from lan_cloud_compat import register_lan_cloud_compat_routes
 from position_history import ModelingPositionHistory
-from cleaning_position import CleaningPositionHistory, CleaningPositionService
+from cleaning_position import (CleaningPositionHistory, CleaningPositionService,
+    modeling_position_context_is_current, resolve_cleaning_coordinate_ready,
+    resolve_live_cleaning_control_state, resolve_position_task_name,
+    route_position_snapshot)
 from modeling_sampler import sample_current_point
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
@@ -142,8 +145,10 @@ from continuous_route import (
     build_continuous_polyline,
     collect_continuous_run,
     compute_polyline_guidance,
+    vehicle_control_heading_to_geographic,
 )
 from route_start_guard import RouteStartGuardError, validate_route_start
+from return_origin_route import ReturnOriginRouteError, build_return_to_origin_tasks
 
 app = Flask(__name__)
 CORS(app)
@@ -172,6 +177,7 @@ LOOP_AUTO_CLEAN_STOP_REASON_KEY = "loopAutoCleanStopReason"
 LOOP_AUTO_CLEAN_UPDATED_AT_KEY = "loopAutoCleanUpdatedAt"
 LOOP_AUTO_CLEAN_SLEEP_SECONDS = 2.0
 AUTO_RESUME_ALLOWED_KEY = "autoResumeAllowed"
+POSITION_ROUTE_SELECTED_AT_KEY = "positionRouteSelectedAt"
 
 WAYPOINT_LOOP_ENABLED_KEY = 'waypointLoopEnabled'
 WAYPOINT_LOOP_MODE_KEY = 'waypointLoopMode'
@@ -315,6 +321,7 @@ global_waypoint_nav_stop = 0
 global_loop_auto_clean_stop = 0
 active_runtime_task_token = ''
 active_runtime_task_action = ''
+active_runtime_thread = None
 global_runtime_task_sequence = 0
 # 当前任务下标标记
 global_cur_task_index = 0
@@ -719,6 +726,7 @@ def _runtime_not_startable_payload():
 
 
 def _start_runtime_thread(action, target, args=(), ready_message='正在创建任务线程', detail=None):
+    global active_runtime_thread
     with TASK_SWITCH_LOCK:
         if not _can_start_runtime_task():
             return None, _runtime_not_startable_payload()
@@ -740,6 +748,7 @@ def _start_runtime_thread(action, target, args=(), ready_message='正在创建�
         thread = threading.Thread(target=target, args=(task_token,) + tuple(args or ()))
         thread.daemon = True
         thread.start()
+        active_runtime_thread = thread
         return thread, None
 
 
@@ -4963,6 +4972,10 @@ def _set_current_task(task_name, return_to_origin=True):
         _write_json_config('config.json', selected_config)
         redis_cli.set('currentTaskName', taskName)
         redis_cli.set('currentTaskReturnToOrigin', 'true' if return_to_origin else 'false')
+        # The latest explicit UI context wins.  This timestamp prevents an
+        # abandoned persisted ``recording`` session from masking the origin
+        # of the route the user has just selected.
+        redis_cli.set(POSITION_ROUTE_SELECTED_AT_KEY, time.time())
         redis_cli.set('curTaskIndex', 0)
         redis_cli.delete('taskList')
         syncCurTaskFileToRedis()
@@ -5419,55 +5432,213 @@ def getVoltage():
     return jsonify(result)
 
 
-# 返回到固定点
+# 返回当前选中/正在执行路线的建模原点。
 @app.route("/vehicle/returnToPoint", methods=['GET'])
 def returnToPoint():
-    # if redis_cli.get("doCleanThreadStop") == '0':
-    #     return make_response("请先点击急停,然后再点击返回原点")
-    logger.warn("启动返回固定点线程")
-    thread, error_payload = _start_runtime_thread(
-        'return_to_point',
-        returnToPointThread,
-        ready_message='正在创建返回固定点线程',
-    )
-    if error_payload:
-        return jsonify(error_payload)
-    response = make_response("1")
-    return response
+    with TASK_SWITCH_LOCK:
+        fsm_state = robot_lifecycle_fsm.get_state()
+        current_action = str(fsm_state.get('action') or '')
+        if current_action == 'return_to_point' and _is_runtime_task_active():
+            return jsonify({
+                'success': True,
+                'message': '小车正在返回原点，请勿重复启动',
+                'data': {'controlState': 'RETURNING'},
+            })
+
+        # 正在清扫时必须以实际运行任务为准，不能因前端又切换了页面选择而
+        # 返回另一条路线的原点；非清扫状态才使用 currentTaskName。
+        active_cleaning = _is_runtime_task_active() and current_action in (
+            'auto_drive', 'go_on', 'loop_auto_drive'
+        )
+        task_name = None
+        if active_cleaning:
+            try:
+                task_name = (cleaning_position_service.realtime() or {}).get('taskName')
+            except Exception:
+                task_name = None
+        task_name = _normalize_task_name(task_name or redis_cli.get('currentTaskName'))
+        if not task_name:
+            return jsonify({
+                'success': False,
+                'message': '未选择可返回原点的路线',
+                'data': {'code': 'CURRENT_TASK_NOT_SET'},
+            })
+
+        try:
+            task_config = _load_json_config(task_name + '.json')
+        except Exception as error:
+            logger.error('读取返航任务失败: {}'.format(error))
+            return jsonify({
+                'success': False,
+                'message': '当前路线配置不存在或不可读',
+                'data': {'code': 'CURRENT_TASK_CONFIG_MISSING', 'taskName': task_name},
+            })
+        if _normalize_task_name(task_config.get('taskName')) != task_name:
+            return jsonify({
+                'success': False,
+                'message': '当前路线名称与保存配置不一致',
+                'data': {'code': 'CURRENT_TASK_MISMATCH', 'taskName': task_name},
+            })
+
+        rtk_status = _build_rtk_runtime_detail()
+        if not rtk_status.get('rtkFixAvailable'):
+            return jsonify({
+                'success': False,
+                'message': 'RTK未获得固定解，不能自动返回原点',
+                'data': {
+                    'code': rtk_status.get('rtkFixState') or 'RTK_NOT_FIXED',
+                    'taskName': task_name,
+                },
+            })
+
+        # taskList 的第一段就是自动清扫尚未完成的当前段。只在清扫接管时使用
+        # 它定位小车所在的安全路径；停车/完成状态则从实时位置就近接入保存路线。
+        active_segment = None
+        if active_cleaning:
+            raw_segment = redis_cli.lindex('taskList', 0)
+            if raw_segment:
+                try:
+                    active_segment = json.loads(_decode_redis_value(raw_segment))
+                except Exception:
+                    active_segment = None
+        try:
+            return_tasks = build_return_to_origin_tasks(
+                task_config,
+                global_cur_rtk_lat,
+                global_cur_rtk_lon,
+                active_segment=active_segment,
+            )
+        except ReturnOriginRouteError as error:
+            return jsonify({
+                'success': False,
+                'message': error.message,
+                'data': {'code': error.code, 'taskName': task_name},
+            })
+
+        # 一个返回命令原子地接管当前动作：先制动并使旧任务 token 失效，再
+        # 启动唯一返航线程。清空剩余清扫段，避免返航后 go_on 误续跑旧路线。
+        previous_runtime_thread = active_runtime_thread
+        _request_runtime_stop(
+            'return_to_origin_takeover',
+            clear_auto_task=True,
+            update_runtime=True,
+            message='已停止当前动作，准备返回路线原点',
+        )
+        # Do not let the old cleaning thread and the new return thread write
+        # global_go or motor commands at the same time.  The old token has
+        # already been invalidated above; wait for its normal stop path to
+        # finish before handing control to return_to_point.
+        if (
+                previous_runtime_thread is not None
+                and previous_runtime_thread is not threading.current_thread()
+                and previous_runtime_thread.is_alive()):
+            previous_runtime_thread.join(timeout=2.0)
+        if previous_runtime_thread is not None and previous_runtime_thread.is_alive():
+            return jsonify({
+                'success': False,
+                'message': '原任务尚未完全停止，暂不能开始返回原点',
+                'data': {'code': 'RETURN_TAKEOVER_TIMEOUT', 'taskName': task_name},
+            })
+        if not return_tasks:
+            doParking(update_runtime=False)
+            _mark_runtime_complete(
+                '小车已在当前路线原点',
+                {'action': 'return_to_point', 'taskName': task_name, 'alreadyAtOrigin': True},
+            )
+            return jsonify({
+                'success': True,
+                'message': '小车已在当前路线原点',
+                'data': {'taskName': task_name, 'alreadyAtOrigin': True},
+            })
+
+        thread, error_payload = _start_runtime_thread(
+            'return_to_point',
+            returnToPointThread,
+            args=({'taskName': task_name, 'tasks': return_tasks},),
+            ready_message='正在创建返回路线原点线程',
+            detail={'taskName': task_name, 'returnTaskCount': len(return_tasks)},
+        )
+        if error_payload:
+            return jsonify(error_payload)
+        return jsonify({
+            'success': True,
+            'message': '返回原点任务已启动',
+            'data': {
+                'taskName': task_name,
+                'returnTaskCount': len(return_tasks),
+                'controlState': 'RETURNING',
+            },
+        })
 
 
-def returnToPointThread(task_token=None):
+def returnToPointThread(task_token=None, return_plan=None):
+    global global_doCleanThreadStop, global_pointToPoint_flag, global_go, global_status
+    return_plan = return_plan if isinstance(return_plan, dict) else {}
+    tasks = list(return_plan.get('tasks') or [])
+    task_name = return_plan.get('taskName')
+    completed = False
     try:
-        logger.warn("启动返回固定点")
-        _mark_runtime_running('返回固定点启动', {'action': 'return_to_point'})
-        redis_cli.set('curTaskIndex', 0)
-        logger.warn("returnToPoint uses shared RTKDataManager observer stream")
-        # 判断当前到那个任务了
-        json_item = redis_cli.lindex('taskList', 0)
-        # 下一个任务
-        json_next_item = redis_cli.lindex('taskList', 1)
-
+        logger.warn("启动返回路线原点: taskName={}, taskCount={}".format(task_name, len(tasks)))
+        global_status = 'working'
+        global_doCleanThreadStop = 0
+        global_pointToPoint_flag = 0
+        global_go = 0
         redis_cli.set("correct", "true")
-        redis_cli.set('action', 'true')
-        reset_odometer(ser)
+        switch_off_clean_mode(ser)
+        _mark_runtime_running('正在返回当前路线原点', {
+            'action': 'return_to_point',
+            'taskName': task_name,
+            'returnTaskCount': len(tasks),
+        })
+        redis_cli.set('curTaskIndex', 0)
+        index = 0
+        while index < len(tasks):
+            if _runtime_task_should_stop(task_token, 'return_to_point'):
+                return
+            continuous_run = collect_continuous_run(tasks, index)
+            if not continuous_run:
+                continuous_run = [tasks[index]]
+            segment = attach_continuations(continuous_run)
+            run_count = len(continuous_run)
+            if not _run_task_segment_by_point_navigation(
+                    segment,
+                    _coerce_int(redis_cli.get('forwardSpeed'), 200) or 200,
+                    'return_to_point',
+                    index + 1):
+                if _is_current_runtime_task(task_token):
+                    _mark_runtime_blocked(
+                        'RETURN_TO_ORIGIN_SEGMENT_FAILED',
+                        '返回原点第{}段执行失败'.format(index + 1),
+                        {'taskName': task_name, 'segmentIndex': index + 1},
+                    )
+                return
+            index += run_count
+            redis_cli.set('curTaskIndex', index)
 
-        if json_item:
-            item = json.loads(json_item)
-            next_item = json.loads(json_next_item)
-            goByBackRoute(item, next_item)
-        # 开启纠偏
+        if _is_current_runtime_task(task_token):
+            completed = True
+            _mark_runtime_complete(
+                '已返回当前路线原点',
+                {'action': 'return_to_point', 'taskName': task_name},
+            )
+    except Exception:
+        logger.error(traceback.format_exc())
+        if _is_current_runtime_task(task_token):
+            _mark_runtime_blocked(
+                'RETURN_TO_ORIGIN_ERROR',
+                '返回原点程序异常',
+                {'taskName': task_name},
+            )
+    finally:
+        global_go = 0
+        global_pointToPoint_flag = 0
+        global_doCleanThreadStop = 0
+        global_status = 'active'
+        _publish_global_go(global_go)
         redis_cli.set("correct", "false")
         redis_cli.set('curTaskIndex', 0)
-        # 初始化
-        redis_cli.set("doCleanThreadStop", 0)
-        logger.warn("返回固定点结束")
-        _mark_runtime_complete('返回固定点结束', {'action': 'return_to_point'})
-        # 停止一切
         doParking(update_runtime=False)
-    except Exception as e:
-        doParking()
-        redis_cli.set("doCleanThreadStop", 0)
-        logger.error(traceback.format_exc())
+        logger.warn("返回路线原点线程结束: taskName={}, completed={}".format(task_name, completed))
 
 
 # 根据当前任务和下一个任务判断小车的位置
@@ -9795,12 +9966,78 @@ def _update_modeling_position_history(lat=None, lon=None, force_context=False):
     )
 
 
+def _modeling_position_session_is_recording():
+    """Return True only when modeling is newer than route selection."""
+    state_path = os.path.join(MODELING_STORE_DIR, 'active_session.json')
+    state = _load_json_config(state_path)
+    try:
+        modeling_updated_at = os.path.getmtime(state_path)
+    except OSError:
+        modeling_updated_at = None
+    return modeling_position_context_is_current(
+        state.get('status'),
+        modeling_updated_at,
+        redis_cli.get(POSITION_ROUTE_SELECTED_AT_KEY),
+        _normalize_task_name(redis_cli.get('currentTaskName')),
+    )
+
+
+def _saved_route_position(task_name, rtk_fixed):
+    """Read current RTK in one saved route's model frame without side effects."""
+    task_name = _normalize_task_name(task_name)
+    if not task_name:
+        return None
+    task_config = _load_json_config(task_name + '.json')
+    if _normalize_task_name(task_config.get('taskName')) != task_name:
+        return None
+    result = route_position_snapshot(
+        task_config,
+        global_cur_rtk_lat,
+        global_cur_rtk_lon,
+        rtk_fixed,
+        model_loader=modeling_store.get_model,
+    )
+    result['taskName'] = task_name
+    return result
+
+
+def _current_route_position(fsm_state, cleaning_snapshot, rtk_fixed):
+    """Resolve active-run route first, otherwise the UI-selected saved route."""
+    selected_task_name = _normalize_task_name(redis_cli.get('currentTaskName'))
+    task_name = resolve_position_task_name(
+        selected_task_name,
+        cleaning_snapshot,
+        fsm_state,
+    )
+    return _saved_route_position(task_name, rtk_fixed)
+
+
 def _get_lan_realtime_position():
-    raw = dict(_update_modeling_position_history(force_context=True) or {})
+    modeling_raw = dict(_update_modeling_position_history(force_context=True) or {})
+    fsm_state = robot_lifecycle_fsm.get_state()
+    cleaning_snapshot = dict(cleaning_position_service.realtime() or {})
+    if _modeling_position_session_is_recording():
+        raw = modeling_raw
+    else:
+        raw = _current_route_position(
+            fsm_state,
+            cleaning_snapshot,
+            bool(modeling_raw.get('rtkFixAvailable')),
+        ) or {
+            'x': None,
+            'y': None,
+            'coordinateReady': False,
+            'rtkFixAvailable': bool(modeling_raw.get('rtkFixAvailable')),
+        }
     raw['heading'] = (
-        _get_current_rtk_heading()
+        vehicle_control_heading_to_geographic(_get_current_rtk_heading())
         if raw.get('rtkFixAvailable') else None
     )
+    if (
+            str(fsm_state.get('action') or '') == 'return_to_point'
+            and str(fsm_state.get('controlState') or '').upper()
+            in ('READY', 'RUNNING', 'PAUSED', 'STOPPING')):
+        raw['controlState'] = 'RETURNING'
     return raw
 
 
@@ -9813,18 +10050,42 @@ def _get_lan_cleaning_realtime_position():
     """Add current task-origin presence without changing x/y availability."""
     raw = cleaning_position_service.realtime()
     raw = dict(raw or {})
+    fsm_state = robot_lifecycle_fsm.get_state()
+    route_raw = _current_route_position(
+        fsm_state,
+        raw,
+        bool(_build_rtk_runtime_detail().get('rtkFixAvailable')),
+    )
+    if route_raw is not None:
+        cached_task_name = _normalize_task_name(raw.get('taskName'))
+        route_task_name = _normalize_task_name(route_raw.get('taskName'))
+        raw.update(route_raw)
+        if cached_task_name != route_task_name:
+            # runId identifies the persisted previous run. Do not pair that
+            # old identifier with coordinates from a newly selected route.
+            raw['runId'] = None
     raw['heading'] = (
-        _get_current_rtk_heading()
+        vehicle_control_heading_to_geographic(_get_current_rtk_heading())
         if raw.get('rtkFixAvailable') else None
     )
-    try:
-        origin_status = _build_task_origin_status_fields(_load_task_params_snapshot())
-        raw['atTaskOrigin'] = bool(
-            raw.get('rtkFixAvailable') and
-            origin_status.get('isAtTaskOrigin') is True
-        )
-    except Exception:
-        raw['atTaskOrigin'] = False
+    if route_raw is None:
+        try:
+            origin_status = _build_task_origin_status_fields(_load_task_params_snapshot())
+            raw['atTaskOrigin'] = bool(
+                raw.get('rtkFixAvailable') and
+                origin_status.get('isAtTaskOrigin') is True
+            )
+        except Exception:
+            raw['atTaskOrigin'] = False
+    # x/y/history are supplied by the non-blocking cleaning telemetry worker,
+    # but the status must come from the live FSM.  Otherwise an asynchronous
+    # cache update can briefly tell the frontend STOPPED while the vehicle is
+    # already executing an automatic-cleaning task.
+    raw['controlState'] = resolve_live_cleaning_control_state(raw, fsm_state)
+    raw['cleaningCoordinateReady'] = resolve_cleaning_coordinate_ready(
+        raw.get('atTaskOrigin'),
+        fsm_state,
+    )
     return raw
 
 

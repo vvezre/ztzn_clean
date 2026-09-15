@@ -32,7 +32,15 @@ from modeling_store import ModelingStore
 from modeling_task_persistence import normalize_task_name
 from modeling_task_generator import generate_task_plan
 from position_history import history_capture_metadata, history_points_for_area, _same_capture
-from cleaning_position import CleaningPositionHistory, CleaningPositionService
+from cleaning_position import (
+    CleaningPositionHistory,
+    CleaningPositionService,
+    modeling_position_context_is_current,
+    resolve_cleaning_coordinate_ready,
+    resolve_live_cleaning_control_state,
+    resolve_position_task_name,
+    route_position_snapshot,
+)
 from mqtt_handler import MQTTCommandHandler
 from mqtt_vehicle_adapter import (
     _frontend_area_points,
@@ -202,7 +210,8 @@ class SimulatorPositionHistory(object):
     def realtime(self):
         self.observe(self.controller.current_position())
         with self._lock:
-            return dict(self._latest)
+            result = dict(self._latest)
+        return self.controller.modeling_realtime_position(result)
 
     def history(self, area_number=None):
         self.observe(self.controller.current_position())
@@ -494,6 +503,14 @@ class ModelingPathPlayer(object):
             if callable(self.on_state):
                 self.on_state('STOPPED')
 
+    def clear(self):
+        """Stop playback and discard a route that no longer owns the session."""
+        self.cancel()
+        with self._lock:
+            self._samples = []
+            self._index = 0
+            self._state = 'idle'
+
     def wait(self, timeout=None):
         with self._lock:
             thread = self._thread
@@ -546,6 +563,12 @@ class ModelingSimulatorController(object):
         self._saved_tasks = {}
         self._current_task_name = None
         self._current_return_to_origin = True
+        # Match the production position-context precedence without depending
+        # on filesystem timestamp precision: every explicit modeling start or
+        # saved-route selection receives a strictly increasing generation.
+        self._position_context_generation = 0
+        self._modeling_context_generation = None
+        self._route_selected_generation = None
         self._cleaning_token = None
         self.cleaning_service = CleaningPositionService(
             CleaningPositionHistory(os.path.join(data_dir, 'cleaning_history', 'latest.json')),
@@ -561,6 +584,8 @@ class ModelingSimulatorController(object):
             on_state=self._on_cleaning_playback_state,
         )
         self._sim_motion_state = "stopped"
+        self._returning = False
+        self._return_generation = 0
         self._manual_events = []
         self.manual_steering_controller = ManualSteeringController(
             motion_provider=self._manual_motion_state,
@@ -717,10 +742,146 @@ class ModelingSimulatorController(object):
         sample = (position.get('lat'), position.get('lon'), position.get('rtkFixAvailable', True))
         self.cleaning_service.poll(sample, state, self._cleaning_token)
 
+    def _advance_position_context(self, context):
+        with self._tasks_lock:
+            self._position_context_generation += 1
+            generation = self._position_context_generation
+            if context == 'modeling':
+                self._modeling_context_generation = generation
+            elif context == 'route':
+                self._route_selected_generation = generation
+            return generation
+
+    def _runtime_position_state(self):
+        playback_state = self.player.snapshot().get('state')
+        with self._tasks_lock:
+            returning = bool(self._returning)
+            selected_task_name = self._current_task_name
+        cached = dict(self.cleaning_service.realtime() or {})
+        active_task_name = cached.get('taskName') or selected_task_name
+        if returning:
+            return {
+                'controlState': 'RUNNING',
+                'action': 'return_to_point',
+                'detail': {'action': 'return_to_point', 'taskName': active_task_name},
+            }
+        if playback_state in ('running', 'paused'):
+            return {
+                'controlState': 'PAUSED' if playback_state == 'paused' else 'RUNNING',
+                'action': 'auto_drive',
+                'detail': {'action': 'auto_drive', 'taskName': active_task_name},
+            }
+        if playback_state == 'complete':
+            return {
+                'controlState': 'COMPLETE',
+                'action': 'auto_drive',
+                'detail': {'action': 'auto_drive', 'taskName': active_task_name},
+            }
+        if cached.get('controlState') == 'START_FAILED':
+            return {
+                'controlState': 'BLOCKED',
+                'action': 'auto_drive',
+                'detail': {'action': 'auto_drive', 'taskName': active_task_name},
+            }
+        return {'controlState': 'IDLE', 'action': 'idle', 'detail': {}}
+
+    def _modeling_position_context_is_current(self):
+        state = self.session.current()
+        with self._tasks_lock:
+            modeling_generation = self._modeling_context_generation
+            route_generation = self._route_selected_generation
+            selected_task_name = self._current_task_name
+        return modeling_position_context_is_current(
+            state.get('status'),
+            modeling_generation,
+            route_generation,
+            selected_task_name,
+        )
+
+    def _saved_route_position(self, task_name):
+        task_name = normalize_task_name(task_name) if task_name else None
+        if not task_name:
+            return None
+        with self._tasks_lock:
+            saved = copy.deepcopy(self._saved_tasks.get(task_name))
+            return_to_origin = bool(self._current_return_to_origin)
+        if saved is None:
+            return None
+        variant_key = 'return' if return_to_origin else 'noReturn'
+        plan = (
+            (saved.get('routeVariants') or {}).get(variant_key)
+            or saved.get('taskPlan')
+            or {}
+        )
+        task = {
+            'taskName': task_name,
+            'modelId': saved.get('modelId'),
+            'coordinateFrame': (saved.get('model') or {}).get('coordinateFrame'),
+            'taskList': plan.get('tasks') or [],
+        }
+        position = self.current_position()
+        result = route_position_snapshot(
+            task,
+            position.get('lat'),
+            position.get('lon'),
+            position.get('rtkFixAvailable', True),
+            model_loader=self.store.get_model,
+        )
+        result['taskName'] = task_name
+        return result
+
+    def _current_route_position(self, cached=None):
+        cached = cached if isinstance(cached, dict) else {}
+        with self._tasks_lock:
+            selected_task_name = self._current_task_name
+        task_name = resolve_position_task_name(
+            selected_task_name,
+            cached,
+            self._runtime_position_state(),
+        )
+        return self._saved_route_position(task_name)
+
+    def modeling_realtime_position(self, modeling_snapshot):
+        """Mirror the production ordinary realtime-position provider."""
+        if self._modeling_position_context_is_current():
+            result = dict(modeling_snapshot or {})
+        else:
+            result = self._current_route_position() or {
+                'x': None,
+                'y': None,
+                'coordinateReady': False,
+                'rtkFixAvailable': bool(
+                    (modeling_snapshot or {}).get('rtkFixAvailable')
+                ),
+            }
+        position = self.current_position()
+        result['heading'] = (
+            position.get('heading') if result.get('rtkFixAvailable') else None
+        )
+        if self.is_returning():
+            result['controlState'] = 'RETURNING'
+        return result
+
     def cleaning_realtime_position(self):
         self._poll_cleaning_position()
         result = dict(self.cleaning_service.realtime() or {})
-        result["heading"] = self.current_position().get("heading")
+        route_result = self._current_route_position(result)
+        if route_result is not None:
+            cached_task_name = result.get('taskName')
+            route_task_name = route_result.get('taskName')
+            result.update(route_result)
+            if cached_task_name != route_task_name:
+                result['runId'] = None
+        position = self.current_position()
+        result['heading'] = (
+            position.get('heading') if result.get('rtkFixAvailable') else None
+        )
+        runtime_state = self._runtime_position_state()
+        result['controlState'] = resolve_live_cleaning_control_state(result, runtime_state)
+        result['cleaningCoordinateReady'] = resolve_cleaning_coordinate_ready(
+            result.get('atTaskOrigin'),
+            runtime_state,
+        )
         return result
 
     def cleaning_position_history(self):
@@ -729,8 +890,12 @@ class ModelingSimulatorController(object):
 
     def start_modeling(self, name=None, restart=True):
         def action():
-            self.player.cancel()
+            # A fresh modeling session has no executable route. Keeping the
+            # previous player's samples would let auto_drive move along an old
+            # route while cleaning telemetry belongs to the empty new model.
+            self.player.clear()
             result = self.session.start(name or "simulator-two-areas", restart=True)
+            self._advance_position_context('modeling')
             events = self._capture_events()
             index = max(0, min(len(events) - 1, len(SCENARIO_POINTS) - 1))
             point = scenario_point(index)
@@ -1015,6 +1180,8 @@ class ModelingSimulatorController(object):
                     )
                 self._current_task_name = name
                 self._current_return_to_origin = bool(return_to_origin)
+                self._position_context_generation += 1
+                self._route_selected_generation = self._position_context_generation
             self.player.load(selected_plan)
             return {
                 "taskName": name,
@@ -1024,6 +1191,7 @@ class ModelingSimulatorController(object):
         return self._call("simulation task selected", action)
 
     def auto_drive(self):
+        self._cancel_simulated_return()
         self.manual_steering_controller.reset(send_hardware=False)
         self.manual_steering_controller.set_commanded_motion("stopped")
         self._sim_motion_state = "stopped"
@@ -1034,18 +1202,21 @@ class ModelingSimulatorController(object):
         return result
 
     def drive(self, distance=0, speed=None):
+        self._cancel_simulated_return()
         self.manual_steering_controller.reset(send_hardware=False)
         self.manual_steering_controller.set_commanded_motion("forward")
         self._sim_motion_state = "forward"
         return self._success("simulation forward motion started")
 
     def back(self, distance=0, speed=None):
+        self._cancel_simulated_return()
         self.manual_steering_controller.reset(send_hardware=False)
         self.manual_steering_controller.set_commanded_motion("reverse")
         self._sim_motion_state = "reverse"
         return self._success("simulation reverse motion started")
 
     def stop(self):
+        self._cancel_simulated_return()
         self.manual_steering_controller.reset(send_hardware=False)
         self.manual_steering_controller.set_commanded_motion("stopped")
         self._sim_motion_state = "stopped"
@@ -1056,12 +1227,88 @@ class ModelingSimulatorController(object):
 
     def parking(self):
         def action():
+            self._cancel_simulated_return()
             self.manual_steering_controller.reset(send_hardware=False)
             self.manual_steering_controller.set_commanded_motion("stopped")
             self._sim_motion_state = "stopped"
             self.player.cancel()
             return self.player.snapshot()
         return self._call("simulation path playback stopped", action)
+
+    def _cancel_simulated_return(self):
+        with self._tasks_lock:
+            self._return_generation += 1
+            self._returning = False
+
+    def is_returning(self):
+        with self._tasks_lock:
+            return bool(self._returning)
+
+    def return_to_point(self):
+        """Simulate the command/state flow without emulating vehicle motors."""
+        with self._tasks_lock:
+            if self._returning:
+                return self._success(
+                    "simulation vehicle is already returning",
+                    {"controlState": "RETURNING"},
+                )
+            saved = self._saved_tasks.get(self._current_task_name)
+            if saved is None:
+                return {
+                    "success": False,
+                    "message": "select a saved task before returning",
+                    "data": {"code": "CURRENT_TASK_NOT_SET"},
+                }
+            return_plan = (saved.get("routeVariants") or {}).get("return") or {}
+            tasks = list(return_plan.get("tasks") or saved.get("taskList") or [])
+            if not tasks:
+                return {
+                    "success": False,
+                    "message": "selected task has no return route",
+                    "data": {"code": "RETURN_ROUTE_EMPTY"},
+                }
+            origin_task = tasks[0]
+            self._return_generation += 1
+            generation = self._return_generation
+            self._returning = True
+
+        self.player.cancel()
+        self.manual_steering_controller.reset(send_hardware=False)
+        self.manual_steering_controller.set_commanded_motion("stopped")
+        self._sim_motion_state = "stopped"
+
+        def complete_return():
+            # Keep RETURNING visible long enough for a polling frontend to see
+            # it, then place the simulator at the selected route origin.
+            time.sleep(1.0)
+            with self._tasks_lock:
+                if generation != self._return_generation or not self._returning:
+                    return
+            with self._position_lock:
+                self._current_position.update({
+                    "x": origin_task.get("startX", 0),
+                    "y": origin_task.get("startY", 0),
+                    "local_x": origin_task.get("startX", 0),
+                    "local_y": origin_task.get("startY", 0),
+                    "lat": origin_task.get("startLat"),
+                    "lon": origin_task.get("startLon"),
+                    "heading": origin_task.get("heading"),
+                    "mode": 2,
+                })
+                position = dict(self._current_position)
+            with self._tasks_lock:
+                if generation == self._return_generation:
+                    self._returning = False
+            if callable(self.position_callback):
+                self.position_callback(position)
+
+        thread = threading.Thread(target=complete_return)
+        thread.daemon = True
+        thread.start()
+        return self._success(
+            "simulation return to origin started",
+            {"taskName": self._current_task_name, "controlState": "RETURNING"},
+        )
 
     def get_status(self):
         return self._success("simulation status fetched", self.status_snapshot())
@@ -1076,6 +1323,7 @@ class ModelingSimulatorController(object):
     def status_snapshot(self):
         playback = self.player.snapshot()
         position = self.current_position()
+        returning = self.is_returning()
         running = playback["state"] == "running"
         paused = playback["state"] == "paused"
         complete = playback["state"] == "complete"
@@ -1083,7 +1331,7 @@ class ModelingSimulatorController(object):
         motion_state = manual_status.get("motionState")
         speed = 100 if running else (-100 if motion_state == "reverse" else (100 if motion_state == "forward" else 0))
         status = {
-            "status": "working" if running or paused else "active",
+            "status": "returning" if returning else ("working" if running or paused else "active"),
             "online_state": "ONLINE",
             "speed": speed,
             "xSpeed": speed,
@@ -1093,16 +1341,19 @@ class ModelingSimulatorController(object):
             "lon": position.get("lon"),
             "local_x": int(position.get("local_x") or 0),
             "local_y": int(position.get("local_y") or 0),
-            "action": "modeling_task" if running or paused else "idle",
-            "mission_state": "RUNNING" if running or paused else ("COMPLETE" if complete else "IDLE"),
-            "control_state": "RUNNING" if running else ("PAUSED" if paused else "IDLE"),
+            "action": "return_to_point" if returning else ("modeling_task" if running or paused else "idle"),
+            "mission_state": "RETURNING" if returning else ("RUNNING" if running or paused else ("COMPLETE" if complete else "IDLE")),
+            # Keep the simulator's internal lifecycle compatible with the real
+            # vehicle: motion remains RUNNING; RETURNING is a public mission
+            # state exposed by the two realtime adapters.
+            "control_state": "RUNNING" if returning or running else ("PAUSED" if paused else "IDLE"),
             "simulation": True,
             "simulation_device_id": SIMULATOR_DEVICE_ID,
             "simulation_playback": playback,
             "simulation_manual_events": list(self._manual_events[-20:]),
             "supported_actions": [
                 "drive", "back", "stop", "parking", "manual_steering",
-                "auto_drive", "go_on", "get_status",
+                "auto_drive", "go_on", "return_to_point", "get_status",
             ],
             "supported_status_fields": [
                 "xSpeed", "motionState", "manualSteeringAllowed",

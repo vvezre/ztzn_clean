@@ -12,6 +12,28 @@ class ContinuousRouteTest(unittest.TestCase):
             "stopAtEnd": stop,
         }
 
+    def test_public_heading_reports_true_vehicle_front_without_changing_control_convention(self):
+        from continuous_route import vehicle_control_heading_to_geographic
+
+        # 内部控制航向比地图上的真实车头方向多90度。接口只转换输出值，
+        # 因此内部90/180/270/0度应分别显示为北/东/南/西。
+        cases = (
+            (90.0, 0.0),
+            (180.0, 90.0),
+            (270.0, 180.0),
+            (0.0, 270.0),
+            (12.5404, 282.5404),
+            (450.0, 0.0),
+        )
+        for raw_heading, expected in cases:
+            self.assertAlmostEqual(
+                vehicle_control_heading_to_geographic(raw_heading),
+                expected,
+                places=4,
+            )
+        self.assertIsNone(vehicle_control_heading_to_geographic(None))
+        self.assertIsNone(vehicle_control_heading_to_geographic("invalid"))
+
     def test_soft_points_are_grouped_until_real_stop(self):
         from continuous_route import CONTINUATION_KEY, attach_continuations, collect_continuous_run
 

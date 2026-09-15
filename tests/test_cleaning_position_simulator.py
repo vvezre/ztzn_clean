@@ -53,6 +53,29 @@ class CleaningSimulatorTests(unittest.TestCase):
         self.assertEqual([], self.fetch('position-history')['points'])
         self.assertEqual('START_FAILED', self.fetch('realtime-position')['controlState'])
 
+    def test_finished_unsaved_modeling_path_has_cleaning_position(self):
+        self.assertTrue(self.controller.preload_scenario()['success'])
+        self.assertTrue(self.controller.auto_drive()['success'])
+        history = self.wait_for_point()
+        self.assertIsNotNone(history['runId'])
+        self.assertTrue(history['points'])
+        realtime = self.fetch('realtime-position')
+        self.assertIsNotNone(realtime['x'])
+        self.assertIsNotNone(realtime['y'])
+
+    def test_new_modeling_session_cannot_replay_previous_route(self):
+        self.assertTrue(self.controller.preload_scenario()['success'])
+        self.assertTrue(self.controller.start_modeling()['success'])
+        snapshot = self.controller.player.snapshot()
+        self.assertEqual('idle', snapshot['state'])
+        self.assertEqual(0, snapshot['positionCount'])
+        self.assertFalse(self.controller.auto_drive()['success'])
+        realtime = self.fetch('realtime-position')
+        self.assertIsNone(realtime['runId'])
+        self.assertIsNone(realtime['x'])
+        self.assertIsNone(realtime['y'])
+        self.assertEqual('START_FAILED', realtime['controlState'])
+
     def test_saved_route_origin_works_after_new_empty_modeling_session(self):
         self.prepare()
         self.controller.start_modeling()
@@ -67,6 +90,21 @@ class CleaningSimulatorTests(unittest.TestCase):
         self.assertEqual(first['runId'], history['runId'])
         self.assertTrue(history['rtkFixAvailable'])
         self.assertEqual('COMPLETE', self.fetch('realtime-position')['controlState'])
+
+    def test_coordinate_ready_stays_true_after_leaving_origin_during_cleaning(self):
+        self.prepare()
+        self.controller.player.interval = 0.2
+        self.assertTrue(self.controller.auto_drive()['success'])
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            realtime = self.fetch('realtime-position')
+            if realtime['x'] is not None and realtime['y'] is not None and (
+                    abs(realtime['x']) > 20 or abs(realtime['y']) > 20):
+                self.assertEqual('RUNNING', realtime['controlState'])
+                self.assertTrue(realtime['coordinateReady'])
+                return
+            time.sleep(0.02)
+        self.fail('simulator did not move away from task origin')
 
     def test_duplicate_start_pause_resume_and_finished_history(self):
         self.prepare()

@@ -31,6 +31,97 @@ TASK_ORIGIN_TOLERANCE_CM = 20.0
 PUBLIC_CONTROL_STATES = frozenset((
     'IDLE', 'RUNNING', 'STOPPED', 'START_FAILED', 'COMPLETE',
 ))
+ACTIVE_RUNTIME_STATES = frozenset((
+    'READY', 'RUNNING', 'PAUSED', 'STOPPING',
+))
+CLEANING_RUNTIME_ACTIONS = frozenset((
+    'auto_drive', 'go_on', 'loop_auto_drive',
+))
+POSITION_ROUTE_RUNTIME_ACTIONS = frozenset(tuple(CLEANING_RUNTIME_ACTIONS) + (
+    'return_to_point',
+))
+
+
+try:
+    text_type = unicode
+except NameError:
+    text_type = str
+
+
+def _state_text(value):
+    if value is None:
+        return ''
+    try:
+        return text_type(value).strip()
+    except Exception:
+        return ''
+
+
+def resolve_live_cleaning_control_state(cached, fsm_state):
+    """Resolve the cleaning-page state from the live runtime FSM.
+
+    Position history deliberately has its own asynchronous worker so RTK
+    callbacks never wait for disk or UI work.  Its cached public state can
+    therefore lag a freshly accepted runtime transition.  The cleaning
+    realtime endpoint must not report STOPPED while an automatic cleaning
+    task is actually RUNNING, nor keep reporting RUNNING after that task has
+    stopped.
+
+    Only the public status value is resolved here.  Coordinates, history,
+    motion commands and route execution remain completely untouched.
+    """
+    cached = cached if isinstance(cached, dict) else {}
+    fsm_state = fsm_state if isinstance(fsm_state, dict) else {}
+    runtime_state = _state_text(fsm_state.get('controlState')).upper()
+    action = _state_text(fsm_state.get('action')).lower()
+    detail = fsm_state.get('detail')
+    detail = detail if isinstance(detail, dict) else {}
+    detail_action = _state_text(detail.get('action')).lower()
+    effective_action = action if action and action != 'idle' else detail_action
+
+    if effective_action == 'return_to_point' and runtime_state in ACTIVE_RUNTIME_STATES:
+        return 'RETURNING'
+
+    if effective_action in CLEANING_RUNTIME_ACTIONS:
+        if runtime_state in ACTIVE_RUNTIME_STATES:
+            return 'RUNNING'
+        if runtime_state == 'COMPLETE':
+            return 'COMPLETE'
+        if runtime_state == 'BLOCKED' and _state_text(cached.get('controlState')).upper() == 'START_FAILED':
+            return 'START_FAILED'
+        return 'STOPPED' if cached.get('runId') else 'IDLE'
+
+    cached_state = _state_text(cached.get('controlState')).upper()
+    if runtime_state == 'BLOCKED' and cached_state == 'START_FAILED':
+        return 'START_FAILED'
+    if runtime_state == 'COMPLETE' and cached_state == 'COMPLETE':
+        return 'COMPLETE'
+    if cached_state == 'IDLE' and not cached.get('runId'):
+        return 'IDLE'
+    return 'STOPPED'
+
+
+def resolve_cleaning_coordinate_ready(at_task_origin, fsm_state):
+    """Latch the public origin-ready flag while one cleaning run is active.
+
+    Before and after a run the flag retains its original meaning: whether the
+    vehicle is currently inside the selected task's origin tolerance.  Once a
+    cleaning action has passed its start guard, READY/RUNNING/PAUSED/STOPPING
+    all belong to the same accepted run, so leaving the origin must not make
+    the frontend lose the task coordinate context mid-run.
+    """
+    fsm_state = fsm_state if isinstance(fsm_state, dict) else {}
+    runtime_state = _state_text(fsm_state.get('controlState')).upper()
+    action = _state_text(fsm_state.get('action')).lower()
+    detail = fsm_state.get('detail')
+    detail = detail if isinstance(detail, dict) else {}
+    detail_action = _state_text(detail.get('action')).lower()
+    effective_action = action if action and action != 'idle' else detail_action
+    if (
+            effective_action in CLEANING_RUNTIME_ACTIONS and
+            runtime_state in ACTIVE_RUNTIME_STATES):
+        return True
+    return bool(at_task_origin)
 
 
 def number(value):
@@ -77,6 +168,91 @@ def cleaning_origin(task, model_loader=None):
                     if origin:
                         return origin
     return None
+
+
+def route_position_snapshot(task, lat, lon, fixed, model_loader=None):
+    """Project one RTK sample into a saved route's own model frame.
+
+    This helper is read-only. It does not start a run, append history or
+    modify the selected task. Both LAN realtime endpoints use it when a
+    saved route is selected, so an idle vehicle no longer depends on an
+    unrelated active-modeling session or the previous cleaning-run cache.
+    """
+    origin = cleaning_origin(task, model_loader)
+    ready = origin is not None
+    fixed = bool(fixed)
+    lat, lon = number(lat), number(lon)
+    xy = (
+        lat_lon_to_model_xy_cm(origin, lat, lon)
+        if ready and fixed and lat is not None and lon is not None
+        else None
+    )
+    x = int(round(xy[0])) if xy is not None else None
+    y = int(round(xy[1])) if xy is not None else None
+    return {
+        'x': x,
+        'y': y,
+        'coordinateReady': ready,
+        'rtkFixAvailable': fixed,
+        'atTaskOrigin': bool(
+            ready and fixed and x is not None and y is not None and
+            math.hypot(float(x), float(y)) <= TASK_ORIGIN_TOLERANCE_CM
+        ),
+    }
+
+
+def resolve_position_task_name(selected_task_name, cached, fsm_state):
+    """Choose the saved route whose origin owns the current position view.
+
+    An active cleaning/return action wins over a later UI selection. Outside
+    those actions, the explicitly selected route is authoritative; a stale
+    previous-run cache is never silently presented as the current route.
+    """
+    cached = cached if isinstance(cached, dict) else {}
+    fsm_state = fsm_state if isinstance(fsm_state, dict) else {}
+    runtime_state = _state_text(fsm_state.get('controlState')).upper()
+    action = _state_text(fsm_state.get('action')).lower()
+    detail = fsm_state.get('detail')
+    detail = detail if isinstance(detail, dict) else {}
+    detail_action = _state_text(detail.get('action')).lower()
+    effective_action = action if action and action != 'idle' else detail_action
+
+    if runtime_state in ACTIVE_RUNTIME_STATES and effective_action in POSITION_ROUTE_RUNTIME_ACTIONS:
+        detail_task_name = _state_text(detail.get('taskName'))
+        if detail_task_name:
+            return detail_task_name
+        cached_state = _state_text(cached.get('controlState')).upper()
+        cached_task_name = _state_text(cached.get('taskName'))
+        if cached_state == 'RUNNING' and cached_task_name:
+            return cached_task_name
+        selected_task_name = _state_text(selected_task_name)
+        return selected_task_name or cached_task_name or None
+
+    selected_task_name = _state_text(selected_task_name)
+    return selected_task_name or None
+
+
+def modeling_position_context_is_current(status, modeling_updated_at,
+                                         route_selected_at, selected_task_name):
+    """Resolve an unfinished modeling session against a later route choice.
+
+    A persisted ``recording`` state can survive an abandoned modeling page and
+    a process restart.  Its file timestamp therefore wins only when it is
+    newer than the last explicit saved-route selection.  On installations
+    created before the timestamp key existed, an existing selected route is
+    the safe migration default; the next start-modeling write immediately
+    makes the modeling context newer.
+    """
+    if _state_text(status).lower() != 'recording':
+        return False
+    modeling_updated_at = number(modeling_updated_at)
+    route_selected_at = number(route_selected_at)
+    if route_selected_at is None:
+        return not bool(_state_text(selected_task_name))
+    return bool(
+        modeling_updated_at is not None and
+        modeling_updated_at > route_selected_at
+    )
 
 
 def _corner(a, b, c):

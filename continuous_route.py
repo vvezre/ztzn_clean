@@ -43,6 +43,19 @@ def _number(value):
     return result
 
 
+def vehicle_control_heading_to_geographic(heading):
+    """把小车内部控制航向转换成前端显示的真实车头地理方位角。
+
+    小车内部导航沿用双天线RTK/下位机的原始航向约定；该约定比地图上的
+    车头地理方位角多90度。这个函数只应在对外接口组装响应时使用，不能
+    写回RTK缓存，也不能用于转向、纠偏或路线规划。
+    """
+    value = _number(heading)
+    if value is None:
+        return None
+    return (value - VEHICLE_HEADING_OFFSET_DEG) % 360.0
+
+
 def _latlon_to_local_m(origin_lat, origin_lon, lat, lon):
     """把小范围经纬度转换成以origin为原点的局部米制坐标。"""
     lat0_rad = math.radians(float(origin_lat))
