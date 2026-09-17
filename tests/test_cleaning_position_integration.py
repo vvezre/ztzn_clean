@@ -54,6 +54,16 @@ class CleaningMainIntegrationTests(unittest.TestCase):
         self.service.poll(gps(900) + (True,), 'STOPPED', '')
         self.assertEqual({'x': 15, 'y': 0}, self.service.history()['points'][-1])
 
+    def test_accepted_start_is_visible_synchronously_without_sampler_poll(self):
+        config = task(u'新任务')
+        self.namespace['_begin_cleaning_position_run'](
+            config, 'runtime-2', immediate=True,
+        )
+        current = self.service.history()
+        self.assertEqual(u'新任务', current['taskName'])
+        self.assertIsNotNone(current['runId'])
+        self.assertEqual([{'x': 0, 'y': 0}], current['points'])
+
     def test_missing_service_during_startup_is_harmless(self):
         self.namespace.pop('cleaning_position_service')
         self.namespace['_notify_cleaning_position_state']('INITIALIZING')
@@ -81,6 +91,25 @@ class CleaningMainIntegrationTests(unittest.TestCase):
         source = ast.get_source_segment(SOURCE, node)
         self.assertLess(source.index("'TASK_PATH_EMPTY'"), source.index('_begin_cleaning_position_run'))
         self.assertLess(source.index('_begin_cleaning_position_run'), source.index('_run_task_segment_by_point_navigation'))
+
+    def test_auto_clean_entrypoints_publish_new_run_before_starting_thread(self):
+        for function_name in ('autoDriveByRTK', 'auto_driving', 'start_loop_auto_drive'):
+            node = next(node for node in TREE.body
+                        if isinstance(node, ast.FunctionDef) and node.name == function_name)
+            source = ast.get_source_segment(SOURCE, node)
+            self.assertIn(
+                'on_task_accepted=_prepare_cleaning_history_for_runtime_start',
+                source,
+                function_name,
+            )
+
+        starter = next(node for node in TREE.body
+                       if isinstance(node, ast.FunctionDef) and node.name == '_start_runtime_thread')
+        starter_source = ast.get_source_segment(SOURCE, starter)
+        self.assertLess(
+            starter_source.index('on_task_accepted(task_token)'),
+            starter_source.index('thread.start()'),
+        )
 
     def test_read_routes_dont_dispatch_motion_or_reset_modeling(self):
         with io.open(os.path.join(ROOT, 'lan_cloud_compat.py'), 'r', encoding='utf-8') as handle:

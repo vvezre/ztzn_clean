@@ -108,6 +108,7 @@ class ModelingSimulatorLanTests(unittest.TestCase):
         self.assertEqual('selected-route', cleaning['taskName'])
         self.assertIsNone(cleaning['runId'])
         self.assertEqual('IDLE', cleaning['controlState'])
+        self.assertFalse(cleaning['isCleaning'])
 
     def test_new_modeling_after_route_selection_reclaims_ordinary_position(self):
         client = self._authorized_client()
@@ -149,6 +150,59 @@ class ModelingSimulatorLanTests(unittest.TestCase):
                 'rtkFixAvailable': True,
             },
         }, response.get_json())
+
+    def test_accepted_cleaning_start_replaces_previous_trail_immediately(self):
+        self.assertTrue(self.controller.preload_scenario()['success'])
+        self.assertTrue(self.controller.save_modeling_task('fresh-run')['success'])
+        self.assertTrue(self.controller.set_current_task('fresh-run')['success'])
+
+        origin = scenario_point(0)
+        old_task = {
+            'taskName': 'old-run',
+            'coordinateFrame': {
+                'type': 'model_origin',
+                'originLat': origin['lat'],
+                'originLon': origin['lon'],
+            },
+            'taskList': [{'startX': 0, 'startY': 0, 'endX': 100, 'endY': 0}],
+        }
+        service = self.controller.cleaning_service
+        self.assertTrue(service.begin_immediate(
+            old_task, 'old-token', sample=(origin['lat'], origin['lon'], True),
+        ))
+        old_run_id = service.history()['runId']
+        service.history_store.observe(
+            origin['lat'], origin['lon'], True, 'COMPLETE', 'old-token', 1001,
+        )
+
+        started = self.controller.auto_drive()
+        self.assertTrue(started['success'], started)
+        current = service.history()
+        self.assertNotEqual(old_run_id, current['runId'])
+        self.assertEqual('fresh-run', current['taskName'])
+
+    def test_rejected_cleaning_start_keeps_previous_trail(self):
+        origin = scenario_point(0)
+        service = self.controller.cleaning_service
+        self.assertTrue(service.begin_immediate(
+            {
+                'taskName': 'old-run',
+                'coordinateFrame': {
+                    'type': 'model_origin',
+                    'originLat': origin['lat'],
+                    'originLon': origin['lon'],
+                },
+                'taskList': [{'startX': 0, 'startY': 0, 'endX': 100, 'endY': 0}],
+            },
+            'old-token',
+            sample=(origin['lat'], origin['lon'], True),
+        ))
+        previous = service.history()
+
+        rejected = self.controller.auto_drive()
+        self.assertFalse(rejected['success'])
+        self.assertEqual(previous['runId'], service.history()['runId'])
+        self.assertEqual(previous['points'], service.history()['points'])
 
     def test_wrong_product_id_is_rejected(self):
         client = self._authorized_client()

@@ -66,6 +66,13 @@ class ModelingExecutionMainTest(unittest.TestCase):
         self.assertNotIn("_advance_continuous_target", source)
         self.assertNotIn("continuousTargets", source)
 
+    def test_rtk_observer_does_not_force_final_segment_slowdown(self):
+        source = read_main()
+        body = function_body(source, "observer_go_correct")
+
+        self.assertNotIn("distance_to_target <= 2", body)
+        self.assertNotIn("sendCommandSetXSpeed(200)", body)
+
     def test_modeling_task_runtime_exposes_progress_stop_and_preflight(self):
         source = read_main()
 

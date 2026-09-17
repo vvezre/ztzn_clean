@@ -36,11 +36,13 @@ from cleaning_position import (
     CleaningPositionHistory,
     CleaningPositionService,
     modeling_position_context_is_current,
+    resolve_cleaning_active,
     resolve_cleaning_coordinate_ready,
     resolve_live_cleaning_control_state,
     resolve_position_task_name,
     route_position_snapshot,
 )
+from cleaning_logs import CleaningLogStore
 from mqtt_handler import MQTTCommandHandler
 from mqtt_vehicle_adapter import (
     _frontend_area_points,
@@ -267,6 +269,8 @@ def build_simulator_lan_app(controller, command_handler=None, position_history=N
         position_history_provider=position_history.history,
         cleaning_realtime_provider=controller.cleaning_realtime_position,
         cleaning_history_provider=controller.cleaning_position_history,
+        cleaning_logs_provider=controller.cleaning_logs,
+        cleaning_log_detail_provider=controller.cleaning_log_detail,
     )
     app.config["SIMULATOR_POSITION_HISTORY"] = position_history
     return app
@@ -570,10 +574,17 @@ class ModelingSimulatorController(object):
         self._modeling_context_generation = None
         self._route_selected_generation = None
         self._cleaning_token = None
+        self._cleaning_log_seen_running = False
         self.cleaning_service = CleaningPositionService(
             CleaningPositionHistory(os.path.join(data_dir, 'cleaning_history', 'latest.json')),
             model_loader=self.store.get_model,
             on_error=lambda error: logger.warning('simulator cleaning telemetry: {}'.format(error)),
+        )
+        self.cleaning_log_store = CleaningLogStore(
+            os.path.join(data_dir, 'cleaning_logs'),
+            now=now,
+            max_points=1500,
+            history_interval=1.0,
         )
         self._current_position = dict(scenario_point(0), local_x=0, local_y=0, mode=2)
         self.player = ModelingPathPlayer(
@@ -718,7 +729,28 @@ class ModelingSimulatorController(object):
                 task = {'taskName': None, 'modelId': path.get('modelId'),
                         'returnToOrigin': True, 'taskList': (path.get('taskPlan') or {}).get('tasks') or []}
         self._cleaning_token = uuid.uuid4().hex
-        self.cleaning_service.begin(task, self._cleaning_token, resume=resume)
+        # Mirror the robot: once a start is accepted, polling must see the new
+        # run immediately instead of the previous run until the sampler ticks.
+        self.cleaning_service.begin_immediate(
+            task,
+            self._cleaning_token,
+            resume=resume,
+            sample=None,
+        )
+        if not resume:
+            current = self.cleaning_service.realtime()
+            model = self.store.get_model(task.get('modelId')) if task.get('modelId') else {}
+            self.cleaning_log_store.begin(
+                current.get('runId'),
+                simulator_device_identity(),
+                task.get('taskName'),
+                {
+                    'areaPoints': _frontend_area_points(model),
+                    'linkPoints': _frontend_link_points(model),
+                    'pathPoints': _frontend_path_points({'tasks': task.get('taskList') or []}),
+                },
+            )
+            self._cleaning_log_seen_running = False
 
     def _safe_cleaning_playback_start(self, resume):
         try:
@@ -732,6 +764,7 @@ class ModelingSimulatorController(object):
             sample = (position.get('lat'), position.get('lon'), position.get('rtkFixAvailable', True))
             self.cleaning_service.state(state, self._cleaning_token, sample)
             self.cleaning_service.poll(sample, state, self._cleaning_token)
+            self._poll_cleaning_log(state)
         except Exception as error:
             logger.warning('simulator cleaning state telemetry: {}'.format(error))
 
@@ -741,6 +774,39 @@ class ModelingSimulatorController(object):
             self.player.snapshot()['state'], 'STOPPED')
         sample = (position.get('lat'), position.get('lon'), position.get('rtkFixAvailable', True))
         self.cleaning_service.poll(sample, state, self._cleaning_token)
+        self._poll_cleaning_log(state)
+
+    def _poll_cleaning_log(self, state):
+        active = self.cleaning_log_store.active()
+        if not active:
+            return
+        if state == 'RUNNING':
+            self._cleaning_log_seen_running = True
+        # ModelingPathPlayer invokes its accepted-start callback immediately
+        # before changing ready -> running.  A concurrent frontend poll during
+        # those few instructions must not archive the brand-new run as stopped.
+        if state == 'STOPPED' and not self._cleaning_log_seen_running:
+            return
+        current = self.cleaning_service.realtime()
+        position = self.current_position()
+        terminal = state in ('COMPLETE', 'STOPPED', 'BLOCKED', 'FAULT')
+        self.cleaning_log_store.observe(
+            current.get('x'),
+            current.get('y'),
+            position.get('heading'),
+            available=bool(current.get('coordinateReady') and current.get('rtkFixAvailable')),
+            force=terminal,
+        )
+        if not terminal:
+            return
+        if state == 'COMPLETE':
+            status, reason = 'COMPLETED', u'路线正常完成'
+        elif state == 'STOPPED':
+            status, reason = 'STOPPED', u'用户手动停止'
+        else:
+            status, reason = 'FAILED', u'任务执行失败'
+        if self.cleaning_log_store.finalize(status, reason) is not None:
+            self.cleaning_service.clear_points(flush=True)
 
     def _advance_position_context(self, context):
         with self._tasks_lock:
@@ -878,6 +944,7 @@ class ModelingSimulatorController(object):
         )
         runtime_state = self._runtime_position_state()
         result['controlState'] = resolve_live_cleaning_control_state(result, runtime_state)
+        result['isCleaning'] = resolve_cleaning_active(runtime_state)
         result['cleaningCoordinateReady'] = resolve_cleaning_coordinate_ready(
             result.get('atTaskOrigin'),
             runtime_state,
@@ -887,6 +954,12 @@ class ModelingSimulatorController(object):
     def cleaning_position_history(self):
         self._poll_cleaning_position()
         return self.cleaning_service.history()
+
+    def cleaning_logs(self, product_id, page, page_size):
+        return self.cleaning_log_store.list_logs(product_id, page, page_size)
+
+    def cleaning_log_detail(self, log_id, product_id):
+        return self.cleaning_log_store.get_log(log_id, product_id)
 
     def start_modeling(self, name=None, restart=True):
         def action():

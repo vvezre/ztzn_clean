@@ -31,6 +31,17 @@ TASK_ORIGIN_TOLERANCE_CM = 20.0
 PUBLIC_CONTROL_STATES = frozenset((
     'IDLE', 'RUNNING', 'STOPPED', 'START_FAILED', 'COMPLETE',
 ))
+
+# These lifecycle states all belong to one accepted task.  In particular,
+# ``_start_runtime_thread`` publishes READY after the telemetry run has been
+# created and before the worker publishes RUNNING.  Treating that short READY
+# window as a terminal transition permanently closes the history recorder, so
+# a browser refresh can restore only the first/origin point.  PAUSED and
+# STOPPING likewise keep the task identity alive until a real terminal state
+# arrives.
+TRACKING_SESSION_STATES = frozenset((
+    'READY', 'RUNNING', 'PAUSED', 'STOPPING',
+))
 ACTIVE_RUNTIME_STATES = frozenset((
     'READY', 'RUNNING', 'PAUSED', 'STOPPING',
 ))
@@ -81,6 +92,14 @@ def resolve_live_cleaning_control_state(cached, fsm_state):
 
     if effective_action == 'return_to_point' and runtime_state in ACTIVE_RUNTIME_STATES:
         return 'RETURNING'
+    # An explicit return-to-origin is a positioning action, not a cleaning
+    # mission.  Once it reaches the selected route origin, expose the vehicle
+    # as ready/idle instead of leaking the generic task terminal state
+    # COMPLETE (or falling back to STOPPED from an older cleaning cache).
+    # Automatic-cleaning completion still follows the separate branch below
+    # and therefore remains COMPLETE.
+    if effective_action == 'return_to_point' and runtime_state == 'COMPLETE':
+        return 'IDLE'
 
     if effective_action in CLEANING_RUNTIME_ACTIONS:
         if runtime_state in ACTIVE_RUNTIME_STATES:
@@ -122,6 +141,26 @@ def resolve_cleaning_coordinate_ready(at_task_origin, fsm_state):
             runtime_state in ACTIVE_RUNTIME_STATES):
         return True
     return bool(at_task_origin)
+
+
+def resolve_cleaning_active(fsm_state):
+    """Return whether an automatic-cleaning task is starting or running.
+
+    This intentionally describes only READY/RUNNING automatic-cleaning work.
+    A paused or stopping task, an explicit return-to-origin action and manual
+    motion all return False even when another public status field is RUNNING.
+    """
+    fsm_state = fsm_state if isinstance(fsm_state, dict) else {}
+    runtime_state = _state_text(fsm_state.get('controlState')).upper()
+    action = _state_text(fsm_state.get('action')).lower()
+    detail = fsm_state.get('detail')
+    detail = detail if isinstance(detail, dict) else {}
+    detail_action = _state_text(detail.get('action')).lower()
+    effective_action = action if action and action != 'idle' else detail_action
+    return bool(
+        effective_action in CLEANING_RUNTIME_ACTIONS and
+        runtime_state in ('READY', 'RUNNING')
+    )
 
 
 def number(value):
@@ -339,7 +378,7 @@ def simplify_history(points, target, tolerance_cm=5.0):
 
 
 class CleaningPositionHistory(object):
-    """One current/most recent run; selecting routes does not reset it."""
+    """One current run; selection does not reset it, durable archival may."""
     def __init__(self, storage_path=None, now=None, max_points=1500,
                  history_interval=1.0, tolerance_cm=5.0):
         self.path = storage_path
@@ -448,13 +487,17 @@ class CleaningPositionHistory(object):
             matching = bool(token and token == self._token)
             previous_running = self._state == 'RUNNING' and not self._ended
             next_running = matching and state == 'RUNNING' and not self._ended
-            if previous_running and not next_running and xy:
+            # READY is emitted during startup, before the vehicle has entered
+            # RUNNING.  It must neither close the run nor manufacture a tiny
+            # forced segment from the initial sample.  Pausing, stopping or a
+            # terminal transition still captures the last real position.
+            if previous_running and not next_running and xy and state != 'READY':
                 self._append(self._latest['x'], self._latest['y'], at, force=True)
             if next_running and xy:
                 self._append(self._latest['x'], self._latest['y'], at)
-            if not xy or not next_running:
+            if not xy or (not next_running and not (matching and state == 'READY')):
                 self._gap = bool(self._points)
-            if not matching or state not in ('RUNNING', 'PAUSED'):
+            if not matching or state not in TRACKING_SESSION_STATES:
                 self._ended = True
             self._state = state if matching else 'STOPPED'
             # Expose a deliberately small UI state contract.  START_FAILED is
@@ -476,6 +519,22 @@ class CleaningPositionHistory(object):
             self._public_state = 'START_FAILED'
             self._ended = True
             self._gap = bool(self._points)
+
+    def clear_points(self):
+        """Clear only the current polyline after its historical log is safe.
+
+        Run identity and terminal UI state deliberately remain available so
+        the realtime endpoint can still report which task completed.  The
+        history endpoint immediately returns an empty ``points`` list, which
+        prevents a polling frontend from drawing the previous run again.
+        """
+        with self._lock:
+            self._points = []
+            self._last_at = None
+            self._gap = False
+            self._simplified = False
+            self._next_compact = self.max_points + 1
+            self._dirty = True
 
     def flush(self, force=False):
         with self._lock:
@@ -546,6 +605,35 @@ class CleaningPositionService(object):
         self.events.put_nowait(('begin', copy.deepcopy(task), token, resume,
                                sample, self.history_store.now()))
 
+    def begin_immediate(self, task, token, resume=False, sample=None):
+        """Publish a newly accepted run before its control thread is exposed.
+
+        Ordinary telemetry notifications stay queued so they never delay the
+        motion observer.  A successful automatic-cleaning start is different:
+        the history endpoint must stop exposing the previous run before the
+        start response reaches a polling frontend.  This small, bounded update
+        is serialized with ``poll`` and persisted before returning.
+        """
+        try:
+            with self._poll_lock:
+                at = self.history_store.now()
+                self.history_store.begin(
+                    copy.deepcopy(task),
+                    cleaning_origin(task, self.model_loader),
+                    token,
+                    resume,
+                )
+                if sample is not None:
+                    self.history_store.observe(*(
+                        tuple(sample) + ('RUNNING', token, at)
+                    ))
+                self.history_store.flush(force=True)
+            return True
+        except Exception as error:
+            if callable(self.on_error):
+                self.on_error(error)
+            return False
+
     def state(self, state, token, sample):
         self.events.put_nowait(('state', state, token, tuple(sample), self.history_store.now()))
 
@@ -589,3 +677,10 @@ class CleaningPositionService(object):
 
     def history(self):
         return self.history_store.history()
+
+    def clear_points(self, flush=True):
+        """Synchronously clear the current trail after durable archival."""
+        with self._poll_lock:
+            self.history_store.clear_points()
+            if flush:
+                self.history_store.flush(force=True)

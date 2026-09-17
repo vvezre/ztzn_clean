@@ -15,9 +15,20 @@ class CleaningPositionApiTests(unittest.TestCase):
                      'heading': 92.6,
                      'coordinateReady': True, 'rtkFixAvailable': True,
                      'atTaskOrigin': False, 'cleaningCoordinateReady': True,
-                     'controlState': 'RUNNING'}
+                     'controlState': 'RUNNING', 'isCleaning': True}
         self.history = dict(self.live, points=[{'x': 0, 'y': 0}, {'x': 5, 'y': 1},
                            {'x': 30, 'y': 40, 'breakBefore': True}], simplified=True)
+        self.log_item = {
+            'id': 'log_20260916_001', 'runId': 'clean_test', 'productId': '250006',
+            'serialNumber': '-T01250006', 'taskName': u'清扫测试',
+            'startTime': '2026-09-16T08:32:11+08:00',
+            'endTime': '2026-09-16T09:14:29+08:00', 'durationSeconds': 2538,
+            'distanceMeters': None, 'status': 'COMPLETED', 'endReason': u'路线正常完成',
+        }
+        self.log_detail = dict(self.log_item, trajectory={
+            'coordinateSystem': 'LOCAL_XY', 'simplified': False,
+            'points': [{'x': 0, 'y': 0, 'heading': 90, 'timestamp': 1789518731000}],
+        }, plannedRoute={'areaPoints': [], 'linkPoints': [], 'pathPoints': []})
         auth = LocalAuthManager(config={
             'tokenSecret': 'test-secret-must-have-at-least-32-characters',
             'users': [{'userId': 1, 'username': 'admin', 'passwordHash': create_password_record('test'),
@@ -25,7 +36,13 @@ class CleaningPositionApiTests(unittest.TestCase):
         })
         register_lan_cloud_compat_routes(self.app, lambda: self.calls.append('command'),
             auth_manager=auth, device_identity_provider=lambda: {'productId': '250006'},
-            cleaning_realtime_provider=lambda: self.live, cleaning_history_provider=lambda: self.history)
+            cleaning_realtime_provider=lambda: self.live, cleaning_history_provider=lambda: self.history,
+            cleaning_logs_provider=lambda product_id, page, page_size: {
+                'list': [self.log_item], 'total': 1, 'page': page, 'pageSize': page_size,
+            },
+            cleaning_log_detail_provider=lambda log_id, product_id: (
+                self.log_detail if log_id == self.log_item['id'] and product_id == '250006' else None
+            ))
         self.client = self.app.test_client()
 
     def get(self, kind, product='250006'):
@@ -59,6 +76,7 @@ class CleaningPositionApiTests(unittest.TestCase):
             'heading': 92.6,
             'coordinateReady': True, 'rtkFixAvailable': True,
             'controlState': 'RUNNING',
+            'isCleaning': True,
         }}, self.payload(response))
         self.assertEqual([], self.calls)
 
@@ -127,6 +145,52 @@ class CleaningPositionApiTests(unittest.TestCase):
             expected = {'coordinateReady': False, 'rtkFixAvailable': False}
             expected.update(extra)
             self.assertEqual({'success': True, 'data': expected}, self.payload(response))
+
+    def test_cleaning_log_list_and_detail_contract(self):
+        self.login()
+        response = self.client.get(
+            '/api/t-railcar/cleaning-logs?productId=250006&page=1&pageSize=20'
+        )
+        self.assertEqual(200, response.status_code)
+        payload = self.payload(response)
+        self.assertEqual(200, payload['code'])
+        self.assertEqual('success', payload['message'])
+        self.assertEqual(1, payload['data']['total'])
+        self.assertIsNone(payload['data']['list'][0]['distanceMeters'])
+        self.assertNotIn('trajectory', payload['data']['list'][0])
+
+        detail = self.client.get('/api/t-railcar/cleaning-logs/log_20260916_001')
+        self.assertEqual(200, detail.status_code)
+        detail_data = self.payload(detail)['data']
+        self.assertEqual('LOCAL_XY', detail_data['trajectory']['coordinateSystem'])
+        self.assertIn('plannedRoute', detail_data)
+
+    def test_cleaning_log_endpoints_validate_auth_device_and_paging(self):
+        unauthenticated = Flask('unauthenticated-cleaning-logs')
+        register_lan_cloud_compat_routes(
+            unauthenticated, lambda: None,
+            device_identity_provider=lambda: {'productId': '250006'},
+        )
+        self.assertEqual(
+            401,
+            unauthenticated.test_client().get(
+                '/api/t-railcar/cleaning-logs?productId=250006'
+            ).status_code,
+        )
+
+        self.login()
+        self.assertEqual(404, self.client.get(
+            '/api/t-railcar/cleaning-logs?productId=999999'
+        ).status_code)
+        self.assertEqual(400, self.client.get(
+            '/api/t-railcar/cleaning-logs?productId=250006&page=0'
+        ).status_code)
+        self.assertEqual(400, self.client.get(
+            '/api/t-railcar/cleaning-logs?productId=250006&pageSize=101'
+        ).status_code)
+        self.assertEqual(404, self.client.get(
+            '/api/t-railcar/cleaning-logs/log_missing'
+        ).status_code)
 
 
 if __name__ == '__main__':

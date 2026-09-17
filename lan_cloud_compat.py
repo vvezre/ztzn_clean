@@ -411,7 +411,8 @@ def register_lan_cloud_compat_routes(
         app, command_handler_provider, status_store=None, auth_manager=None,
         device_identity_provider=None, realtime_position_provider=None,
         position_history_provider=None, cleaning_realtime_provider=None,
-        cleaning_history_provider=None, web_root=None):
+        cleaning_history_provider=None, cleaning_logs_provider=None,
+        cleaning_log_detail_provider=None, web_root=None):
     """Register cloud-compatible LAN routes on an existing Flask app."""
 
     register_lan_web_routes(app, web_root=web_root)
@@ -615,6 +616,7 @@ def register_lan_cloud_compat_routes(
             'taskName': raw.get('taskName'),
             'runId': raw.get('runId'),
             'controlState': cleaning_control_state(raw),
+            'isCleaning': bool(raw.get('isCleaning')),
         })
         return jsonify({'success': True, 'data': data})
 
@@ -646,6 +648,55 @@ def register_lan_cloud_compat_routes(
             'simplified': bool(raw.get('simplified')),
             'pointLimitExceeded': bool(raw.get('pointLimitExceeded')),
         }})
+
+    @app.route('/api/t-railcar/cleaning-logs', methods=['GET'])
+    def lan_cloud_cleaning_logs():
+        """Return lightweight, newest-first records for this LAN vehicle."""
+        product_values = request.args.getlist('productId')
+        if len(product_values) != 1:
+            return result_response(400, 'productId必须传且只能传一次', http_status=400)
+        product_id, error = require_local_product(product_values[0])
+        if error is not None:
+            return error
+
+        page_text = request.args.get('page', '1')
+        page_size_text = request.args.get('pageSize', '20')
+        if not re.match(r'^[0-9]{1,9}\Z', page_text or '') or int(page_text) < 1:
+            return result_response(400, 'page必须是正整数', http_status=400)
+        if not re.match(r'^[0-9]{1,3}\Z', page_size_text or ''):
+            return result_response(400, 'pageSize必须是1到100之间的整数', http_status=400)
+        page, page_size = int(page_text), int(page_size_text)
+        if page_size < 1 or page_size > 100:
+            return result_response(400, 'pageSize必须是1到100之间的整数', http_status=400)
+        try:
+            data = (
+                cleaning_logs_provider(product_id, page, page_size)
+                if callable(cleaning_logs_provider)
+                else {'list': [], 'total': 0, 'page': page, 'pageSize': page_size}
+            )
+        except Exception:
+            return result_response(500, '清扫记录读取失败', http_status=500)
+        return result_response(200, 'success', data=data)
+
+    @app.route('/api/t-railcar/cleaning-logs/<string:log_id>', methods=['GET'])
+    def lan_cloud_cleaning_log_detail(log_id):
+        """Return one archived trajectory and its immutable route snapshot."""
+        identity = local_identity()
+        if identity is None:
+            return result_response(404, '设备不存在或不是当前局域网小车', http_status=404)
+        if not re.match(r'^log_[A-Za-z0-9_-]{1,80}\Z', _text(log_id)):
+            return result_response(400, '清扫记录ID格式错误', http_status=400)
+        try:
+            data = (
+                cleaning_log_detail_provider(log_id, identity.get('productId'))
+                if callable(cleaning_log_detail_provider)
+                else None
+            )
+        except Exception:
+            return result_response(500, '清扫记录详情读取失败', http_status=500)
+        if data is None:
+            return result_response(404, '清扫记录不存在', http_status=404)
+        return result_response(200, 'success', data=data)
 
     @app.route('/api/t-railcar/command', methods=['POST'])
     def lan_cloud_send_command():

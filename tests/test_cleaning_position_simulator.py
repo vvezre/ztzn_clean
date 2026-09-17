@@ -139,14 +139,18 @@ class CleaningSimulatorTests(unittest.TestCase):
         after = json.dumps(self.controller.get_saved_routes(), sort_keys=True)
         self.assertEqual(before, after)
 
-    def test_completion_persists_tail_even_without_frontend_polling(self):
+    def test_completion_archives_tail_then_clears_current_history(self):
         self.prepare()
         self.controller.auto_drive()
         self.assertTrue(self.controller.player.wait(5))
         tracker = self.controller.cleaning_service.history_store
         restored = CleaningPositionHistory(tracker.path)
-        expected = tracker.history()['points']
-        self.assertEqual(expected, restored.history()['points'])
+        self.assertEqual([], tracker.history()['points'])
+        self.assertEqual([], restored.history()['points'])
+        page = self.controller.cleaning_logs('999999', 1, 20)
+        self.assertEqual(1, page['total'])
+        detail = self.controller.cleaning_log_detail(page['list'][0]['id'], '999999')
+        expected = detail['trajectory']['points']
         self.assertTrue(expected)
         position = self.controller.current_position()
         self.assertLessEqual(abs(expected[-1]['x'] - position['local_x']), 1)

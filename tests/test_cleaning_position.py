@@ -12,7 +12,8 @@ import unittest
 
 from cleaning_position import (CleaningPositionHistory, CleaningPositionService,
     cleaning_origin, simplify_history, _distance_to_segment,
-    modeling_position_context_is_current, resolve_cleaning_coordinate_ready,
+    modeling_position_context_is_current, resolve_cleaning_active,
+    resolve_cleaning_coordinate_ready,
     resolve_live_cleaning_control_state,
     resolve_position_task_name, route_position_snapshot)
 from modeling_coordinates import EARTH_RADIUS_M
@@ -290,9 +291,12 @@ class LiveCleaningControlStateTests(unittest.TestCase):
     def test_return_and_completed_cleaning_use_live_runtime(self):
         cached = {'runId': 'clean_current', 'controlState': 'STOPPED'}
         returning = {'controlState': 'RUNNING', 'action': 'return_to_point'}
+        returned = {'controlState': 'COMPLETE', 'action': 'idle',
+                    'detail': {'action': 'return_to_point'}}
         complete = {'controlState': 'COMPLETE', 'action': 'idle',
                     'detail': {'action': 'auto_drive'}}
         self.assertEqual('RETURNING', resolve_live_cleaning_control_state(cached, returning))
+        self.assertEqual('IDLE', resolve_live_cleaning_control_state(cached, returned))
         self.assertEqual('COMPLETE', resolve_live_cleaning_control_state(cached, complete))
 
     def test_start_failure_and_never_started_idle_are_preserved(self):
@@ -323,6 +327,29 @@ class LiveCleaningControlStateTests(unittest.TestCase):
             'action': 'idle',
         }))
 
+    def test_is_cleaning_is_true_only_while_auto_clean_is_starting_or_running(self):
+        for state in ('READY', 'RUNNING'):
+            self.assertTrue(resolve_cleaning_active({
+                'controlState': state,
+                'action': 'auto_drive',
+            }))
+        for state in ('PAUSED', 'STOPPING', 'STOPPED', 'COMPLETE', 'BLOCKED'):
+            self.assertFalse(resolve_cleaning_active({
+                'controlState': state,
+                'action': 'auto_drive',
+            }))
+        for action in ('return_to_point', 'manual_steering', 'idle'):
+            self.assertFalse(resolve_cleaning_active({
+                'controlState': 'RUNNING',
+                'action': action,
+            }))
+
+    def test_is_cleaning_recognizes_cleaning_action_kept_in_runtime_detail(self):
+        self.assertTrue(resolve_cleaning_active({
+            'controlState': 'READY',
+            'action': 'idle',
+            'detail': {'action': 'go_on'},
+        }))
 
 class CompressionTests(unittest.TestCase):
     def points(self, coords):
@@ -465,6 +492,77 @@ class OriginAndServiceTests(unittest.TestCase):
         service.poll(gps(0) + (True,), 'RUNNING', 't1')
         self.assertEqual(['saved'], calls)
         self.assertIsNotNone(service.realtime()['runId'])
+
+    def test_immediate_accepted_start_replaces_old_run_before_poll_and_persists(self):
+        directory = tempfile.mkdtemp()
+        try:
+            clock = [100.0]
+            path = os.path.join(directory, 'latest.json')
+            tracker = CleaningPositionHistory(path, now=lambda: clock[0])
+            service = CleaningPositionService(tracker)
+
+            self.assertTrue(service.begin_immediate(
+                task(u'上一轮'), 'old-token', sample=gps(0) + (True,)
+            ))
+            old_run_id = service.history()['runId']
+            clock[0] += 1.0
+            service.state('COMPLETE', 'old-token', gps(80) + (True,))
+            service.poll(gps(80) + (True,), 'COMPLETE', 'old-token')
+            self.assertEqual(80, service.history()['points'][-1]['x'])
+
+            clock[0] += 1.0
+            self.assertTrue(service.begin_immediate(
+                task(u'新一轮'), 'new-token', sample=gps(0) + (True,)
+            ))
+            current = service.history()
+            self.assertNotEqual(old_run_id, current['runId'])
+            self.assertEqual(u'新一轮', current['taskName'])
+            self.assertEqual([{'x': 0, 'y': 0}], current['points'])
+
+            restored = CleaningPositionHistory(path)
+            self.assertEqual(current['runId'], restored.history()['runId'])
+            self.assertEqual([{'x': 0, 'y': 0}], restored.history()['points'])
+        finally:
+            shutil.rmtree(directory)
+
+    def test_immediate_start_survives_ready_and_records_later_running_points(self):
+        clock = [100.0]
+        tracker = CleaningPositionHistory(now=lambda: clock[0])
+        service = CleaningPositionService(tracker)
+
+        self.assertTrue(service.begin_immediate(
+            task(u'刷新恢复测试'), 'runtime-token', sample=gps(0) + (True,)
+        ))
+        # Production publishes READY immediately after the accepted-start
+        # hook.  This transitional state must not terminate history capture.
+        service.poll(gps(0) + (True,), 'READY', 'runtime-token')
+        self.assertFalse(tracker._ended)
+
+        clock[0] += 1.1
+        service.poll(gps(120, -30) + (True,), 'RUNNING', 'runtime-token')
+        history = service.history()
+        self.assertEqual(
+            [{'x': 0, 'y': 0}, {'x': 120, 'y': -30}],
+            history['points'],
+        )
+        self.assertFalse(tracker._ended)
+
+    def test_immediate_resume_preserves_run_and_existing_points(self):
+        tracker = CleaningPositionHistory()
+        service = CleaningPositionService(tracker)
+        self.assertTrue(service.begin_immediate(
+            task(), 'old-token', sample=gps(0) + (True,)
+        ))
+        service.state('STOPPED', '', gps(40) + (True,))
+        service.poll(gps(40) + (True,), 'STOPPED', '')
+        previous = service.history()
+
+        self.assertTrue(service.begin_immediate(
+            task(), 'resume-token', resume=True, sample=gps(40) + (True,)
+        ))
+        resumed = service.history()
+        self.assertEqual(previous['runId'], resumed['runId'])
+        self.assertEqual(previous['points'], resumed['points'])
 
     def test_queued_start_failure_is_visible_until_next_successful_begin(self):
         tracker = CleaningPositionHistory()

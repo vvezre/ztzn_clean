@@ -34,6 +34,19 @@ class GoToPointIntegrationTest(unittest.TestCase):
         self.assertIn("sendBraking()", helper)
         self.assertNotIn("getRotateArrive()", helper)
 
+    def test_rtk_turn_timeout_rechecks_fix_and_retries_without_failing_route(self):
+        body = read_main()
+        start = body.index("def _turn_to_heading_by_rtk(")
+        end = body.index("\ndef turn(", start)
+        helper = body[start:end]
+
+        self.assertIn("plan_turn_timeout_recovery(", helper)
+        self.assertIn("_is_rtk_fixed_status(rtk_status)", helper)
+        self.assertIn("[turn_rtk_wait_recovery]", helper)
+        self.assertIn("[turn_rtk_retry]", helper)
+        self.assertIn("issue_turn(direction, relative_angle, current_heading, retry_count)", helper)
+        self.assertIn("turn_start_at = time.time()", helper)
+
     def test_main_exposes_go_to_point_route(self):
         body = read_main()
 

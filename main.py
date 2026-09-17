@@ -8,6 +8,8 @@ import base64
 import binascii
 import codecs
 
+import copy
+
 import hashlib
 
 import json
@@ -92,6 +94,7 @@ from turn_heading_control import (
     TURN_LEFT_PROTOCOL_VALUE,
     TURN_RIGHT_PROTOCOL_VALUE,
     choose_turn_direction,
+    plan_turn_timeout_recovery,
 )
 from waypoint_loop import iter_closed_loop_targets, normalize_loop_options
 from runtime_state import RUNTIME_STATE_KEY, build_runtime_state_snapshot
@@ -118,9 +121,13 @@ from modeling_routes import register_modeling_routes
 from lan_cloud_compat import register_lan_cloud_compat_routes
 from position_history import ModelingPositionHistory
 from cleaning_position import (CleaningPositionHistory, CleaningPositionService,
-    modeling_position_context_is_current, resolve_cleaning_coordinate_ready,
+    modeling_position_context_is_current,
+    resolve_cleaning_active,
+    resolve_cleaning_coordinate_ready,
     resolve_live_cleaning_control_state, resolve_position_task_name,
     route_position_snapshot)
+from cleaning_logs import CleaningLogStore
+from modeling_frontend import frontend_area_points, frontend_link_points, frontend_path_points
 from modeling_sampler import sample_current_point
 from modeling_task_persistence import (
     ModelingTaskPersistenceError,
@@ -155,6 +162,8 @@ CORS(app)
 robot_event_bus = RobotEventBus(max_events=200)
 robot_lifecycle_fsm = RobotLifecycleFSM()
 dev_console_trace = []
+cleaning_log_event_lock = threading.RLock()
+cleaning_log_fsm_events = []
 
 canStart = 1
 
@@ -725,7 +734,8 @@ def _runtime_not_startable_payload():
     }
 
 
-def _start_runtime_thread(action, target, args=(), ready_message='正在创建任务线程', detail=None):
+def _start_runtime_thread(action, target, args=(), ready_message='正在创建任务线程',
+                          detail=None, on_task_accepted=None):
     global active_runtime_thread
     with TASK_SWITCH_LOCK:
         if not _can_start_runtime_task():
@@ -738,6 +748,13 @@ def _start_runtime_thread(action, target, args=(), ready_message='正在创建�
         _reset_manual_steering(send_hardware=False)
 
         task_token = _begin_runtime_task(action)
+        if callable(on_task_accepted):
+            # Run acceptance hooks before READY and before the worker becomes
+            # visible.  Cleaning history uses this to atomically replace the
+            # previous run for polling clients.  The hook performs only the
+            # bounded telemetry initialization; vehicle motion remains in the
+            # background worker.
+            on_task_accepted(task_token)
         ready_detail = dict(detail or {})
         if action:
             ready_detail['action'] = action
@@ -868,6 +885,13 @@ def dispatch_runtime_event(event_type, message='', payload=None, detail=None):
     position_observer = globals().get('_notify_cleaning_position_state')
     if callable(position_observer):
         position_observer(fsm_state.get('controlState'))
+    # Preserve short-lived BLOCKED/FAULT transitions for the asynchronous log
+    # worker.  Some failure paths brake immediately and then publish STOPPED;
+    # polling only the latest state would mislabel those runs as manual stops.
+    with cleaning_log_event_lock:
+        cleaning_log_fsm_events.append(copy.deepcopy(fsm_state))
+        if len(cleaning_log_fsm_events) > 100:
+            del cleaning_log_fsm_events[:-100]
 
     runtime_detail = fsm_state.get('detail')
     if not isinstance(runtime_detail, dict):
@@ -3328,6 +3352,11 @@ cleaning_position_service = CleaningPositionService(
     model_loader=modeling_store.get_model,
     on_error=lambda error: logger.warning('cleaning position telemetry: {}'.format(error)),
 )
+cleaning_log_store = CleaningLogStore(
+    os.path.join(MODELING_STORE_DIR, 'cleaning_logs'),
+    max_points=1500,
+    history_interval=1.0,
+)
 
 
 @app.route("/vehicle/login", methods=['POST'])
@@ -4306,6 +4335,7 @@ def autoDriveByRTK():
         autoDriveByRTKThread,
         ready_message='启动条件通过，正在创建 RTK 自动清扫线程',
         detail=validation.get('data'),
+        on_task_accepted=_prepare_cleaning_history_for_runtime_start,
     )
     if error_payload:
         return jsonify(error_payload)
@@ -4533,8 +4563,15 @@ def autoDriveByRTKThread(task_token=None):
 
     global_status = 'working'
     global_doCleanThreadStop = 0
-    _begin_cleaning_position_run(taskObj, task_token)
+    # The normal start endpoint already published this run before returning.
+    # Direct and loop-cleaning calls reach this hook here.  The same token is
+    # idempotent, so the endpoint path cannot clear the new run a second time.
+    _begin_cleaning_position_run(taskObj, task_token, immediate=True)
     _mark_runtime_running('自动清扫启动成功，任务执行中', {'action': 'auto_drive'})
+    # A historical log is created only here, after the route passed the worker
+    # validations and entered RUNNING.  A rejected start therefore never
+    # creates a misleading empty record.
+    _begin_cleaning_log_run(taskObj)
 
     # 根据缓存中是否存在任务，来构建新的任务
     resultTask = []
@@ -4727,6 +4764,7 @@ def auto_driving():
         autoDriveByRTKThread,
         ready_message='启动条件通过，正在创建自动清扫线程',
         detail=validation.get('data'),
+        on_task_accepted=_prepare_cleaning_history_for_runtime_start,
     )
     if error_payload:
         return jsonify(error_payload)
@@ -4836,6 +4874,7 @@ def start_loop_auto_drive():
             loopAutoDriveThread,
             ready_message='循环自动清扫启动条件通过，正在创建循环线程',
             detail=validation.get('data'),
+            on_task_accepted=_prepare_cleaning_history_for_runtime_start,
         )
         if error_payload:
             _set_loop_auto_clean_state(enabled=False, running=False, stop_reason='start_rejected')
@@ -5502,11 +5541,23 @@ def returnToPoint():
                 except Exception:
                     active_segment = None
         try:
+            route_model = None
+            model_id = task_config.get('modelId')
+            if model_id:
+                try:
+                    route_model = modeling_store.get_model(model_id)
+                except Exception as error:
+                    logger.warning(
+                        "返航未读取到建模区域，继续使用已保存路线: modelId=%s, error=%s",
+                        model_id,
+                        error,
+                    )
             return_tasks = build_return_to_origin_tasks(
                 task_config,
                 global_cur_rtk_lat,
                 global_cur_rtk_lon,
                 active_segment=active_segment,
+                model=route_model,
             )
         except ReturnOriginRouteError as error:
             return jsonify({
@@ -5568,17 +5619,21 @@ def returnToPoint():
                 'returnTaskCount': len(return_tasks),
                 'controlState': 'RETURNING',
             },
-        })
+            })
 
 
 def returnToPointThread(task_token=None, return_plan=None):
     global global_doCleanThreadStop, global_pointToPoint_flag, global_go, global_status
     return_plan = return_plan if isinstance(return_plan, dict) else {}
     tasks = list(return_plan.get('tasks') or [])
-    task_name = return_plan.get('taskName')
+    task_name = _decode_redis_value(return_plan.get('taskName')) or u''
     completed = False
     try:
-        logger.warn("启动返回路线原点: taskName={}, taskCount={}".format(task_name, len(tasks)))
+        logger.warning(
+            u"启动返回路线原点: taskName=%s, taskCount=%s",
+            task_name,
+            len(tasks),
+        )
         global_status = 'working'
         global_doCleanThreadStop = 0
         global_pointToPoint_flag = 0
@@ -5638,7 +5693,11 @@ def returnToPointThread(task_token=None, return_plan=None):
         redis_cli.set("correct", "false")
         redis_cli.set('curTaskIndex', 0)
         doParking(update_runtime=False)
-        logger.warn("返回路线原点线程结束: taskName={}, completed={}".format(task_name, completed))
+        logger.warning(
+            u"返回路线原点线程结束: taskName=%s, completed=%s",
+            task_name,
+            completed,
+        )
 
 
 # 根据当前任务和下一个任务判断小车的位置
@@ -6602,9 +6661,6 @@ def observer_go_correct(data):
             )
         )
         global_last_cte = cte
-        if distance_to_target <= 2 and redis_cli.get('lastTask') == '1':
-            sendCommandSetXSpeed(200)
-
         _publish_correction_debug(
             heading_error,
             cte,
@@ -8277,29 +8333,38 @@ def _turn_to_heading_by_rtk(ser, target_heading, source='turn', segment_index=No
         sendBraking()
         return 1
 
-    protocol_value = TURN_RIGHT_PROTOCOL_VALUE if direction == 'right' else TURN_LEFT_PROTOCOL_VALUE
-    sendBraking()
-    preBuildCommand()
-    setStatus(3)
-    setPowerOn(1)
-    setXSpeed(0)
-    setZSpeed(0)
-    setRotateTo(protocol_value)
-    command[17] = tem_listener(command, 17)
-    logger.warn(
-        "[turn_rtk_start] source={}, segment={}, taskId={}, direction={}, relativeAngle={:.2f}, target={:.2f}, current={:.2f}, protocolValue={}, frame={}".format(
-            source,
-            segment_index,
-            task_id,
-            direction,
-            relative_angle,
-            target_heading,
-            current_heading,
-            protocol_value,
-            ' '.join(format(x, '02x') for x in command),
+    def issue_turn(turn_direction, turn_angle, live_heading, retry_count):
+        protocol_value = (
+            TURN_RIGHT_PROTOCOL_VALUE
+            if turn_direction == 'right'
+            else TURN_LEFT_PROTOCOL_VALUE
         )
-    )
-    duplicateWriteCmd(ser, command)
+        sendBraking()
+        preBuildCommand()
+        setStatus(3)
+        setPowerOn(1)
+        setXSpeed(0)
+        setZSpeed(0)
+        setRotateTo(protocol_value)
+        command[17] = tem_listener(command, 17)
+        logger.warn(
+            "[turn_rtk_start] source={}, segment={}, taskId={}, direction={}, relativeAngle={:.2f}, target={:.2f}, current={:.2f}, protocolValue={}, retry={}, frame={}".format(
+                source,
+                segment_index,
+                task_id,
+                turn_direction,
+                turn_angle,
+                target_heading,
+                live_heading,
+                protocol_value,
+                retry_count,
+                ' '.join(format(x, '02x') for x in command),
+            )
+        )
+        duplicateWriteCmd(ser, command)
+
+    retry_count = 0
+    issue_turn(direction, relative_angle, current_heading, retry_count)
 
     turn_start_at = time.time()
     stable_count = 0
@@ -8308,13 +8373,73 @@ def _turn_to_heading_by_rtk(ser, target_heading, source='turn', segment_index=No
     while _is_runtime_task_active():
         elapsed = time.time() - turn_start_at
         if elapsed >= TURN_RTK_MAX_DURATION_SEC:
-            logger.error(
-                "[turn_rtk_timeout] direction={}, target={:.2f}, elapsed={:.2f}s".format(
-                    direction, target_heading, elapsed
+            # 30秒只是本次旋转命令的检查点，不能因此终止整条自动清扫路线。
+            # 先停车，再等待固定解和新鲜航向；RTK正常后，从当前车头方向重新计算
+            # 最短转向并继续。这里不改变原有的2度到位及跨角判断规则。
+            logger.warning(
+                "[turn_rtk_timeout] direction={}, target={:.2f}, elapsed={:.2f}s; brake and recheck RTK".format(
+                    direction,
+                    target_heading,
+                    elapsed,
                 )
             )
             sendBraking()
-            return 0
+            waiting_logged = False
+            while _is_runtime_task_active():
+                rtk_status = _get_rtk_runtime_status()
+                current_heading = _get_current_rtk_heading()
+                recovery = plan_turn_timeout_recovery(
+                    current_heading,
+                    target_heading,
+                    _is_rtk_fixed_status(rtk_status),
+                    TURN_RTK_FALLBACK_TOLERANCE_DEG,
+                )
+                recovery_action = recovery.get('action')
+                if recovery_action == 'wait_rtk':
+                    if not waiting_logged:
+                        logger.warning(
+                            "[turn_rtk_wait_recovery] target={:.2f}, reason={}; vehicle remains stopped".format(
+                                target_heading,
+                                _rtk_fix_problem_reason(rtk_status),
+                            )
+                        )
+                        waiting_logged = True
+                    time.sleep(0.25)
+                    continue
+
+                if recovery_action == 'complete':
+                    logger.warning(
+                        "[turn_rtk_retry_done] target={:.2f}, current={:.2f}; already within tolerance".format(
+                            target_heading,
+                            current_heading,
+                        )
+                    )
+                    sendBraking()
+                    return 1
+
+                direction = recovery.get('direction')
+                relative_angle = recovery.get('relativeAngle')
+                retry_count += 1
+                logger.warning(
+                    "[turn_rtk_retry] target={:.2f}, current={:.2f}, direction={}, relativeAngle={:.2f}, retry={}".format(
+                        target_heading,
+                        current_heading,
+                        direction,
+                        relative_angle,
+                        retry_count,
+                    )
+                )
+                issue_turn(direction, relative_angle, current_heading, retry_count)
+                turn_start_at = time.time()
+                stable_count = 0
+                previous_delta = _normalize_heading_delta(current_heading, target_heading)
+                last_log_at = 0.0
+                break
+            else:
+                # 只有人工停止、故障状态或现有RTK看门狗明确终止任务时才退出。
+                sendBraking()
+                return 0
+            continue
 
         current_heading = _get_current_rtk_heading()
         delta = _normalize_heading_delta(current_heading, target_heading)
@@ -9911,14 +10036,100 @@ def _cleaning_position_sample():
             bool(_build_rtk_runtime_detail().get('rtkFixAvailable')))
 
 
-def _begin_cleaning_position_run(task_config, task_token, resume=False):
+def _cleaning_log_device_identity():
+    """Read the same product identity already used by the MQTT connection."""
+    config_path = os.environ.get('CLEANBOT_MQTT_CONFIG') or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        'mqtt_config.json',
+    )
+    config = _load_json_config(config_path)
+    mqtt_config = config.get('mqtt') if isinstance(config, dict) else {}
+    mqtt_config = mqtt_config if isinstance(mqtt_config, dict) else {}
+    product_id = str(mqtt_config.get('product_id') or '').strip()
+    product_model = str(mqtt_config.get('product_model') or '-T01').strip()
+    return {
+        'productId': product_id,
+        'serialNumber': '{}{}'.format(product_model, product_id),
+    }
+
+
+def _cleaning_planned_route_snapshot(task_config):
+    """Freeze the exact selected geometry used by this cleaning run."""
+    task_config = task_config if isinstance(task_config, dict) else {}
+    area_points = copy.deepcopy(task_config.get('areaPoints') or [])
+    link_points = copy.deepcopy(task_config.get('linkPoints') or [])
+    model_id = task_config.get('modelId')
+    if model_id:
+        try:
+            model = modeling_store.get_model(model_id)
+            area_points = frontend_area_points(model)
+            link_points = frontend_link_points(model)
+        except Exception as error:
+            logger.warning('snapshot cleaning model geometry: {}'.format(error))
+    return {
+        'areaPoints': area_points,
+        'linkPoints': link_points,
+        # taskList is the selected return/no-return variant that the robot is
+        # actually about to execute; do not re-plan it for the log.
+        'pathPoints': frontend_path_points({'tasks': task_config.get('taskList') or []}),
+    }
+
+
+def _begin_cleaning_log_run(task_config):
+    """Create the durable LAN log after automatic cleaning enters RUNNING."""
+    try:
+        current = cleaning_position_service.realtime()
+        run_id = current.get('runId') if isinstance(current, dict) else None
+        if not run_id:
+            logger.warning('skip cleaning log start: current runId is unavailable')
+            return None
+        # Remove all startup/previous-run transitions before publishing the
+        # active log.  This closes the race where an old STOPPED event could
+        # otherwise terminate the new record during its first disk write.
+        with cleaning_log_event_lock:
+            del cleaning_log_fsm_events[:]
+        result = cleaning_log_store.begin(
+            run_id,
+            _cleaning_log_device_identity(),
+            task_config.get('taskName'),
+            _cleaning_planned_route_snapshot(task_config),
+        )
+        return result
+    except Exception as error:
+        # Log persistence is observational and must never start/stop motors.
+        logger.error('begin cleaning log failed: {}'.format(error), exc_info=True)
+        return None
+
+
+def _begin_cleaning_position_run(task_config, task_token, resume=False, immediate=False):
     """Called only after a real cleaning start passed task validation."""
     try:
         service = globals().get('cleaning_position_service')
         if service is not None:
-            service.begin(task_config, task_token, resume=resume, sample=_cleaning_position_sample())
+            begin_method = service.begin_immediate if immediate else service.begin
+            begin_method(
+                task_config,
+                task_token,
+                resume=resume,
+                sample=_cleaning_position_sample(),
+            )
     except Exception as error:
         logger.warning('begin cleaning telemetry: {}'.format(error))
+
+
+def _prepare_cleaning_history_for_runtime_start(task_token):
+    """Replace the previous trail only after auto-drive validation succeeds."""
+    try:
+        task_config = util.readConfig('config.json')
+    except Exception as error:
+        logger.warning('prepare cleaning telemetry config: {}'.format(error))
+        return
+    _begin_cleaning_position_run(
+        task_config,
+        task_token,
+        resume=False,
+        immediate=True,
+    )
 
 
 def _notify_cleaning_position_state(control_state):
@@ -9940,12 +10151,91 @@ def _notify_cleaning_position_start_failed():
         logger.warning('cleaning telemetry start failure: {}'.format(error))
 
 
+def _cleaning_log_terminal_result(fsm_state):
+    """Map one accepted runtime state to the frontend log enumeration."""
+    fsm_state = fsm_state if isinstance(fsm_state, dict) else {}
+    state = str(fsm_state.get('controlState') or '').upper()
+    message = _decode_redis_value(fsm_state.get('message')) or ''
+    fault = _decode_redis_value(fsm_state.get('faultState')) or ''
+    try:
+        message = message.strip()
+    except Exception:
+        message = ''
+    try:
+        fault = fault.strip()
+    except Exception:
+        fault = ''
+    if state == 'COMPLETE':
+        return 'COMPLETED', u'路线正常完成'
+    if state in ('BLOCKED', 'FAULT', 'DISABLED', 'UNKNOWN'):
+        return 'FAILED', message or fault or u'任务执行失败'
+    if state == 'STOPPED':
+        return 'STOPPED', message or u'用户手动停止'
+    return None
+
+
+def _poll_cleaning_log(fsm_state):
+    """Sample and finalize the active LAN cleaning log off the motion path."""
+    active = cleaning_log_store.active()
+    if not active:
+        # Discard old runtime chatter while no cleaning log exists so it can
+        # never terminate a future run.
+        with cleaning_log_event_lock:
+            del cleaning_log_fsm_events[:]
+        return
+
+    snapshot = cleaning_position_service.realtime()
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    fixed = bool(snapshot.get('rtkFixAvailable'))
+    heading = (
+        vehicle_control_heading_to_geographic(_get_current_rtk_heading())
+        if fixed else None
+    )
+    terminal = _cleaning_log_terminal_result(fsm_state)
+    cleaning_log_store.observe(
+        snapshot.get('x'),
+        snapshot.get('y'),
+        heading,
+        available=bool(fixed and snapshot.get('coordinateReady')),
+        force=bool(terminal),
+    )
+
+    with cleaning_log_event_lock:
+        events = list(cleaning_log_fsm_events)
+        del cleaning_log_fsm_events[:]
+    # Process every accepted transition in order.  This preserves a brief
+    # failure state even if the runtime published STOPPED immediately after it.
+    result = None
+    for event in events:
+        result = _cleaning_log_terminal_result(event)
+        if result:
+            break
+    if result is None:
+        result = terminal
+    if result is None:
+        return
+
+    status, reason = result
+    archived = cleaning_log_store.finalize(status, reason)
+    if archived is not None:
+        # Never clear first: an exception from finalize leaves the live trail
+        # intact and the next worker tick can retry the durable archive.
+        cleaning_position_service.clear_points(flush=True)
+        logger.info(
+            'cleaning log archived: id={}, runId={}, status={}'.format(
+                archived.get('id'), archived.get('runId'), archived.get('status'),
+            )
+        )
+
+
 def _cleaning_position_history_loop():
     """Separate UI worker: never blocks the RTK steering observer."""
     while True:
         try:
-            state = robot_lifecycle_fsm.get_state().get('controlState')
+            fsm_state = robot_lifecycle_fsm.get_state()
+            state = fsm_state.get('controlState')
             cleaning_position_service.poll(_cleaning_position_sample(), state, active_runtime_task_token)
+            _poll_cleaning_log(fsm_state)
         except Exception as error:
             logger.warning('cleaning position sampler: {}'.format(error))
         time.sleep(0.2)
@@ -10082,6 +10372,7 @@ def _get_lan_cleaning_realtime_position():
     # cache update can briefly tell the frontend STOPPED while the vehicle is
     # already executing an automatic-cleaning task.
     raw['controlState'] = resolve_live_cleaning_control_state(raw, fsm_state)
+    raw['isCleaning'] = resolve_cleaning_active(fsm_state)
     raw['cleaningCoordinateReady'] = resolve_cleaning_coordinate_ready(
         raw.get('atTaskOrigin'),
         fsm_state,
@@ -10119,6 +10410,8 @@ lan_cloud_compatibility = register_lan_cloud_compat_routes(
     position_history_provider=_get_lan_position_history,
     cleaning_realtime_provider=_get_lan_cleaning_realtime_position,
     cleaning_history_provider=cleaning_position_service.history,
+    cleaning_logs_provider=cleaning_log_store.list_logs,
+    cleaning_log_detail_provider=cleaning_log_store.get_log,
 )
 
 

@@ -106,6 +106,34 @@ class RuntimeStateModelTest(unittest.TestCase):
         self.assertEqual(state["actionLabel"], u"停车")
         json.dumps(state, ensure_ascii=False)
 
+    def test_return_to_origin_logging_is_safe_for_unicode_task_names(self):
+        source = read_main_source()
+        body = function_body(source, "returnToPointThread")
+
+        self.assertIn(
+            "task_name = _decode_redis_value(return_plan.get('taskName')) or u''",
+            body,
+        )
+        self.assertIn(
+            'u"启动返回路线原点: taskName=%s, taskCount=%s"',
+            body,
+        )
+        self.assertIn(
+            'u"返回路线原点线程结束: taskName=%s, completed=%s"',
+            body,
+        )
+        self.assertNotIn(
+            '"启动返回路线原点: taskName={}, taskCount={}".format',
+            body,
+        )
+
+    def test_return_to_origin_loads_model_for_safe_direct_route_validation(self):
+        source = read_main_source()
+        body = function_body(source, "returnToPoint")
+
+        self.assertIn("route_model = modeling_store.get_model(model_id)", body)
+        self.assertIn("model=route_model", body)
+
     def test_blocked_state_disables_motion_and_keeps_fault_reason(self):
         from runtime_state import build_runtime_state_snapshot
 

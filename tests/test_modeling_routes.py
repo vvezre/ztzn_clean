@@ -248,7 +248,11 @@ class ModelingRoutesTest(unittest.TestCase):
         self.client.post("/modeling/session/record-link-point", json={})
         created_area = self.client.post("/modeling/session/new-area", json={})
         self.assertEqual(created_area.status_code, 200)
-        self.assertEqual(created_area.get_json()["data"], {"areaNumber": 2, "groupCount": 2})
+        self.assertEqual(created_area.get_json()["data"], {
+            "areaNumber": 2,
+            "groupCount": 2,
+            "sourceAreaNumber": 1,
+        })
         for _ in range(2):
             self.client.post("/modeling/session/record-area-point", json={})
 
@@ -295,6 +299,16 @@ class ModelingRoutesTest(unittest.TestCase):
     def test_recognize_group_route_updates_group_draft(self):
         model = self.client.post("/modeling/models", json={"name": "recognize-a"}).get_json()["data"]
         draft = dict(model)
+        # This test exercises legacy in-group connector recognition, not the
+        # coordinate migration path.  Keep the explicit x/y fixture intact.
+        draft["coordinateFrame"] = {
+            "type": "model_origin",
+            "unit": "cm",
+            "originPointId": "p1",
+            "originGroupId": "g1",
+            "originLat": 32.0,
+            "originLon": 118.0,
+        }
         draft["groups"] = [{
             "id": "g1",
             "name": "group-1",
